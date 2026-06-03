@@ -157,6 +157,44 @@ def blocking_echo(cli_port):
         s.close()
 
 
+def _bidi_worker(sock, data, results, key):
+    """One direction of blocking bidi: partial send + interleaved recv."""
+    sock.settimeout(30)
+    pos = 0
+    total = b""
+    try:
+        while pos < len(data) or len(total) < len(data):
+            if pos < len(data):
+                sock.settimeout(0.05)
+                try:
+                    n = sock.send(data[pos:pos + BLOCKING_CHUNK])
+                    if n > 0:
+                        pos += n
+                except (socket.timeout, BlockingIOError):
+                    pass
+                finally:
+                    sock.settimeout(30)
+            sock.settimeout(0.05)
+            try:
+                while True:
+                    d = sock.recv(65536)
+                    if not d:
+                        results[key] = False; return
+                    total += d
+            except (socket.timeout, BlockingIOError):
+                pass
+            finally:
+                sock.settimeout(30)
+        while len(total) < len(data):
+            d = sock.recv(65536)
+            if not d:
+                results[key] = False; return
+            total += d
+        results[key] = (total == data)
+    except:
+        results[key] = False
+
+
 def _recv_exact(sock, size):
     """Receive exactly `size` bytes from socket."""
     buf = b""
@@ -461,13 +499,87 @@ def run_tunnel_blocking_test():
         _stop_tunnel(svr, cli)
 
 
+def run_tunnel_blocking_bidi_test():
+    """Blocking bidi: 2 directions in parallel, partial send + interleaved recv."""
+    tgt_port = random.randint(31000, 32000)
+    svr_port = random.randint(32001, 33000)
+    cli_port = random.randint(33001, 34000)
+
+    echo_stop = threading.Event()
+    echo_ready = threading.Event()
+    def echo_server():
+        ls = socket.socket()
+        ls.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+        ls.bind((HOST, tgt_port))
+        ls.listen(5)
+        echo_ready.set()
+        while not echo_stop.is_set():
+            ls.settimeout(1.0)
+            try:
+                conn, _ = ls.accept()
+                conn.settimeout(30)
+                t = threading.Thread(target=_echo_inner, args=(conn,), daemon=True)
+                t.start()
+            except socket.timeout:
+                continue
+            except:
+                break
+        ls.close()
+    def _echo_inner(conn):
+        while True:
+            try:
+                d = conn.recv(65536)
+                if not d: break
+                conn.sendall(d)
+            except:
+                break
+        conn.close()
+    t = threading.Thread(target=echo_server, daemon=True)
+    t.start()
+    echo_ready.wait()
+
+    svr, cli = _start_tunnel(svr_port, cli_port, tgt_port)
+
+    try:
+        data0 = os.urandom(BLOCKING_SIZE)
+        data1 = os.urandom(BLOCKING_SIZE)
+
+        s0 = socket.socket()
+        s0.settimeout(10)
+        s0.connect((HOST, cli_port))
+
+        s1 = socket.socket()
+        s1.settimeout(10)
+        s1.connect((HOST, cli_port))
+
+        results = {}
+
+        t0 = threading.Thread(target=_bidi_worker, args=(s0, data0, results, 'a'), daemon=True)
+        t1 = threading.Thread(target=_bidi_worker, args=(s1, data1, results, 'b'), daemon=True)
+        t0.start()
+        t1.start()
+        t0.join(timeout=120)
+        t1.join(timeout=120)
+
+        s0.close()
+        s1.close()
+
+        ok = results.get('a') and results.get('b')
+        print(f"  [tunnel] blocking_bidi={'OK' if ok else 'FAIL'}", flush=True)
+        return ok
+    finally:
+        echo_stop.set()
+        _stop_tunnel(svr, cli)
+
+
 def run_tunnel_test():
-    """Tunnel mode: short HTTP + long echo + blocking + bidi."""
+    """Tunnel mode: short HTTP + long echo + blocking + bidi + blocking_bidi."""
     short_ok = run_tunnel_short_test()
     long_ok = run_tunnel_long_test()
     blocking_ok = run_tunnel_blocking_test()
+    blocking_bidi_ok = run_tunnel_blocking_bidi_test()
     bidi_ok = run_tunnel_bidi_test()
-    return short_ok and long_ok and blocking_ok and bidi_ok
+    return short_ok and long_ok and blocking_ok and blocking_bidi_ok and bidi_ok
 
 
 def run_module_chain_test(label, chain_config):

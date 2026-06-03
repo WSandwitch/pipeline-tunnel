@@ -8,6 +8,7 @@
 #include <unordered_map>
 #include <memory>
 #include <signal.h>
+#include <thread>
 
 class Session;
 
@@ -40,7 +41,7 @@ static void print_usage(const char *prog) {
         "  -l <host:port>       Listen address and port\n"
         "  -A <password>        Authentication password\n"
         "  -M <modpath>         Path to directory with .so modules\n"
-        "  -t <N>               Number of worker threads (default: 4)\n"
+        "  -t [<N>]             Worker threads (default: 1, auto-detect cores when no value)\n"
         "  -h                   Show this help\n"
         "  -v, -vv, -vvv        Verbosity level (v=info, vv=debug, vvv=trace)\n"
         "  --module-help <name>  Show help for a module\n"
@@ -63,7 +64,7 @@ int main(int argc, char *argv[]) {
     bool show_help = false;
     bool show_module_list = false;
     std::string module_help_name;
-    int thread_count = 4;
+    int thread_count = 1;
 
     int verbosity = 0;
 
@@ -108,8 +109,14 @@ int main(int argc, char *argv[]) {
                     break;
                 case 't': {
                     const char *val = argv[i] + 2;
-                    if (!val[0] && i + 1 < argc) val = argv[++i];
-                    thread_count = atoi(val);
+                    if (val[0]) {
+                        thread_count = atoi(val);
+                    } else if (i + 1 < argc && argv[i+1][0] >= '0' && argv[i+1][0] <= '9') {
+                        val = argv[++i];
+                        thread_count = atoi(val);
+                    } else {
+                        thread_count = std::thread::hardware_concurrency();
+                    }
                     if (thread_count < 1) thread_count = 1;
                     break;
                 }
