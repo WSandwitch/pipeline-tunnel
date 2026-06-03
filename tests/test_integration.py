@@ -845,6 +845,65 @@ if __name__ == "__main__":
             print(f"  [{label}] benchmark: FAIL", flush=True)
         sys.exit(0 if ok else 1)
 
+    if len(sys.argv) > 1 and sys.argv[1] == "--benchmark-ref":
+        """Measure raw TCP echo throughput (no proxy) as reference."""
+        tgt_port = _find_free_port(31000, 32000)
+        echo_stop = threading.Event()
+        echo_ready = threading.Event()
+        def echo_server():
+            ls = socket.socket()
+            ls.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+            ls.bind((HOST, tgt_port))
+            ls.listen(5)
+            echo_ready.set()
+            while not echo_stop.is_set():
+                ls.settimeout(1.0)
+                try:
+                    conn, _ = ls.accept()
+                    conn.settimeout(60)
+                    t = threading.Thread(target=_echo_inner, args=(conn,), daemon=True)
+                    t.start()
+                except: pass
+            ls.close()
+        def _echo_inner(conn):
+            while True:
+                try:
+                    d = conn.recv(65536)
+                    if not d: break
+                    conn.sendall(d)
+                except: break
+            conn.close()
+        t = threading.Thread(target=echo_server, daemon=True)
+        t.start()
+        echo_ready.wait()
+        try:
+            chunk = BENCHMARK_CHUNK
+            nchunks = max(1, BENCHMARK_TOTAL // chunk)
+            data = os.urandom(chunk)
+            s = socket.socket()
+            s.settimeout(60)
+            s.connect((HOST, tgt_port))
+            t0 = time.time()
+            for _ in range(nchunks):
+                s.sendall(data)
+                resp = b""
+                while len(resp) < len(data):
+                    d = s.recv(65536)
+                    if not d: break
+                    resp += d
+                if resp != data:
+                    raise RuntimeError("data mismatch")
+            elapsed = time.time() - t0
+            mbps = (chunk * nchunks) / elapsed / 1_000_000
+            print(f"  [raw TCP] benchmark: {mbps:.2f} MB/s ({elapsed:.2f}s, {BENCHMARK_TOTAL // 1_000_000}MB)", flush=True)
+            sys.exit(0)
+        except Exception as e:
+            print(f"  [raw TCP] benchmark: FAIL ({e})", flush=True)
+            sys.exit(1)
+        finally:
+            echo_stop.set()
+            s.close() if 's' in dir() else None
+
     if len(sys.argv) > 1 and sys.argv[1] == "--benchmark-all":
         workers = int(sys.argv[2]) if len(sys.argv) > 2 and sys.argv[2] else 1
         from test_tester import Tester
