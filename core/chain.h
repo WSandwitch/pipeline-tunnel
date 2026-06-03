@@ -9,6 +9,7 @@
 #include <atomic>
 #include <utility>
 #include <unordered_map>
+#include <unordered_set>
 #include "module.h"
 #include "config.h"
 #include "protocol.h"
@@ -92,8 +93,11 @@ private:
     std::unordered_map<int, std::vector<uint8_t>> fd_pending_writes_;
     std::unordered_map<int, size_t> fd_write_cursors_;
 
-    // Protects all per-fd maps above from concurrent insertion/data-race
+    // Protects all per-fd maps below from concurrent insertion/data-race
     std::mutex fd_data_mutex_;
+
+    // Fds with EPOLLIN disabled due to output back-pressure (per-fd, key=fd)
+    std::unordered_set<int> fd_paused_;
 
     int handle_read_packet_size(size_t mod_idx, int fd);
     int handle_read_packet(size_t mod_idx, int fd, uint8_t *buf);

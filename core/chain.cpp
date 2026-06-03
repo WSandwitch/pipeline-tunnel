@@ -115,7 +115,6 @@ int Chain::handle_read_packet(size_t mod_idx, int fd, uint8_t *buf) {
 
 int Chain::handle_write_packet(size_t mod_idx, int fd,
                                const uint8_t *data, size_t len) {
-    (void)mod_idx;
     std::vector<uint8_t> frame;
     size_t val = len;
     while (val > 0x7F) {
@@ -129,11 +128,39 @@ int Chain::handle_write_packet(size_t mod_idx, int fd,
     if (w == (ssize_t)frame.size())
         return 0;
 
+    auto do_pause = [&]() {
+        if (mod_idx >= nodes_.size()) return;
+        std::vector<int> pause_fds;
+        if (fd == nodes_[mod_idx].in_fd) {
+            // Backward EAGAIN (writing to in_fd) — pause all out_fds
+            for (int ofd : nodes_[mod_idx].out_fds) {
+                if (ofd < 0) continue;
+                if (!fd_paused_.count(ofd)) {
+                    fd_paused_.insert(ofd);
+                    pause_fds.push_back(ofd);
+                }
+            }
+        } else {
+            // Forward EAGAIN (writing to out_fd) — pause in_fd
+            int infd = nodes_[mod_idx].in_fd;
+            if (infd >= 0 && !fd_paused_.count(infd)) {
+                fd_paused_.insert(infd);
+                pause_fds.push_back(infd);
+            }
+        }
+        for (int pfd : pause_fds)
+            if (kernel_)
+                kernel_->mod_chain_fd_events(pfd, 0, EPOLLIN);
+    };
+
     if (w < 0) {
         if (errno == EAGAIN || errno == EWOULDBLOCK) {
-            std::lock_guard<std::mutex> lock(fd_data_mutex_);
-            fd_pending_writes_[fd] = std::move(frame);
-            fd_write_cursors_[fd] = 0;
+            {
+                std::lock_guard<std::mutex> lock(fd_data_mutex_);
+                fd_pending_writes_[fd] = std::move(frame);
+                fd_write_cursors_[fd] = 0;
+                do_pause();
+            }
             if (kernel_)
                 kernel_->mod_chain_fd_events(fd, EPOLLOUT, 0);
             return 0;
@@ -145,6 +172,7 @@ int Chain::handle_write_packet(size_t mod_idx, int fd,
         std::lock_guard<std::mutex> lock(fd_data_mutex_);
         fd_pending_writes_[fd].assign(frame.begin() + w, frame.end());
         fd_write_cursors_[fd] = 0;
+        do_pause();
     }
     if (kernel_)
         kernel_->mod_chain_fd_events(fd, EPOLLOUT, 0);
@@ -512,9 +540,9 @@ void Chain::on_fd_ready(int fd) {
 
         int ret = nodes_[idx].mod->process(dir, fd);
         if (ret < 0) {
-            std::lock_guard<std::mutex> lock(fd_data_mutex_);
-            fd_cursors_[fd] = save;
-            break;
+            log_error("chain %llx: module %zu process returned %d, aborting",
+                      (unsigned long long)session_id_, idx, ret);
+            _exit(1);
         }
 
         {
@@ -569,6 +597,7 @@ void Chain::on_fd_write_ready(int fd) {
     ssize_t w = write(fd, buf.data() + cursor, remaining);
 
     bool flushed = false;
+    std::vector<int> resume_fds;
     {
         std::lock_guard<std::mutex> lock(fd_data_mutex_);
         if (w > 0) {
@@ -579,15 +608,46 @@ void Chain::on_fd_write_ready(int fd) {
                 flushed = true;
                 if (kernel_)
                     kernel_->mod_chain_fd_events(fd, 0, EPOLLOUT);
+
+                auto fi = fd_to_info_.find(fd);
+                if (fi != fd_to_info_.end()) {
+                    size_t midx = (size_t)fi->second.module_idx;
+                    if (midx < nodes_.size()) {
+                        if (fd == nodes_[midx].in_fd) {
+                            // Backward buffer drained — resume all paused out_fds
+                            for (int ofd : nodes_[midx].out_fds) {
+                                if (ofd < 0) continue;
+                                if (fd_paused_.erase(ofd))
+                                    resume_fds.push_back(ofd);
+                            }
+                        } else {
+                            // Forward buffer drained — check all out_fds clear
+                            bool all_drained = true;
+                            for (int ofd : nodes_[midx].out_fds) {
+                                if (ofd == fd) continue;
+                                if (fd_pending_writes_.count(ofd) && !fd_pending_writes_[ofd].empty()) {
+                                    all_drained = false;
+                                    break;
+                                }
+                            }
+                            if (all_drained) {
+                                int infd = nodes_[midx].in_fd;
+                                if (infd >= 0 && fd_paused_.erase(infd))
+                                    resume_fds.push_back(infd);
+                            }
+                        }
+                    }
+                }
             }
         } else if (w < 0 && errno != EAGAIN && errno != EWOULDBLOCK) {
-            fd_pending_writes_.erase(fd);
-            fd_write_cursors_.erase(fd);
-            flushed = true;
-            if (kernel_)
-                kernel_->mod_chain_fd_events(fd, 0, EPOLLOUT);
+            log_error("chain %llx: write error on fd %d: %s",
+                      (unsigned long long)session_id_, fd, strerror(errno));
+            _exit(1);
         }
     }
+    for (int rfd : resume_fds)
+        if (kernel_)
+            kernel_->mod_chain_fd_events(rfd, EPOLLIN, 0);
     if (flushed)
         retry_buffered();
 }
