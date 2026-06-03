@@ -546,7 +546,7 @@ def run_tunnel_blocking_bidi_test(chain_config=None):
     t.start()
     echo_ready.wait()
 
-    svr, cli = _start_tunnel(svr_port, cli_port, tgt_port, chain_config)
+    svr, cli = _start_tunnel(svr_port, cli_port, tgt_port, chain_config, threads=2)
 
     try:
         data0 = os.urandom(BLOCKING_SIZE)
