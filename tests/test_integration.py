@@ -164,17 +164,14 @@ def _bidi_worker(sock, data, results, key):
     pos = 0
     total = b""
     try:
-        while pos < len(data) or len(total) < len(data):
-            if pos < len(data):
-                sock.settimeout(0.05)
-                try:
-                    n = sock.send(data[pos:pos + BLOCKING_CHUNK])
-                    if n > 0:
-                        pos += n
-                except (socket.timeout, BlockingIOError):
-                    pass
-                finally:
-                    sock.settimeout(30)
+        while pos < len(data):
+            sock.settimeout(0.05)
+            try:
+                n = sock.send(data[pos:pos + BLOCKING_CHUNK])
+                if n > 0:
+                    pos += n
+            except (socket.timeout, BlockingIOError):
+                pass
             sock.settimeout(0.05)
             try:
                 while True:
@@ -184,8 +181,7 @@ def _bidi_worker(sock, data, results, key):
                     total += d
             except (socket.timeout, BlockingIOError):
                 pass
-            finally:
-                sock.settimeout(30)
+        # All data sent — blocking recv; no more 50ms spin
         while len(total) < len(data):
             d = sock.recv(65536)
             if not d:
