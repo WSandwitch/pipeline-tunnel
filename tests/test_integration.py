@@ -83,8 +83,6 @@ def discover_modules():
     for line in r.stderr.split('\n'):
         if line.startswith("  "):
             name = line.strip().split()[0]
-            if name == "sleep":
-                continue
             mods.append(name)
     return mods
 
