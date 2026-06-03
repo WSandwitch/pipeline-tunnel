@@ -283,6 +283,13 @@ def long_bidi(cli_port, tgt_port, count, size):
     return ok
 
 
+def _thread_arg(threads):
+    """Return '-t' list item: '-t' alone for auto (0), or ['-t', str(N)] otherwise."""
+    if threads == 0:
+        return ["-t"]
+    return ["-t", str(threads)]
+
+
 def _start_tunnel(svr_port, cli_port, tgt_port, chain_config=None, threads=1):
     """Start server+client pair, return (svr_proc, cli_proc).
     Retries with new ports on first failure.
@@ -294,7 +301,7 @@ def _start_tunnel(svr_port, cli_port, tgt_port, chain_config=None, threads=1):
             cli_port = _find_free_port(33001, 34000)
 
         svr = subprocess.Popen([SERVER, f"-l{HOST}:{svr_port}", f"-A{PASS}",
-                                f"-M{MPATH}", f"-t{threads}"],
+                                f"-M{MPATH}"] + _thread_arg(threads),
                                stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
                                cwd=APP)
         try:
@@ -303,10 +310,13 @@ def _start_tunnel(svr_port, cli_port, tgt_port, chain_config=None, threads=1):
             _kill(svr)
             continue
 
-        cli = subprocess.Popen([CLIENT, f"-L{HOST}:{cli_port}:{HOST}:{tgt_port}",
-                                f"-M{MPATH}", f"-t{threads}",
-                                f"{HOST}:{svr_port},{PASS}"
-                                + (f";{chain_config}" if chain_config else "")],
+        cli_args = [CLIENT, f"-L{HOST}:{cli_port}:{HOST}:{tgt_port}",
+                    f"-M{MPATH}",
+                    f"{HOST}:{svr_port},{PASS}"
+                    + (f";{chain_config}" if chain_config else "")]
+        # Put -t after positional to avoid it eating chain_config arg
+        cli_args += _thread_arg(threads)
+        cli = subprocess.Popen(cli_args,
                                stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
                                cwd=APP)
         try:
@@ -325,9 +335,11 @@ def _stop_tunnel(svr, cli):
     _kill(svr)
 
 
-def run_tunnel_short_test(chain_config=None):
+def run_tunnel_short_test(chain_config=None, threads=1):
     """Tunnel mode: short HTTP requests only."""
     label = chain_config or "tunnel"
+    if threads:
+        label += f" t{threads}"
     min_pct = 100 if chain_config else TUNNEL_MIN_PCT
     tgt_port = _find_free_port(31000, 32000)
 
@@ -339,7 +351,7 @@ def run_tunnel_short_test(chain_config=None):
         _wait_port_listen(tgt_port)
         svr, cli, _, cli_port = _start_tunnel(
             _find_free_port(32001, 33000), _find_free_port(33001, 34000),
-            tgt_port, chain_config)
+            tgt_port, chain_config, threads=threads)
     except:
         _kill(httpd)
         raise
@@ -354,7 +366,7 @@ def run_tunnel_short_test(chain_config=None):
         _stop_tunnel(svr, cli)
 
 
-def run_tunnel_long_test(chain_config=None):
+def run_tunnel_long_test(chain_config=None, threads=1):
     """Tunnel mode: long echo data (own echo target)."""
     label = chain_config or "tunnel"
     min_pct = 100 if chain_config else TUNNEL_MIN_PCT
@@ -399,7 +411,7 @@ def run_tunnel_long_test(chain_config=None):
     try:
         svr, cli, _, cli_port = _start_tunnel(
             _find_free_port(32001, 33000), _find_free_port(33001, 34000),
-            tgt_port, chain_config)
+            tgt_port, chain_config, threads=threads)
     except:
         echo_stop.set()
         raise
@@ -414,12 +426,12 @@ def run_tunnel_long_test(chain_config=None):
         _stop_tunnel(svr, cli)
 
 
-def _long_bidi_once(tgt_port, size, chain_config=None):
+def _long_bidi_once(tgt_port, size, chain_config=None, threads=1):
     """Single bidi transfer: own tunnel instance, 4 parallel threads."""
     try:
         svr, cli, _, cli_port = _start_tunnel(
             _find_free_port(32001, 33000), _find_free_port(33001, 34000),
-            tgt_port, chain_config)
+            tgt_port, chain_config, threads=threads)
     except:
         return 0
 
@@ -483,13 +495,13 @@ def _long_bidi_once(tgt_port, size, chain_config=None):
         _stop_tunnel(svr, cli)
 
 
-def run_tunnel_bidi_test(chain_config=None):
+def run_tunnel_bidi_test(chain_config=None, threads=1):
     """Tunnel mode: parallel bidirectional data (fresh tunnel per iteration)."""
     label = chain_config or "tunnel"
     ok = 0
     for i in range(LONG_COUNT):
         tgt_port = _find_free_port(31000, 32000)
-        result = _long_bidi_once(tgt_port, BIDI_SIZE, chain_config)
+        result = _long_bidi_once(tgt_port, BIDI_SIZE, chain_config, threads=threads)
         ok += result
         print(f"  [{label}] bidi iter {i}: {'OK' if result else 'FAIL'}", flush=True)
     bidi_pct = ok * 100 // max(LONG_COUNT, 1)
@@ -497,7 +509,7 @@ def run_tunnel_bidi_test(chain_config=None):
     return bidi_pct >= TUNNEL_MIN_PCT
 
 
-def run_tunnel_blocking_test(chain_config=None):
+def run_tunnel_blocking_test(chain_config=None, threads=1):
     """Tunnel mode: blocking write (partial send), interleaved read."""
     label = chain_config or "tunnel"
     tgt_port = _find_free_port(31000, 32000)
@@ -538,7 +550,7 @@ def run_tunnel_blocking_test(chain_config=None):
     try:
         svr, cli, _, cli_port = _start_tunnel(
             _find_free_port(32001, 33000), _find_free_port(33001, 34000),
-            tgt_port, chain_config)
+            tgt_port, chain_config, threads=threads)
     except:
         echo_stop.set()
         raise
@@ -552,7 +564,7 @@ def run_tunnel_blocking_test(chain_config=None):
         _stop_tunnel(svr, cli)
 
 
-def run_tunnel_blocking_bidi_test(chain_config=None):
+def run_tunnel_blocking_bidi_test(chain_config=None, threads=1):
     """Blocking bidi: 2 directions in parallel, partial send + interleaved recv."""
     label = chain_config or "tunnel"
     tgt_port = _find_free_port(31000, 32000)
@@ -593,7 +605,7 @@ def run_tunnel_blocking_bidi_test(chain_config=None):
     try:
         svr, cli, _, cli_port = _start_tunnel(
             _find_free_port(32001, 33000), _find_free_port(33001, 34000),
-            tgt_port, chain_config)
+            tgt_port, chain_config, threads=threads)
     except:
         echo_stop.set()
         raise
@@ -630,7 +642,7 @@ def run_tunnel_blocking_bidi_test(chain_config=None):
         _stop_tunnel(svr, cli)
 
 
-def run_tunnel_test(chain_config=None):
+def run_tunnel_test(chain_config=None, threads=1):
     """Tunnel mode: short HTTP + long echo + blocking + bidi + blocking_bidi."""
     ok = True
     for name, fn in [("short", run_tunnel_short_test),
@@ -641,11 +653,36 @@ def run_tunnel_test(chain_config=None):
         if not ok:
             break
         try:
-            ok = fn(chain_config)
+            ok = fn(chain_config, threads=threads)
         except:
             ok = False
         killall()
     return ok
+
+
+def run_tunnel_test_threads(chain_config=None, thread_list=None):
+    """Run all tunnel tests with each thread count in thread_list.
+    thread_list: iterable of ints (0 = auto). Default: [1,2,3,4,8,0].
+    Returns dict {threads: ok_bool}.
+    """
+    if thread_list is None:
+        thread_list = [1, 2, 3, 4, 8, 0]
+    results = {}
+    for tc in thread_list:
+        label = f"t{tc}" if tc else "tauto"
+        killall()
+        print(f"\n--- threads={label} ---", flush=True)
+        t0 = time.time()
+        try:
+            ok = run_tunnel_test(chain_config, threads=tc)
+        except:
+            ok = False
+        elapsed = time.time() - t0
+        print(f"  threads={label}: {'PASS' if ok else 'FAIL'} ({elapsed:.1f}s)", flush=True)
+        results[tc] = ok
+        if not ok:
+            break
+    return results
 
 
 _TEST_FUNCS = {
@@ -672,6 +709,18 @@ if __name__ == "__main__":
         cfg = sys.argv[2] if len(sys.argv) > 2 else None
         ok = run_tunnel_test(cfg)
         sys.exit(0 if ok else 1)
+
+    if len(sys.argv) > 1 and sys.argv[1] == "--run-threads":
+        # Run tunnel test with multiple thread counts
+        cfg = sys.argv[2] if len(sys.argv) > 2 and sys.argv[2] else None
+        results = run_tunnel_test_threads(cfg)
+        passed = sum(1 for v in results.values() if v)
+        total = len(results)
+        print(f"\n  {passed}/{total} passed", flush=True)
+        for tc, ok in results.items():
+            label = f"t{tc}" if tc else "tauto"
+            print(f"    {label}: {'PASS' if ok else 'FAIL'}", flush=True)
+        sys.exit(0 if all(results.values()) else 1)
 
     killall()
     mods = discover_modules()
