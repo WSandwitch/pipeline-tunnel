@@ -73,6 +73,9 @@ def _find_free_port(low=31000, high=34000):
             continue
     raise RuntimeError("no free port found")
 
+MODULE_CONF_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "module_conf")
+
+
 def discover_modules():
     r = subprocess.run([SERVER, "--module-list", f"-M{MPATH}"],
                        capture_output=True, text=True, cwd=APP)
@@ -84,6 +87,31 @@ def discover_modules():
                 continue
             mods.append(name)
     return mods
+
+
+def read_module_configs(module_name):
+    """Read config list for a module from module_conf/{module}.cfg.list.
+    Returns list of config strings (empty if no config file found).
+    Config is from line start to first space, '#' or end of line.
+    Empty lines and lines starting with '#' are skipped.
+    """
+    path = os.path.join(MODULE_CONF_DIR, f"{module_name}.cfg.list")
+    if not os.path.exists(path):
+        return []
+    configs = []
+    with open(path) as f:
+        for line in f:
+            line = line.strip()
+            if not line or line.startswith('#'):
+                continue
+            # Strip from first space or #
+            for sep in (' ', '#'):
+                idx = line.find(sep)
+                if idx >= 0:
+                    line = line[:idx]
+            if line:
+                configs.append(line)
+    return configs
 
 
 def short_http(cli_port, count):
@@ -726,9 +754,19 @@ if __name__ == "__main__":
     mods = discover_modules()
     print(f"Modules: {mods}", flush=True)
 
+    # Build config list: tunnel + modules with their config files
+    configs_to_test = [None]
+    for m in mods:
+        cfgs = read_module_configs(m)
+        if cfgs:
+            for c in cfgs:
+                configs_to_test.append(f"{m}|{c}")
+        else:
+            configs_to_test.append(m)
+
     results = {}
 
-    for cfg in [None] + mods:
+    for cfg in configs_to_test:
         killall()
         label = cfg or "tunnel"
         print(f"\n--- {label} ---", flush=True)

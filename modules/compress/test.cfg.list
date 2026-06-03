@@ -1,0 +1,9 @@
+gzip
+gzip:1
+gzip:5
+gzip:9
+zstd
+zstd:1
+zstd:5
+zstd:10
+zstd:15
