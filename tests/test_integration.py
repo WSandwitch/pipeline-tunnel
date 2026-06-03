@@ -711,6 +711,14 @@ def run_tunnel_test_threads(chain_config=None, thread_list=None):
     return results
 
 
+class Task:
+    """Runs all 5 tunnel subtests for a given config and worker count."""
+
+    def test(self, workers=1, config=None):
+        """Run all 5 subtests. Returns True if all pass."""
+        return run_tunnel_test(chain_config=config, threads=workers)
+
+
 _TEST_FUNCS = {
     "short": run_tunnel_short_test,
     "long": run_tunnel_long_test,
@@ -721,7 +729,6 @@ _TEST_FUNCS = {
 
 if __name__ == "__main__":
     if len(sys.argv) > 2 and sys.argv[1] == "--run-test":
-        # Subprocess mode: run a single test for a specific config
         test_name = sys.argv[2]
         cfg = sys.argv[3] if len(sys.argv) > 3 and sys.argv[3] else None
         fn = _TEST_FUNCS.get(test_name)
@@ -731,13 +738,11 @@ if __name__ == "__main__":
         sys.exit(0 if ok else 1)
 
     if len(sys.argv) > 1 and sys.argv[1] == "--run":
-        # Legacy: run all tests for a config in one shot
         cfg = sys.argv[2] if len(sys.argv) > 2 else None
         ok = run_tunnel_test(cfg)
         sys.exit(0 if ok else 1)
 
     if len(sys.argv) > 1 and sys.argv[1] == "--run-threads":
-        # Run tunnel test with multiple thread counts
         cfg = sys.argv[2] if len(sys.argv) > 2 and sys.argv[2] else None
         results = run_tunnel_test_threads(cfg)
         passed = sum(1 for v in results.values() if v)
@@ -748,62 +753,18 @@ if __name__ == "__main__":
             print(f"    {label}: {'PASS' if ok else 'FAIL'}", flush=True)
         sys.exit(0 if all(results.values()) else 1)
 
-    killall()
-    mods = discover_modules()
-    print(f"Modules: {mods}", flush=True)
+    if len(sys.argv) > 2 and sys.argv[1] == "--task":
+        workers = int(sys.argv[2])
+        cfg = sys.argv[3] if len(sys.argv) > 3 and sys.argv[3] else None
+        ok = Task().test(workers=workers, config=cfg)
+        sys.exit(0 if ok else 1)
 
-    # Build config list: tunnel + modules with their config files
-    configs_to_test = [None]
-    for m in mods:
-        cfgs = read_module_configs(m)
-        if cfgs:
-            for c in cfgs:
-                configs_to_test.append(f"{m}|{c}")
-        else:
-            configs_to_test.append(m)
-
-    results = {}
-
-    for cfg in configs_to_test:
-        killall()
-        label = cfg or "tunnel"
-        print(f"\n--- {label} ---", flush=True)
-
-        all_ok = True
-        for test_name in ("short", "long", "blocking", "blocking_bidi", "bidi"):
-            killall()
-            try:
-                p = subprocess.run(
-                    [sys.executable, __file__, "--run-test", test_name, cfg or ""],
-                    timeout=PER_TEST_TIMEOUT,
-                    capture_output=True, text=True,
-                    cwd=os.path.dirname(os.path.abspath(__file__ or "."))
-                )
-                if p.stdout: print(p.stdout, end="", flush=True)
-                if p.stderr: print(p.stderr, end="", flush=True)
-                ok = (p.returncode == 0)
-                print(f"  {label} {test_name}: {'OK' if ok else 'FAIL'}", flush=True)
-                if not ok:
-                    all_ok = False
-                    break
-            except subprocess.TimeoutExpired:
-                print(f"  {label} {test_name}: TIMEOUT ({PER_TEST_TIMEOUT}s)", flush=True)
-                killall()
-                all_ok = False
-                break
-            except:
-                print(f"  {label} {test_name}: EXCEPTION", flush=True)
-                all_ok = False
-                break
-            finally:
-                killall()
-
-        print(f"  {label}: {'PASS' if all_ok else 'FAIL'}", flush=True)
-        results[label] = all_ok
-
+    from test_tester import Tester
+    task = Task()
+    tester = Tester()
+    results = tester.run(task)
     passed = sum(1 for v in results.values() if v)
     total = len(results)
     print(f"\n  {passed}/{total} passed", flush=True)
-    all_ok = all(results.values())
-    print(f"{'ALL PASS' if all_ok else 'SOME FAILED'}", flush=True)
-    sys.exit(0 if all_ok else 1)
+    print(f"{'ALL PASS' if all(results.values()) else 'SOME FAILED'}", flush=True)
+    sys.exit(0 if all(results.values()) else 1)
