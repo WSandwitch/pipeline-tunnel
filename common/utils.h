@@ -22,6 +22,9 @@ constexpr uint8_t TYPE_DATA = 0;
 constexpr uint8_t TYPE_DISCONNECT = 1;
 constexpr uint8_t TYPE_PAUSE = 2;
 constexpr uint8_t TYPE_RESUME = 3;
+constexpr uint8_t TYPE_CONNECT_REQ = 0x10;
+constexpr uint8_t TYPE_CONNECT_OK = 0x11;
+constexpr uint8_t TYPE_CONNECT_FAIL = 0x12;
 
 std::vector<uint8_t> make_varint_packet(const uint8_t *data, size_t len);
 std::vector<uint8_t> make_varint_packet_with_conn_id(uint8_t conn_id, const uint8_t *data, size_t len);

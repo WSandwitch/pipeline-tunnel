@@ -24,42 +24,54 @@ BLOCKING_SIZE = int(os.environ.get("INTEGRATION_BLOCKING_SIZE", "2097152"))
 BLOCKING_CHUNK = int(os.environ.get("INTEGRATION_BLOCKING_CHUNK", "131072"))
 TUNNEL_MIN_PCT = int(os.environ.get("INTEGRATION_MIN_PCT", "90"))
 TEST_TIMEOUT = int(os.environ.get("INTEGRATION_TIMEOUT", "120"))
+PER_TEST_TIMEOUT = int(os.environ.get("INTEGRATION_PER_TEST_TIMEOUT", str(TEST_TIMEOUT)))
 
 
-def _wait_port(port, timeout=5, listener=False):
-    """Poll until port is ready.
-    For listener ports (client): use ss (no connection established).
-    For server ports: use TCP connect (harmless for server control port).
-    """
+def _kill(proc):
+    """Safely kill a subprocess: SIGTERM → wait 3s → SIGKILL."""
+    if not proc or proc.poll() is not None:
+        return
+    try:
+        proc.terminate()
+        proc.wait(timeout=3)
+    except subprocess.TimeoutExpired:
+        proc.kill()
+        proc.wait()
+
+def killall():
+    """Kill all tunnel processes. No sleep."""
+    subprocess.run(["killall", "-9", "modtunnel-server", "modtunnel-client"],
+                   capture_output=True, timeout=5)
+
+def _wait_port_listen(port, timeout=5):
+    """Wait until a process is LISTENing on port (using ss). Faster than connect()."""
     deadline = time.monotonic() + timeout
-    hex_port = f":{port:04X}"
     while time.monotonic() < deadline:
-        if listener:
-            # Check LISTEN state without connecting (avoids triggering accept)
-            try:
-                r = subprocess.run(["ss", "-tln", f"sport = {port}"],
-                                   capture_output=True, text=True, timeout=5)
-                if f"127.0.0.1:{port}" in r.stdout or f"0.0.0.0:{port}" in r.stdout:
-                    return
-            except:
-                pass
-        else:
-            try:
-                s = socket.socket()
-                s.settimeout(0.5)
-                s.connect((HOST, port))
-                s.close()
+        try:
+            r = subprocess.run(["ss", "-tln", f"sport = {port}"],
+                               capture_output=True, text=True, timeout=5)
+            out = r.stdout
+            if f"127.0.0.1:{port}" in out or f"0.0.0.0:{port}" in out:
                 return
-            except:
-                pass
+        except:
+            pass
         time.sleep(0.05)
     raise TimeoutError(f"port {port} not ready after {timeout}s")
 
-def killall():
-    subprocess.run(["killall", "-9", "modtunnel-server", "modtunnel-client"],
-                   capture_output=True)
-    time.sleep(0.3)
 
+def _find_free_port(low=31000, high=34000):
+    """Return a free port in [low, high] by trying to bind()."""
+    for _ in range(50):
+        port = random.randint(low, high)
+        try:
+            s = socket.socket()
+            s.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+            s.bind(("", port))
+            s.close()
+            return port
+        except OSError:
+            continue
+    raise RuntimeError("no free port found")
 
 def discover_modules():
     r = subprocess.run([SERVER, "--module-list", f"-M{MPATH}"],
@@ -68,6 +80,8 @@ def discover_modules():
     for line in r.stderr.split('\n'):
         if line.startswith("  "):
             name = line.strip().split()[0]
+            if name == "sleep" or name == "split":
+                continue
             mods.append(name)
     return mods
 
@@ -182,6 +196,7 @@ def _bidi_worker(sock, data, results, key):
             except (socket.timeout, BlockingIOError):
                 pass
         # All data sent — blocking recv; no more 50ms spin
+        sock.settimeout(120)
         while len(total) < len(data):
             d = sock.recv(65536)
             if not d:
@@ -269,44 +284,65 @@ def long_bidi(cli_port, tgt_port, count, size):
 
 
 def _start_tunnel(svr_port, cli_port, tgt_port, chain_config=None, threads=1):
-    """Start server+client pair, return (svr_proc, cli_proc)."""
-    svr = subprocess.Popen([SERVER, f"-l{HOST}:{svr_port}", f"-A{PASS}",
-                            f"-M{MPATH}", f"-t{threads}"],
-                           stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
-                           cwd=APP)
-    _wait_port(svr_port)
+    """Start server+client pair, return (svr_proc, cli_proc).
+    Retries with new ports on first failure.
+    Returns (svr_proc, cli_proc, svr_port, cli_port).
+    """
+    for attempt in range(3):
+        if attempt > 0:
+            svr_port = _find_free_port(32001, 33000)
+            cli_port = _find_free_port(33001, 34000)
 
-    client_cmd = f"{HOST}:{svr_port},{PASS}"
-    if chain_config:
-        client_cmd += f";{chain_config}"
-    cli = subprocess.Popen([CLIENT, f"-L{HOST}:{cli_port}:{HOST}:{tgt_port}",
-                            f"-M{MPATH}", f"-t{threads}", client_cmd],
-                           stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
-                           cwd=APP)
-    _wait_port(cli_port, listener=True)
-    return svr, cli
+        svr = subprocess.Popen([SERVER, f"-l{HOST}:{svr_port}", f"-A{PASS}",
+                                f"-M{MPATH}", f"-t{threads}"],
+                               stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+                               cwd=APP)
+        try:
+            _wait_port_listen(svr_port)
+        except TimeoutError:
+            _kill(svr)
+            continue
+
+        cli = subprocess.Popen([CLIENT, f"-L{HOST}:{cli_port}:{HOST}:{tgt_port}",
+                                f"-M{MPATH}", f"-t{threads}",
+                                f"{HOST}:{svr_port},{PASS}"
+                                + (f";{chain_config}" if chain_config else "")],
+                               stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+                               cwd=APP)
+        try:
+            _wait_port_listen(cli_port)
+            return svr, cli, svr_port, cli_port
+        except TimeoutError:
+            _kill(cli)
+            _kill(svr)
+            continue
+
+    raise RuntimeError(f"cannot start tunnel after 3 attempts")
 
 
 def _stop_tunnel(svr, cli):
-    cli.terminate(); cli.wait()
-    svr.terminate(); svr.wait()
+    _kill(cli)
+    _kill(svr)
 
 
 def run_tunnel_short_test(chain_config=None):
     """Tunnel mode: short HTTP requests only."""
     label = chain_config or "tunnel"
     min_pct = 100 if chain_config else TUNNEL_MIN_PCT
-    tgt_port = random.randint(31000, 32000)
-    svr_port = random.randint(32001, 33000)
-    cli_port = random.randint(33001, 34000)
+    tgt_port = _find_free_port(31000, 32000)
 
     httpd_dir = tempfile.mkdtemp()
     httpd = subprocess.Popen(["python3", "-m", "http.server", str(tgt_port),
                               "-d", httpd_dir],
                              stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
-    _wait_port(tgt_port)
-
-    svr, cli = _start_tunnel(svr_port, cli_port, tgt_port, chain_config)
+    try:
+        _wait_port_listen(tgt_port)
+        svr, cli, _, cli_port = _start_tunnel(
+            _find_free_port(32001, 33000), _find_free_port(33001, 34000),
+            tgt_port, chain_config)
+    except:
+        _kill(httpd)
+        raise
 
     try:
         short_ok = short_http(cli_port, SHORT_COUNT)
@@ -314,7 +350,7 @@ def run_tunnel_short_test(chain_config=None):
         print(f"  [{label}] short={short_ok}/{SHORT_COUNT} ({short_pct}%)", flush=True)
         return short_pct >= min_pct
     finally:
-        httpd.terminate(); httpd.wait(timeout=5)
+        _kill(httpd)
         _stop_tunnel(svr, cli)
 
 
@@ -322,9 +358,7 @@ def run_tunnel_long_test(chain_config=None):
     """Tunnel mode: long echo data (own echo target)."""
     label = chain_config or "tunnel"
     min_pct = 100 if chain_config else TUNNEL_MIN_PCT
-    tgt_port = random.randint(31000, 32000)
-    svr_port = random.randint(32001, 33000)
-    cli_port = random.randint(33001, 34000)
+    tgt_port = _find_free_port(31000, 32000)
 
     echo_stop = threading.Event()
     echo_ready = threading.Event()
@@ -362,7 +396,13 @@ def run_tunnel_long_test(chain_config=None):
     t.start()
     echo_ready.wait()
 
-    svr, cli = _start_tunnel(svr_port, cli_port, tgt_port, chain_config)
+    try:
+        svr, cli, _, cli_port = _start_tunnel(
+            _find_free_port(32001, 33000), _find_free_port(33001, 34000),
+            tgt_port, chain_config)
+    except:
+        echo_stop.set()
+        raise
 
     try:
         long_ok = long_echo(cli_port, LONG_COUNT, LONG_SIZE)
@@ -374,9 +414,15 @@ def run_tunnel_long_test(chain_config=None):
         _stop_tunnel(svr, cli)
 
 
-def _long_bidi_once(cli_port, tgt_port, size, chain_config=None):
+def _long_bidi_once(tgt_port, size, chain_config=None):
     """Single bidi transfer: own tunnel instance, 4 parallel threads."""
-    svr, cli = _start_tunnel(random.randint(32001, 33000), cli_port, tgt_port, chain_config)
+    try:
+        svr, cli, _, cli_port = _start_tunnel(
+            _find_free_port(32001, 33000), _find_free_port(33001, 34000),
+            tgt_port, chain_config)
+    except:
+        return 0
+
     try:
         client_data = os.urandom(size)
         server_data = os.urandom(size)
@@ -442,9 +488,8 @@ def run_tunnel_bidi_test(chain_config=None):
     label = chain_config or "tunnel"
     ok = 0
     for i in range(LONG_COUNT):
-        tgt_port = random.randint(31000, 32000)
-        cli_port = random.randint(33001, 34000)
-        result = _long_bidi_once(cli_port, tgt_port, BIDI_SIZE, chain_config)
+        tgt_port = _find_free_port(31000, 32000)
+        result = _long_bidi_once(tgt_port, BIDI_SIZE, chain_config)
         ok += result
         print(f"  [{label}] bidi iter {i}: {'OK' if result else 'FAIL'}", flush=True)
     bidi_pct = ok * 100 // max(LONG_COUNT, 1)
@@ -455,9 +500,7 @@ def run_tunnel_bidi_test(chain_config=None):
 def run_tunnel_blocking_test(chain_config=None):
     """Tunnel mode: blocking write (partial send), interleaved read."""
     label = chain_config or "tunnel"
-    tgt_port = random.randint(31000, 32000)
-    svr_port = random.randint(32001, 33000)
-    cli_port = random.randint(33001, 34000)
+    tgt_port = _find_free_port(31000, 32000)
 
     echo_stop = threading.Event()
     echo_ready = threading.Event()
@@ -492,7 +535,14 @@ def run_tunnel_blocking_test(chain_config=None):
     t.start()
     echo_ready.wait()
 
-    svr, cli = _start_tunnel(svr_port, cli_port, tgt_port, chain_config)
+    try:
+        svr, cli, _, cli_port = _start_tunnel(
+            _find_free_port(32001, 33000), _find_free_port(33001, 34000),
+            tgt_port, chain_config)
+    except:
+        echo_stop.set()
+        raise
+
     try:
         ok = blocking_echo(cli_port)
         print(f"  [{label}] blocking={'OK' if ok else 'FAIL'}", flush=True)
@@ -505,9 +555,7 @@ def run_tunnel_blocking_test(chain_config=None):
 def run_tunnel_blocking_bidi_test(chain_config=None):
     """Blocking bidi: 2 directions in parallel, partial send + interleaved recv."""
     label = chain_config or "tunnel"
-    tgt_port = random.randint(31000, 32000)
-    svr_port = random.randint(32001, 33000)
-    cli_port = random.randint(33001, 34000)
+    tgt_port = _find_free_port(31000, 32000)
 
     echo_stop = threading.Event()
     echo_ready = threading.Event()
@@ -542,7 +590,13 @@ def run_tunnel_blocking_bidi_test(chain_config=None):
     t.start()
     echo_ready.wait()
 
-    svr, cli = _start_tunnel(svr_port, cli_port, tgt_port, chain_config, threads=2)
+    try:
+        svr, cli, _, cli_port = _start_tunnel(
+            _find_free_port(32001, 33000), _find_free_port(33001, 34000),
+            tgt_port, chain_config)
+    except:
+        echo_stop.set()
+        raise
 
     try:
         data0 = os.urandom(BLOCKING_SIZE)
@@ -578,17 +632,43 @@ def run_tunnel_blocking_bidi_test(chain_config=None):
 
 def run_tunnel_test(chain_config=None):
     """Tunnel mode: short HTTP + long echo + blocking + bidi + blocking_bidi."""
-    short_ok = run_tunnel_short_test(chain_config)
-    long_ok = run_tunnel_long_test(chain_config)
-    blocking_ok = run_tunnel_blocking_test(chain_config)
-    blocking_bidi_ok = run_tunnel_blocking_bidi_test(chain_config)
-    bidi_ok = run_tunnel_bidi_test(chain_config)
-    return short_ok and long_ok and blocking_ok and blocking_bidi_ok and bidi_ok
+    ok = True
+    for name, fn in [("short", run_tunnel_short_test),
+                     ("long", run_tunnel_long_test),
+                     ("blocking", run_tunnel_blocking_test),
+                     ("blocking_bidi", run_tunnel_blocking_bidi_test),
+                     ("bidi", run_tunnel_bidi_test)]:
+        if not ok:
+            break
+        try:
+            ok = fn(chain_config)
+        except:
+            ok = False
+        killall()
+    return ok
 
+
+_TEST_FUNCS = {
+    "short": run_tunnel_short_test,
+    "long": run_tunnel_long_test,
+    "blocking": run_tunnel_blocking_test,
+    "blocking_bidi": run_tunnel_blocking_bidi_test,
+    "bidi": run_tunnel_bidi_test,
+}
 
 if __name__ == "__main__":
+    if len(sys.argv) > 2 and sys.argv[1] == "--run-test":
+        # Subprocess mode: run a single test for a specific config
+        test_name = sys.argv[2]
+        cfg = sys.argv[3] if len(sys.argv) > 3 and sys.argv[3] else None
+        fn = _TEST_FUNCS.get(test_name)
+        if fn is None:
+            sys.exit(1)
+        ok = fn(cfg)
+        sys.exit(0 if ok else 1)
+
     if len(sys.argv) > 1 and sys.argv[1] == "--run":
-        # Subprocess mode: run_tunnel_test for a specific config
+        # Legacy: run all tests for a config in one shot
         cfg = sys.argv[2] if len(sys.argv) > 2 else None
         ok = run_tunnel_test(cfg)
         sys.exit(0 if ok else 1)
@@ -603,22 +683,38 @@ if __name__ == "__main__":
         killall()
         label = cfg or "tunnel"
         print(f"\n--- {label} ---", flush=True)
-        try:
-            p = subprocess.run(
-                [sys.executable, __file__, "--run", cfg or ""],
-                timeout=TEST_TIMEOUT,
-                capture_output=True, text=True,
-                cwd=os.path.dirname(os.path.abspath(__file__ or "."))
-            )
-            if p.stdout: print(p.stdout, end="", flush=True)
-            if p.stderr: print(p.stderr, end="", flush=True)
-            ok = (p.returncode == 0)
-            print(f"  {label}: {'PASS' if ok else 'FAIL'}", flush=True)
-            results[label] = ok
-        except subprocess.TimeoutExpired:
-            print(f"  {label}: TIMEOUT ({TEST_TIMEOUT}s)", flush=True)
-            results[label] = False
+
+        all_ok = True
+        for test_name in ("short", "long", "blocking", "blocking_bidi", "bidi"):
             killall()
+            try:
+                p = subprocess.run(
+                    [sys.executable, __file__, "--run-test", test_name, cfg or ""],
+                    timeout=PER_TEST_TIMEOUT,
+                    capture_output=True, text=True,
+                    cwd=os.path.dirname(os.path.abspath(__file__ or "."))
+                )
+                if p.stdout: print(p.stdout, end="", flush=True)
+                if p.stderr: print(p.stderr, end="", flush=True)
+                ok = (p.returncode == 0)
+                print(f"  {label} {test_name}: {'OK' if ok else 'FAIL'}", flush=True)
+                if not ok:
+                    all_ok = False
+                    break
+            except subprocess.TimeoutExpired:
+                print(f"  {label} {test_name}: TIMEOUT ({PER_TEST_TIMEOUT}s)", flush=True)
+                killall()
+                all_ok = False
+                break
+            except:
+                print(f"  {label} {test_name}: EXCEPTION", flush=True)
+                all_ok = False
+                break
+            finally:
+                killall()
+
+        print(f"  {label}: {'PASS' if all_ok else 'FAIL'}", flush=True)
+        results[label] = all_ok
 
     passed = sum(1 for v in results.values() if v)
     total = len(results)

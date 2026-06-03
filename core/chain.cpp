@@ -143,16 +143,15 @@ int Chain::handle_read_packet_size(size_t mod_idx, int fd) {
 }
 
 int Chain::handle_read_packet(size_t mod_idx, int fd, uint8_t *buf) {
-    ChainNode &node = nodes_[mod_idx];
-    int remaining = node.pending_packet_size;
-    node.pending_packet_size = 0;
-
-    // fd_bufs has: varint + body[0..packetsize-2] (packetsize-1 body bytes)
-    // Last body byte (body[packetsize-1]) is still in socketpair
-    size_t from_buf = (remaining > 0) ? (size_t)remaining - 1 : 0;
-
+    (void)mod_idx;
+    int remaining;
+    size_t from_buf;
     {
         std::lock_guard<std::mutex> lock(fd_data_mutex_);
+        remaining = fd_pending_sizes_[fd];
+        fd_pending_sizes_[fd] = 0;
+        from_buf = (remaining > 0) ? (size_t)remaining - 1 : 0;
+
         auto &fdbuf = fd_bufs_[fd];
         auto &cursor = fd_cursors_[fd];
 
@@ -184,8 +183,9 @@ int Chain::handle_write_packet(size_t mod_idx, int fd,
     frame.insert(frame.end(), data, data + len);
 
     ssize_t w = write(fd, frame.data(), frame.size());
-    if (w == (ssize_t)frame.size())
+    if (w == (ssize_t)frame.size()) {
         return 0;
+    }
 
     auto do_pause = [&]() {
         if (mod_idx >= nodes_.size()) return;
@@ -243,8 +243,10 @@ int Chain::handle_write_packet(size_t mod_idx, int fd,
 int Chain::read_packet_size_thunk(void *kernel_ctx, int fd) {
     auto *data = (std::pair<Chain *, size_t> *)kernel_ctx;
     int sz = data->first->handle_read_packet_size(data->second, fd);
-    if (sz >= 0)
-        data->first->nodes_[data->second].pending_packet_size = sz;
+    if (sz >= 0) {
+        std::lock_guard<std::mutex> lock(data->first->fd_data_mutex_);
+        data->first->fd_pending_sizes_[fd] = sz;
+    }
     return sz;
 }
 
@@ -600,10 +602,20 @@ void Chain::on_fd_ready(int fd) {
             shift += 7;
         }
         size_t varint_bytes = tmp_pos - cursor;
-        // +1 accounts for last body byte still in socketpair
         if (has_varint && cursor + varint_bytes + pkt_val <= buf.size() + 1) {
-            save = cursor;
-            have_packet = true;
+            if (pkt_val <= 1) {
+                // Spurious varint with body <= 1 — no module produces
+                // packets this small.  Consume the varint bytes from buf
+                // only; the "body byte" allowance (+1 in the check above)
+                // may not actually exist.  If it does, it stays in the
+                // fd socket buffer and is handled by the next epoll event.
+                cursor += varint_bytes;
+                buf.erase(buf.begin(), buf.begin() + cursor);
+                cursor = 0;
+            } else {
+                save = cursor;
+                have_packet = true;
+            }
         }
     }
 

@@ -177,10 +177,7 @@ void Client::register_data_connection_reader(size_t idx) {
                 if (pos >= 10 || shift >= 56) { buf.clear(); break; }
                 if (pos > buf.size() || pos + val > buf.size()) break;
 
-                uint8_t first = buf[pos];
-                if (first == 255) {
-                    dispatch_data_conn_packet(255, buf.data() + pos + 1, val - 1);
-                } else if (chain_ && chain_->valid()) {
+                if (chain_ && chain_->valid()) {
                     auto out_fds = chain_->output_fds();
                     if (idx < out_fds.size()) {
                         int out_fd = out_fds[idx];
@@ -196,7 +193,7 @@ void Client::register_data_connection_reader(size_t idx) {
                     }
                     }
                 } else {
-                    dispatch_data_conn_packet(first, buf.data() + pos + 1, val - 1);
+                    dispatch_data_conn_packet(buf[pos], buf.data() + pos + 1, val - 1);
                 }
                 buf.erase(buf.begin(), buf.begin() + pos + val);
             }
@@ -361,12 +358,17 @@ void Client::on_listener_accept(int cfd, const struct sockaddr_in &addr) {
         }
         return;
     }
-    std::vector<uint8_t> payload;
-    payload.push_back(conn_id);
-    payload.push_back((uint8_t)target.size());
-    payload.insert(payload.end(), target.begin(), target.end());
-    Packet req = Protocol::make_msg(MSG_CONNECT_REQ, payload);
-    send_control(req);
+    if (chain_ && chain_->valid()) {
+        std::vector<uint8_t> pkt = {TYPE_CONNECT_REQ, conn_id, (uint8_t)target.size()};
+        pkt.insert(pkt.end(), target.begin(), target.end());
+        auto framed = make_varint_packet(pkt.data(), pkt.size());
+        int in_fd = chain_->input_fd();
+        if (in_fd >= 0) {
+            int ret = chain_in_writer_.write(in_fd, framed.data(), framed.size());
+            if (ret > 0 && !chain_in_writer_.registered)
+                register_chain_in_epollout(in_fd);
+        }
+    }
 
     // Register in epoll instead of creating a thread
     kernel_->add_fd_handler(cfd, [this, conn_id](int fd, uint32_t events) {
@@ -429,16 +431,13 @@ void Client::on_external_disconnect(uint8_t conn_id) {
         kernel_->del_fd(fd);
         close(fd);
     }
-    if (chain_ && chain_->valid()) {
-        std::vector<uint8_t> marker = {TYPE_DISCONNECT, conn_id};
-        auto framed = make_varint_packet(marker.data(), marker.size());
-        chain_in_writer_.write(chain_->input_fd(), framed.data(), framed.size());
+    std::vector<uint8_t> marker = {TYPE_DISCONNECT, conn_id};
+    auto framed = make_varint_packet(marker.data(), marker.size());
+    int in_fd = chain_ && chain_->valid() ? chain_->input_fd() : -1;
+    if (in_fd >= 0) {
+        chain_in_writer_.write(in_fd, framed.data(), framed.size());
         if (chain_in_writer_.size() > 0 && !chain_in_writer_.registered)
-            register_chain_in_epollout(chain_->input_fd());
-    } else {
-        std::vector<uint8_t> payload = {conn_id};
-        Packet dpkt = Protocol::make_msg(MSG_DISCONNECT, payload);
-        send_control(dpkt);
+            register_chain_in_epollout(in_fd);
     }
 }
 
@@ -517,13 +516,19 @@ void Client::on_server_data(const uint8_t *data, size_t len) {
                 if (state_ == AWAIT_CHAIN_READY) handle_chain_ready(pkt);
                 break;
             case MSG_CONNECT_OK:
-                if (state_ == AWAIT_CONNECT_OK) handle_connect_ok(pkt);
+                if (state_ == AWAIT_CONNECT_OK || state_ == RUNNING) handle_connect_ok(pkt);
                 break;
             case MSG_CONNECT_FAIL:
-                if (state_ == AWAIT_CONNECT_OK) handle_connect_fail(pkt);
+                if (state_ == AWAIT_CONNECT_OK || state_ == RUNNING) handle_connect_fail(pkt);
                 break;
             case MSG_DISCONNECT:
-                if (state_ == AWAIT_CONNECT_OK) handle_disconnect(pkt);
+                if (state_ == RUNNING || state_ == AWAIT_CONNECT_OK) handle_disconnect(pkt);
+                break;
+            case MSG_CONNECT_PAUSE:
+                if (state_ == RUNNING) handle_connect_pause(pkt);
+                break;
+            case MSG_CONNECT_RESUME:
+                if (state_ == RUNNING) handle_connect_resume(pkt);
                 break;
             default:
                 break;
@@ -618,13 +623,14 @@ void Client::handle_chain_ready(const Packet &pkt) {
 
     // Set up data connections
     data_connections_.resize(num_outputs_);
-    data_connections_[0].fd = tcp_fd_;
 
-    // Switch tcp_fd_ from protocol reader to data connection reader
-    kernel_->del_fd(tcp_fd_);
-    register_data_connection_reader(0);
+    // data_connections_[0] = existing tcp_fd_
+    if (num_outputs_ > 0) {
+        data_connections_[0].fd = tcp_fd_;
+        register_data_connection_reader(0);
+    }
 
-    // Open additional connections for outputs 1..N-1
+    // Open separate TCP connections for outputs 1..N-1
     open_additional_connections();
 
     state_ = RUNNING;
@@ -720,6 +726,10 @@ void Client::build_client_chain() {
                         handle_connect_pause(Protocol::make_msg(MSG_CONNECT_PAUSE, std::vector<uint8_t>{conn_id}));
                     } else if (type == TYPE_RESUME) {
                         handle_connect_resume(Protocol::make_msg(MSG_CONNECT_RESUME, std::vector<uint8_t>{conn_id}));
+                    } else if (type == TYPE_CONNECT_OK) {
+                        handle_connect_ok(Protocol::make_msg(MSG_CONNECT_OK, std::vector<uint8_t>{conn_id}));
+                    } else if (type == TYPE_CONNECT_FAIL) {
+                        handle_connect_fail(Protocol::make_msg(MSG_CONNECT_FAIL, std::vector<uint8_t>{conn_id}));
                     }
                     buf.erase(buf.begin(), buf.begin() + pos + val);
                 }
@@ -850,15 +860,29 @@ void Client::register_external_epollout(uint8_t conn_id, int fd) {
 // ── Pause/resume helpers ──
 
 void Client::send_pause(uint8_t conn_id) {
-    std::vector<uint8_t> payload = {conn_id};
-    Packet pkt = Protocol::make_msg(MSG_CONNECT_PAUSE, payload);
-    send_control(pkt);
+    if (chain_ && chain_->valid()) {
+        std::vector<uint8_t> pkt = {TYPE_PAUSE, conn_id};
+        auto framed = make_varint_packet(pkt.data(), pkt.size());
+        int in_fd = chain_->input_fd();
+        if (in_fd >= 0) {
+            chain_in_writer_.write(in_fd, framed.data(), framed.size());
+            if (chain_in_writer_.size() > 0 && !chain_in_writer_.registered)
+                register_chain_in_epollout(in_fd);
+        }
+    }
 }
 
 void Client::send_resume(uint8_t conn_id) {
-    std::vector<uint8_t> payload = {conn_id};
-    Packet pkt = Protocol::make_msg(MSG_CONNECT_RESUME, payload);
-    send_control(pkt);
+    if (chain_ && chain_->valid()) {
+        std::vector<uint8_t> pkt = {TYPE_RESUME, conn_id};
+        auto framed = make_varint_packet(pkt.data(), pkt.size());
+        int in_fd = chain_->input_fd();
+        if (in_fd >= 0) {
+            chain_in_writer_.write(in_fd, framed.data(), framed.size());
+            if (chain_in_writer_.size() > 0 && !chain_in_writer_.registered)
+                register_chain_in_epollout(in_fd);
+        }
+    }
 }
 
 void Client::handle_connect_pause(const Packet &pkt) {

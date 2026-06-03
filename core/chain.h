@@ -31,7 +31,6 @@ struct ChainNode {
     std::vector<int> extra_peer_fds;
 
     std::string config_str;
-    int pending_packet_size = 0;
     std::unique_ptr<ModuleKernel> kapi;
     void *kapi_ctx = nullptr;
 };
@@ -88,6 +87,9 @@ private:
     // Per-fd input buffer for buffered reads (avoids partial-packet processing)
     std::unordered_map<int, std::vector<uint8_t>> fd_bufs_;
     std::unordered_map<int, size_t> fd_cursors_;
+
+    // Per-fd pending packet size (set by read_packet_size, consumed by read_packet)
+    std::unordered_map<int, int> fd_pending_sizes_;
 
     // Per-fd output buffer for buffered writes (avoids partial-write corruption on EAGAIN)
     std::unordered_map<int, std::vector<uint8_t>> fd_pending_writes_;

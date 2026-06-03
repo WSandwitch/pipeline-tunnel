@@ -161,8 +161,36 @@ void Session::on_data(const uint8_t *data, size_t len) {
                     handle_chain_create(pkt);
                 break;
             case MSG_CONNECT_REQ:
-                if (state_ == AWAIT_CHAIN_CREATE || state_ == AWAIT_CONNECT_REQ)
+                if (state_ == AWAIT_CHAIN_CREATE || state_ == AWAIT_CONNECT_REQ || state_ == RUNNING)
                     handle_connect_req(pkt);
+                break;
+            case MSG_DISCONNECT:
+                if (state_ == RUNNING || state_ == AWAIT_CONNECT_REQ)
+                    handle_disconnect(pkt);
+                break;
+            case MSG_CONNECT_PAUSE:
+                if (state_ == RUNNING || state_ == AWAIT_CONNECT_REQ) {
+                    if (pkt.payload.size() >= 1) {
+                        uint8_t cid = pkt.payload[0];
+                        auto it = targets_.find(cid);
+                        if (it != targets_.end()) {
+                            it->second.paused_by_client = true;
+                            kernel_->mod_fd_events(it->second.fd, 0, EPOLLIN);
+                        }
+                    }
+                }
+                break;
+            case MSG_CONNECT_RESUME:
+                if (state_ == RUNNING || state_ == AWAIT_CONNECT_REQ) {
+                    if (pkt.payload.size() >= 1) {
+                        uint8_t cid = pkt.payload[0];
+                        auto it = targets_.find(cid);
+                        if (it != targets_.end()) {
+                            it->second.paused_by_client = false;
+                            kernel_->mod_fd_events(it->second.fd, EPOLLIN, 0);
+                        }
+                    }
+                }
                 break;
             default:
                 log_debug("session %llx: unexpected msg %d",
@@ -312,9 +340,13 @@ void Session::handle_connect_req(const Packet &pkt) {
     }
 
     if (!setup_tunnel_target(target_addr, conn_id)) {
-        std::vector<uint8_t> fail_payload = {conn_id, 0x00};
-        Packet fail = Protocol::make_msg(MSG_CONNECT_FAIL, fail_payload);
-        send_control(fail);
+        if (chain_ && chain_->valid()) {
+            std::vector<uint8_t> pkt = {TYPE_CONNECT_FAIL, conn_id};
+            auto framed = make_varint_packet(pkt.data(), pkt.size());
+            chain_in_writer_.write(chain_->input_fd(), framed.data(), framed.size());
+            if (chain_in_writer_.size() > 0 && !chain_in_writer_.registered)
+                register_chain_input_out();
+        }
         return;
     }
 
@@ -357,7 +389,7 @@ void Session::handle_connect_req(const Packet &pkt) {
                 }
             } else if (n == 0) {
                 if (chain_ && chain_->valid()) {
-                    std::vector<uint8_t> marker = {1, conn_id};  // TYPE_DISCONNECT + conn_id
+                    std::vector<uint8_t> marker = {TYPE_DISCONNECT, conn_id};
                     auto framed = make_varint_packet(marker.data(), marker.size());
                     chain_in_writer_.write(chain_->input_fd(), framed.data(), framed.size());
                     if (chain_in_writer_.size() > 0 && !chain_in_writer_.registered)
@@ -378,9 +410,13 @@ void Session::handle_connect_req(const Packet &pkt) {
         }
     });
 
-    std::vector<uint8_t> ok_payload = {conn_id, 0x01};
-    Packet ok = Protocol::make_msg(MSG_CONNECT_OK, ok_payload);
-    send_control(ok);
+    if (chain_ && chain_->valid()) {
+        std::vector<uint8_t> pkt = {TYPE_CONNECT_OK, conn_id};
+        auto framed = make_varint_packet(pkt.data(), pkt.size());
+        chain_in_writer_.write(chain_->input_fd(), framed.data(), framed.size());
+        if (chain_in_writer_.size() > 0 && !chain_in_writer_.registered)
+            register_chain_input_out();
+    }
 
     state_ = RUNNING;
     log_info("session %llx: tunnel connected conn_id=%u -> %s",
@@ -457,7 +493,8 @@ void Session::handle_chain_create(const Packet &pkt) {
     // Set up data connections — one per chain output
     num_outputs_ = (uint8_t)chain_->output_fds().size();
     data_connections_.resize(num_outputs_);
-    data_connections_[0].fd = client_fd_;
+    // data_connections_[0] is NOT client_fd_ — client opens a separate
+    // TCP socket for each data connection (including output 0).
     chain_out_writers_.resize(num_outputs_);
     log_debug("session %llx: chain_out_writers_ size=%zu, num_outputs=%u",
               (unsigned long long)session_id_, chain_out_writers_.size(), num_outputs_);
@@ -542,9 +579,30 @@ void Session::handle_chain_create(const Packet &pkt) {
                     } else if (type == TYPE_DISCONNECT) {
                         close_target(conn_id);
                     } else if (type == TYPE_PAUSE) {
-                        send_pause(conn_id);
+                        auto it = targets_.find(conn_id);
+                        if (it != targets_.end()) {
+                            it->second.paused_by_client = true;
+                            kernel_->mod_fd_events(it->second.fd, 0, EPOLLIN);
+                        }
                     } else if (type == TYPE_RESUME) {
-                        send_resume(conn_id);
+                        auto it = targets_.find(conn_id);
+                        if (it != targets_.end()) {
+                            it->second.paused_by_client = false;
+                            kernel_->mod_fd_events(it->second.fd, EPOLLIN, 0);
+                        }
+                    } else if (type == TYPE_CONNECT_REQ) {
+                        if (val >= 3) {
+                            uint8_t addr_len = chain_in_read_buf_[pos + 2];
+                            if (pos + 2 + addr_len <= chain_in_read_buf_.size()) {
+                                std::vector<uint8_t> pkt_payload(
+                                    chain_in_read_buf_.data() + pos + 1,
+                                    chain_in_read_buf_.data() + pos + 3 + addr_len);
+                                Packet p = Protocol::make_msg(MSG_CONNECT_REQ, pkt_payload);
+                                handle_connect_req(p);
+                            }
+                        }
+                    } else if (type == TYPE_CONNECT_OK) {
+                    } else if (type == TYPE_CONNECT_FAIL) {
                     }
                     chain_in_read_buf_.erase(chain_in_read_buf_.begin(),
                                              chain_in_read_buf_.begin() + pos + val);
@@ -577,11 +635,9 @@ void Session::handle_chain_create(const Packet &pkt) {
     Packet pkt_ready = Protocol::make_msg(MSG_CHAIN_READY, ready);
     send_packet(pkt_ready);
 
-    // Transition the original TCP connection to data connection reader mode
-    if (client_fd_ >= 0) {
-        kernel_->del_fd(client_fd_);
-        register_data_connection_reader(0);
-    }
+    // Transition client_fd_ to data_connections_[0] — all packets now flow through chain
+    data_connections_[0].fd = client_fd_;
+    register_data_connection_reader(0);
 
     state_ = AWAIT_CONNECT_REQ;
     log_info("session %llx: chain ready, awaiting MSG_CONNECT_REQ, %zu modules, %u outputs",
@@ -682,30 +738,10 @@ void Session::register_data_connection_reader(size_t idx) {
             auto &dc = data_connections_[idx];
             uint8_t tmp[65536];
             ssize_t n = read(dc.fd, tmp, sizeof(tmp));
-            if (n > 0)
-                dc.read_buf.insert(dc.read_buf.end(), tmp, tmp + n);
-
-            while (true) {
-                auto &buf = dc.read_buf;
-                if (buf.size() < 1) break;
-                size_t pos = 0;
-                size_t val = 0;
-                int shift = 0;
-                while (pos < buf.size() && shift < 56) {
-                    uint8_t byte = buf[pos++];
-                    val |= (size_t)(byte & 0x7F) << shift;
-                    if (!(byte & 0x80)) break;
-                    shift += 7;
-                }
-                if (pos >= 10 || shift >= 56) { buf.clear(); break; }
-                if (pos > buf.size() || pos + val > buf.size()) break;
-
-                uint8_t first = buf[pos];
-                if (first == 255) {
-                    dispatch_data_conn_packet(255, buf.data() + pos + 1, val - 1);
-                } else if (chain_ && chain_->valid() && idx < chain_out_writers_.size()) {
+            if (n > 0) {
+                if (chain_ && chain_->valid() && idx < chain_out_writers_.size()) {
                     int out_fd = chain_->output_fds()[idx];
-                    int ret = chain_out_writers_[idx].write(out_fd, buf.data(), pos + val);
+                    int ret = chain_out_writers_[idx].write(out_fd, tmp, n);
                     if (ret > 0 && !chain_out_writers_[idx].registered)
                         register_chain_out_epollout(idx, out_fd);
                     {
@@ -716,12 +752,28 @@ void Session::register_data_connection_reader(size_t idx) {
                         }
                     }
                 } else {
-                    // No chain: old-format data, fall back to dispatch as conn_id
-                    dispatch_data_conn_packet(first, buf.data() + pos + 1, val - 1);
+                    // No chain: old-format varint framed data, parse and dispatch
+                    dc.read_buf.insert(dc.read_buf.end(), tmp, tmp + n);
+                    while (true) {
+                        auto &buf = dc.read_buf;
+                        if (buf.size() < 1) break;
+                        size_t pos = 0;
+                        size_t val = 0;
+                        int shift = 0;
+                        while (pos < buf.size() && shift < 56) {
+                            uint8_t byte = buf[pos++];
+                            val |= (size_t)(byte & 0x7F) << shift;
+                            if (!(byte & 0x80)) break;
+                            shift += 7;
+                        }
+                        if (pos >= 10 || shift >= 56) { buf.clear(); break; }
+                        if (pos > buf.size() || pos + val > buf.size()) break;
+                        dispatch_data_conn_packet(buf[pos], buf.data() + pos + 1, val - 1);
+                        buf.erase(buf.begin(), buf.begin() + pos + val);
+                    }
                 }
-                buf.erase(buf.begin(), buf.begin() + pos + val);
-                }
-                }
+            }
+        }
         if (events & (EPOLLERR | EPOLLHUP)) {
             log_debug("session %llx: data connection %zu closed",
                       (unsigned long long)session_id_, idx);
@@ -951,9 +1003,30 @@ bool Session::reconnect(int new_client_fd) {
                     } else if (type == TYPE_DISCONNECT) {
                         close_target(conn_id);
                     } else if (type == TYPE_PAUSE) {
-                        send_pause(conn_id);
+                        auto it = targets_.find(conn_id);
+                        if (it != targets_.end()) {
+                            it->second.paused_by_client = true;
+                            kernel_->mod_fd_events(it->second.fd, 0, EPOLLIN);
+                        }
                     } else if (type == TYPE_RESUME) {
-                        send_resume(conn_id);
+                        auto it = targets_.find(conn_id);
+                        if (it != targets_.end()) {
+                            it->second.paused_by_client = false;
+                            kernel_->mod_fd_events(it->second.fd, EPOLLIN, 0);
+                        }
+                    } else if (type == TYPE_CONNECT_REQ) {
+                        if (val >= 3) {
+                            uint8_t addr_len = chain_in_read_buf_[pos + 2];
+                            if (pos + 2 + addr_len <= chain_in_read_buf_.size()) {
+                                std::vector<uint8_t> pkt_payload(
+                                    chain_in_read_buf_.data() + pos + 1,
+                                    chain_in_read_buf_.data() + pos + 3 + addr_len);
+                                Packet p = Protocol::make_msg(MSG_CONNECT_REQ, pkt_payload);
+                                handle_connect_req(p);
+                            }
+                        }
+                    } else if (type == TYPE_CONNECT_OK) {
+                    } else if (type == TYPE_CONNECT_FAIL) {
                     }
                     chain_in_read_buf_.erase(chain_in_read_buf_.begin(),
                                              chain_in_read_buf_.begin() + pos + val);
@@ -1002,18 +1075,13 @@ bool Session::reconnect(int new_client_fd) {
                         }
                     }
                 } else if (n == 0) {
+                    close_target(conn_id);
                     if (chain_ && chain_->valid()) {
                         std::vector<uint8_t> marker = {TYPE_DISCONNECT, conn_id};
                         auto framed = make_varint_packet(marker.data(), marker.size());
                         chain_in_writer_.write(chain_->input_fd(), framed.data(), framed.size());
                         if (chain_in_writer_.size() > 0 && !chain_in_writer_.registered)
                             register_chain_input_out();
-                        close_target(conn_id);
-                    } else {
-                        close_target(conn_id);
-                        std::vector<uint8_t> d = {conn_id};
-                        Packet dpkt = Protocol::make_msg(MSG_DISCONNECT, d);
-                        send_control(dpkt);
                     }
                 }
             }
@@ -1025,9 +1093,8 @@ bool Session::reconnect(int new_client_fd) {
     for (auto &mf : chain_->module_fds())
         kernel_->add_fd(mf.first, chain_, mf.second);
 
-    // Register data connection reader on client_fd_ (data_connections_[0])
-    data_connections_[0].fd = client_fd_;
-    register_data_connection_reader(0);
+    // client_fd_ stays as protocol control channel.
+    // Data connections are re-established by the client via separate TCP sockets.
 
     paused_ = false;
     state_ = RUNNING;
@@ -1136,13 +1203,21 @@ void Session::register_chain_out_epollout(size_t idx, int out_fd) {
 }
 
 void Session::send_pause(uint8_t conn_id) {
-    std::vector<uint8_t> payload = {conn_id};
-    Packet pkt = Protocol::make_msg(MSG_CONNECT_PAUSE, payload);
-    send_control(pkt);
+    if (chain_ && chain_->valid()) {
+        std::vector<uint8_t> pkt = {TYPE_PAUSE, conn_id};
+        auto framed = make_varint_packet(pkt.data(), pkt.size());
+        chain_in_writer_.write(chain_->input_fd(), framed.data(), framed.size());
+        if (chain_in_writer_.size() > 0 && !chain_in_writer_.registered)
+            register_chain_input_out();
+    }
 }
 
 void Session::send_resume(uint8_t conn_id) {
-    std::vector<uint8_t> payload = {conn_id};
-    Packet pkt = Protocol::make_msg(MSG_CONNECT_RESUME, payload);
-    send_control(pkt);
+    if (chain_ && chain_->valid()) {
+        std::vector<uint8_t> pkt = {TYPE_RESUME, conn_id};
+        auto framed = make_varint_packet(pkt.data(), pkt.size());
+        chain_in_writer_.write(chain_->input_fd(), framed.data(), framed.size());
+        if (chain_in_writer_.size() > 0 && !chain_in_writer_.registered)
+            register_chain_input_out();
+    }
 }
