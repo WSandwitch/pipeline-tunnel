@@ -54,7 +54,9 @@ void *init(int in_fd, int out_fd, ModuleKernel *kapi, const char *config) {
 
     int copies = 1;
     if (config && config[0] != '\0') {
-        if (strncmp(config, "split:", 6) == 0)
+        if (strncmp(config, "n:", 2) == 0)
+            copies = atoi(config + 2);
+        else if (strncmp(config, "split:", 6) == 0)
             copies = atoi(config + 6);
         else if (strcmp(config, "split") == 0)
             copies = 1;
@@ -221,12 +223,12 @@ const char *modulename(void) {
 }
 
 const char *moduledesc(void) {
-    return "Split/merge module for N-way multi-stream";
+    return "Split/merge module for multi-stream data transfer";
 }
 
 const char *modulehelp(void) {
     return "Splits large packets into chunks (round-robin), merges by seqnum.\n"
-           "Config: \"split:N\" for N extra streams.\n"
+           "Config: \"n:N\" for N extra streams (default 1).\n"
            "\"trace\" enables debug output.\n"
             "Chunk max size: 65536 bytes, uses more flag for packet boundaries.";
 }
