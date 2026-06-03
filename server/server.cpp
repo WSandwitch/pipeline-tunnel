@@ -6,6 +6,7 @@
 #include <arpa/inet.h>
 #include <unistd.h>
 #include <fcntl.h>
+#include <poll.h>
 #include <cstring>
 
 extern std::unordered_map<uint64_t, std::weak_ptr<Session>> g_session_registry;
@@ -119,6 +120,38 @@ void Server::accept_loop() {
             // Partial read — unexpected, close
             close(fd);
             continue;
+        }
+
+        if (nread < 0 && errno == EAGAIN) {
+            // Data connection may not have sent handshake yet — brief wait
+            struct pollfd pfd = {fd, POLLIN, 0};
+            int pret = poll(&pfd, 1, 200);
+            if (pret > 0 && (pfd.revents & POLLIN)) {
+                nread = read(fd, header, 9);
+                if (nread == 9) {
+                    uint64_t sid;
+                    memcpy(&sid, header, 8);
+                    uint8_t output_idx = header[8];
+                    auto it = g_session_registry.find(sid);
+                    if (it != g_session_registry.end()) {
+                        auto session = it->second.lock();
+                        if (session) {
+                            log_info("data connection for session %llx output %u (fd=%d) (deferred)",
+                                     (unsigned long long)sid, output_idx, fd);
+                            session->add_data_connection(output_idx, fd);
+                            continue;
+                        }
+                    }
+                    log_error("data connection handshake for unknown session %llx (deferred), closing",
+                              (unsigned long long)sid);
+                    close(fd);
+                    continue;
+                }
+                if (nread > 0 && nread < 9) {
+                    close(fd);
+                    continue;
+                }
+            }
         }
 
         // nread < 0 (EAGAIN) or nread == 0: no data from client yet → new session

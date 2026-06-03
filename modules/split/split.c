@@ -8,7 +8,7 @@
 #define min(a,b) ((a) < (b) ? (a) : (b))
 #define CLAMP(x,lo,hi) ((x) < (lo) ? (lo) : (x) > (hi) ? (hi) : (x))
 
-#define MAX_SEQ_WINDOW 256
+#define MAX_SEQ_WINDOW 65536
 #define DEF_CHUNK_SIZE 4096
 #define MIN_CHUNK 64
 #define MAX_CHUNK 65536
@@ -145,10 +145,17 @@ static int next_chunk_size(struct split_ctx *ctx) {
 
 static int process_split(struct split_ctx *ctx, int trigger_fd) {
     int sz = ctx->kapi->read_packet_size(ctx->kapi->ctx, trigger_fd);
-    if (sz <= 0) return -1;
+    if (sz <= 0) { fprintf(stderr, "[split ERR] split read_packet_size=%d\n", sz); return -1; }
     uint8_t *in_buf = (uint8_t *)malloc((size_t)sz);
-    if (!in_buf) return -1;
-    ctx->kapi->read_packet(ctx->kapi->ctx, trigger_fd, in_buf);
+    if (!in_buf) { fprintf(stderr, "[split ERR] split malloc %d\n", sz); return -1; }
+    if (ctx->kapi->read_packet(ctx->kapi->ctx, trigger_fd, in_buf) < 0) {
+        fprintf(stderr, "[split ERR] split read_packet failed\n");
+        free(in_buf); return -1;
+    }
+
+    if (ctx->trace)
+        fprintf(stderr, "[split node=%d split] sz=%d in_fd=%d\n",
+                ctx->node_id, sz, trigger_fd);
 
     int to_output = (trigger_fd == ctx->in_fd);
     int max_chunk = ctx->chunk_size_max;
@@ -162,6 +169,10 @@ static int process_split(struct split_ctx *ctx, int trigger_fd) {
         if (chunk_len > remain) chunk_len = remain;
         int more = (chunk_len < remain) ? 1 : 0;
 
+        if (ctx->trace)
+            fprintf(stderr, "[split node=%d split] chunk seq=%d more=%d len=%d out_idx=%d\n",
+                    ctx->node_id, ctx->seqnum, more, chunk_len, ctx->rr_idx % ctx->num_outputs);
+
         out_buf[0] = (uint8_t)(ctx->seqnum & 0xFF);
         out_buf[1] = (uint8_t)((ctx->seqnum >> 8) & 0xFF);
         out_buf[2] = (uint8_t)more;
@@ -174,7 +185,7 @@ static int process_split(struct split_ctx *ctx, int trigger_fd) {
         ctx->seqnum++;
 
         int ret = ctx->kapi->write_packet(ctx->kapi->ctx, fd, out_buf, (size_t)chunk_len + 3);
-        if (ret < 0) { free(out_buf); free(in_buf); return ret; }
+        if (ret < 0) { fprintf(stderr, "[split ERR] split write_packet fd=%d ret=%d\n", fd, ret); free(out_buf); free(in_buf); return ret; }
         offset += chunk_len;
     }
     free(out_buf);
@@ -215,23 +226,32 @@ static void merge_flush_packet(struct split_ctx *ctx, uint16_t last_seq, int wri
     ctx->merge.next_seq = (uint16_t)(last_seq + 1);
 
     if (out_len > 0 && out_buf) {
-        ctx->kapi->write_packet(ctx->kapi->ctx, write_fd, out_buf, (size_t)out_len);
+        int wr = ctx->kapi->write_packet(ctx->kapi->ctx, write_fd, out_buf, (size_t)out_len);
+        if (wr < 0)
+            fprintf(stderr, "[split ERR] merge write_packet fd=%d ret=%d\n", write_fd, wr);
         free(out_buf);
     }
 }
 
 static int process_merge(struct split_ctx *ctx, int trigger_fd) {
     int sz = ctx->kapi->read_packet_size(ctx->kapi->ctx, trigger_fd);
-    if (sz <= 0) return -1;
+    if (sz <= 0) { fprintf(stderr, "[split ERR] read_packet_size=%d fd=%d\n", sz, trigger_fd); return -1; }
     uint8_t *buf = (uint8_t *)malloc((size_t)sz);
-    if (!buf) return -1;
-    ctx->kapi->read_packet(ctx->kapi->ctx, trigger_fd, buf);
+    if (!buf) { fprintf(stderr, "[split ERR] malloc %d failed\n", sz); return -1; }
+    if (ctx->kapi->read_packet(ctx->kapi->ctx, trigger_fd, buf) < 0) {
+        fprintf(stderr, "[split ERR] read_packet failed fd=%d\n", trigger_fd);
+        free(buf); return -1;
+    }
 
-    if (sz < 3) { free(buf); return -1; }
+    if (sz < 3) { free(buf); fprintf(stderr, "[split ERR] sz=%d < 3\n", sz); return -1; }
     uint16_t seq = (uint16_t)buf[0] | ((uint16_t)buf[1] << 8);
     int more = buf[2];
     uint8_t *data = buf + 3;
     int data_len = sz - 3;
+
+    if (ctx->trace)
+        fprintf(stderr, "[split node=%d merge] seq=%d more=%d len=%d fd=%d\n",
+                ctx->node_id, seq, more, data_len, trigger_fd);
 
     size_t slot = seq % MAX_SEQ_WINDOW;
     struct seq_entry *e = &ctx->merge.buf[slot];
@@ -251,7 +271,7 @@ static int process_merge(struct split_ctx *ctx, int trigger_fd) {
     if (e->count >= e->cap) {
         int new_cap = e->cap ? e->cap * 2 : 4;
         struct chunk *tmp = (struct chunk *)realloc(e->chunks, sizeof(struct chunk) * (size_t)new_cap);
-        if (!tmp) { free(buf); return -1; }
+        if (!tmp) { free(buf); fprintf(stderr, "[split ERR] realloc chunks failed\n"); return -1; }
         e->chunks = tmp;
         e->cap = new_cap;
     }
