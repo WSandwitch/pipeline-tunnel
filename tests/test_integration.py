@@ -13,7 +13,7 @@ APP = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 BUILD = os.path.join(os.path.dirname(APP), "build")
 SERVER = os.path.join(BUILD, "server", "modtunnel-server")
 CLIENT = os.path.join(BUILD, "client", "modtunnel-client")
-MPATH = os.path.join(APP, "test_modules")
+MPATH = os.path.join(APP, "tests", "test_modules")
 
 SHORT_COUNT = int(os.environ.get("INTEGRATION_SHORT", "50"))
 LONG_COUNT = int(os.environ.get("INTEGRATION_LONG", "3"))

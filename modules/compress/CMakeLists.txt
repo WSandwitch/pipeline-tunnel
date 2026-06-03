@@ -4,5 +4,5 @@ target_link_libraries(compress PRIVATE z zstd)
 set_target_properties(compress PROPERTIES PREFIX "" SUFFIX ".so")
 
 add_custom_command(TARGET compress POST_BUILD
-  COMMAND ${CMAKE_COMMAND} -E copy $<TARGET_FILE:compress> ${CMAKE_SOURCE_DIR}/test_modules/
-  COMMENT "Copying compress.so to test_modules/")
+  COMMAND ${CMAKE_COMMAND} -E copy $<TARGET_FILE:compress> ${CMAKE_SOURCE_DIR}/tests/test_modules/
+  COMMENT "Copying compress.so to tests/test_modules/")
