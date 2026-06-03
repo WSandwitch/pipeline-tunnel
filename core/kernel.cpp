@@ -117,6 +117,22 @@ void Kernel::del_fd(int fd) {
     fd_to_chain_.erase(fd);
 }
 
+void Kernel::del_chain_fd(int fd) {
+    epoll_ctl(epoll_fd_, EPOLL_CTL_DEL, fd, nullptr);
+}
+
+void Kernel::add_chain_fd(int fd) {
+    auto it = fd_to_chain_.find(fd);
+    if (it == fd_to_chain_.end()) return;
+    it->second.pending_in.store(false);
+    struct epoll_event ev;
+    ev.events = it->second.current_events;
+    ev.data.u64 = (uint64_t)fd;
+    if (epoll_ctl(epoll_fd_, EPOLL_CTL_ADD, fd, &ev) < 0)
+        if (errno == EEXIST)
+            epoll_ctl(epoll_fd_, EPOLL_CTL_MOD, fd, &ev);
+}
+
 void Kernel::enqueue(Task task) {
     {
         std::lock_guard<std::mutex> lock(queue_mutex_);

@@ -62,21 +62,15 @@ void Chain::register_fd(int fd, size_t mod_idx, FdType type) {
     fd_to_info_[fd] = {(int)mod_idx, type};
 }
 
-// ── helper: drain fd into per-fd buffer (non-blocking) ──
+// ── helper: single non-blocking read into per-fd buffer ──
 
-void Chain::drain_fd(int fd) {
+void Chain::read_into_buf(int fd) {
     // Caller must hold fd_data_mutex_
-    std::vector<uint8_t> collected;
     uint8_t tmp[65536];
-    ssize_t n;
-    do {
-        n = read(fd, tmp, sizeof(tmp));
-        if (n > 0)
-            collected.insert(collected.end(), tmp, tmp + n);
-    } while (n > 0);
-    if (!collected.empty()) {
+    ssize_t n = read(fd, tmp, sizeof(tmp));
+    if (n > 0) {
         auto &buf = fd_bufs_[fd];
-        buf.insert(buf.end(), collected.begin(), collected.end());
+        buf.insert(buf.end(), tmp, tmp + n);
     }
 }
 
@@ -463,38 +457,36 @@ bool Chain::build() {
 
 void Chain::on_fd_ready(int fd) {
     auto it = fd_to_info_.find(fd);
-    if (it == fd_to_info_.end()) {
+    if (it == fd_to_info_.end())
         return;
-    }
 
     size_t idx = (size_t)it->second.module_idx;
     if (idx >= busy_count_) return;
 
     bool expected = false;
-    if (!busy_flags_[idx].compare_exchange_strong(expected, true)) {
+    if (!busy_flags_[idx].compare_exchange_strong(expected, true))
         return;
-    }
 
     int dir;
     switch (it->second.type) {
-        case FD_IN:
-            dir = 1;
-            break;
-        case FD_OUT:
-            dir = 0;
-            break;
-        case FD_EXTRA:
-            dir = 0;
-            break;
-        default:
-            dir = 1;
-            break;
+        case FD_IN:  dir = 1; break;
+        case FD_OUT: dir = 0; break;
+        case FD_EXTRA: dir = 0; break;
+        default:     dir = 1; break;
     }
 
     {
         std::lock_guard<std::mutex> lock(fd_data_mutex_);
-        drain_fd(fd);
+        read_into_buf(fd);
     }
+
+    // Remove all module fds from epoll to prevent re-trigger during process()
+    std::vector<int> mfds;
+    for (auto &kv : fd_to_info_)
+        if ((size_t)kv.second.module_idx == idx)
+            mfds.push_back(kv.first);
+    for (int mfd : mfds)
+        kernel_->del_chain_fd(mfd);
 
     while (true) {
         size_t save;
@@ -537,6 +529,9 @@ void Chain::on_fd_ready(int fd) {
             }
         }
     }
+
+    for (int mfd : mfds)
+        kernel_->add_chain_fd(mfd);
 
     busy_flags_[idx].store(false);
 }

@@ -54,6 +54,10 @@ public:
     // Remove fd from epoll
     void del_fd(int fd);
 
+    // Temporarily remove/add a chain fd from/to epoll (for module exclusion)
+    void del_chain_fd(int fd);
+    void add_chain_fd(int fd);
+
     // Start/stop the event loop
     void start(int thread_count = 4);
     void stop();

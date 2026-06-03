@@ -101,7 +101,7 @@ private:
     int handle_read_packet_size(size_t mod_idx, int fd);
     int handle_read_packet(size_t mod_idx, int fd, uint8_t *buf);
     int handle_write_packet(size_t mod_idx, int fd, const uint8_t *data, size_t len);
-    void drain_fd(int fd);
+    void read_into_buf(int fd);
 
     void register_fd(int fd, size_t mod_idx, FdType type);
 
