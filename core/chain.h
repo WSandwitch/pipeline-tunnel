@@ -25,10 +25,7 @@ struct FdInfo {
 struct ChainNode {
     std::unique_ptr<Module> mod;
     int in_fd = -1;
-    int out_fd = -1;
-
-    // Module-facing extra output fds (sv[0] from request_outputs socketpairs)
-    std::vector<int> extra_out_fds;
+    std::vector<int> out_fds;  // [0]=primary, [1..N-1]=extra (from request_outputs)
     // Peer-facing ends of those socketpairs (sv[1]) — become in_fd of cloned tails
     std::vector<int> extra_peer_fds;
 

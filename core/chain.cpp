@@ -47,8 +47,7 @@ Chain::~Chain() {
     cleanup_kapi();
     for (auto &n : nodes_) {
         if (n.in_fd >= 0) close(n.in_fd);
-        if (n.out_fd >= 0) close(n.out_fd);
-        for (int fd : n.extra_out_fds)
+        for (int fd : n.out_fds)
             if (fd >= 0) close(fd);
     }
     if (chain_in_fd_ >= 0) close(chain_in_fd_);
@@ -203,7 +202,7 @@ ModuleKernel Chain::make_kernel_api(Chain *chain, size_t mod_idx) {
 
 int Chain::handle_request_outputs(size_t mod_idx, int count) {
     ChainNode &node = nodes_[mod_idx];
-    node.extra_out_fds.resize(count);
+    node.out_fds.resize(1 + count);
     node.extra_peer_fds.resize(count);
 
     for (int i = 0; i < count; i++) {
@@ -214,10 +213,10 @@ int Chain::handle_request_outputs(size_t mod_idx, int count) {
         }
         set_nonblock(sv[0]);
         set_nonblock(sv[1]);
-        node.extra_out_fds[i] = sv[0];
+        node.out_fds[1 + i] = sv[0];
         node.extra_peer_fds[i] = sv[1];
         // Register extra fd for epoll
-        register_fd(node.extra_out_fds[i], mod_idx, FD_EXTRA);
+        register_fd(node.out_fds[1 + i], mod_idx, FD_EXTRA);
     }
 
     log_debug("request_outputs: mod=%zu count=%d", mod_idx, count);
@@ -226,8 +225,8 @@ int Chain::handle_request_outputs(size_t mod_idx, int count) {
 
 int Chain::handle_get_output_fd(size_t mod_idx, int idx) {
     ChainNode &node = nodes_[mod_idx];
-    if (idx < (int)node.extra_out_fds.size())
-        return node.extra_out_fds[idx];
+    if ((size_t)(idx + 1) < node.out_fds.size())
+        return node.out_fds[idx + 1];
     return -1;
 }
 
@@ -292,16 +291,16 @@ bool Chain::build() {
         }
         set_nonblock(sv[0]);
         set_nonblock(sv[1]);
-        nodes_[i].out_fd = sv[0];
+        nodes_[i].out_fds.push_back(sv[0]);
         nodes_[i + 1].in_fd = sv[1];
-        register_fd(nodes_[i].out_fd, i, FD_OUT);
+        register_fd(nodes_[i].out_fds[0], i, FD_OUT);
         register_fd(nodes_[i + 1].in_fd, i + 1, FD_IN);
     }
 
     // Phase 4: last node output → chain_out
     {
         ChainNode &last = nodes_.back();
-        if (last.extra_out_fds.empty()) {
+        if (last.out_fds.empty()) {
             int sv[2];
             if (create_socketpair(sv) < 0) {
                 log_error("chain: output socketpair failed");
@@ -309,11 +308,11 @@ bool Chain::build() {
             }
             set_nonblock(sv[0]);
             set_nonblock(sv[1]);
-            last.out_fd = sv[0];
+            last.out_fds.push_back(sv[0]);
             chain_out_fds_.push_back(sv[1]);
-            register_fd(last.out_fd, nodes_.size() - 1, FD_OUT);
+            register_fd(last.out_fds[0], nodes_.size() - 1, FD_OUT);
             chain_trace( "[chain sess=%llx] Phase4: out_fd=%d FD_OUT=%d\n",
-                    (unsigned long long)session_id_, last.out_fd, FD_OUT);
+                    (unsigned long long)session_id_, last.out_fds[0], FD_OUT);
         }
     }
 
@@ -324,7 +323,7 @@ bool Chain::build() {
         const char *cfg_str = config_.modules[i].params.c_str();
         nodes_[i].config_str = cfg_str;
 
-        if (!nodes_[i].mod->init(nodes_[i].in_fd, nodes_[i].out_fd, nodes_[i].kapi.get(), cfg_str)) {
+        if (!nodes_[i].mod->init(nodes_[i].in_fd, nodes_[i].out_fds.empty() ? -1 : nodes_[i].out_fds[0], nodes_[i].kapi.get(), cfg_str)) {
             log_error("chain: module %s init failed", nodes_[i].mod->name());
             return false;
         }
@@ -386,7 +385,7 @@ bool Chain::build() {
                         set_nonblock(sv[0]);
                         set_nonblock(sv[1]);
                         // Link previous clone (last in nodes_) to this clone
-                        nodes_.back().out_fd = sv[0];
+                        nodes_.back().out_fds.push_back(sv[0]);
                         clone.in_fd = sv[1];
                     }
 
@@ -398,7 +397,7 @@ bool Chain::build() {
                         }
                         set_nonblock(sv[0]);
                         set_nonblock(sv[1]);
-                        clone.out_fd = sv[0];
+                        clone.out_fds.push_back(sv[0]);
                         chain_out_fds_.push_back(sv[1]);
                     }
 
@@ -408,16 +407,16 @@ bool Chain::build() {
                     size_t new_idx = nodes_.size() - 1;
 
                     register_fd(new_node.in_fd, new_idx, FD_IN);
-                    if (new_node.out_fd >= 0)
-                        register_fd(new_node.out_fd, new_idx, FD_OUT);
-                    // Interconnect out (sv[0]) was just set on nodes_[new_idx-1].out_fd
+                    if (!new_node.out_fds.empty())
+                        register_fd(new_node.out_fds[0], new_idx, FD_OUT);
+                    // Interconnect out (sv[0]) was just set on nodes_[new_idx-1].out_fds[0]
                     if (t > 0)
-                        register_fd(nodes_[new_idx - 1].out_fd, new_idx - 1, FD_OUT);
+                        register_fd(nodes_[new_idx - 1].out_fds[0], new_idx - 1, FD_OUT);
 
                     new_node.kapi = std::make_unique<ModuleKernel>(make_kernel_api(this, new_idx));
                     new_node.kapi_ctx = new_node.kapi->ctx;
 
-                    if (!new_node.mod->init(new_node.in_fd, new_node.out_fd,
+                    if (!new_node.mod->init(new_node.in_fd, new_node.out_fds.empty() ? -1 : new_node.out_fds[0],
                                             new_node.kapi.get(), new_node.config_str.c_str())) {
                         log_error("chain: cloned module %s init failed", new_node.mod->name());
                         return false;
