@@ -105,13 +105,15 @@ int process(void *ctx_ptr, int dir, int trigger_fd) {
 
     uint8_t *out_buf;
     int out_cap;
-    if (ctx->use_zstd) {
-        out_cap = (int)ZSTD_compressBound((size_t)sz);
+    if (dir == 1) {
+        if (ctx->use_zstd)
+            out_cap = (int)ZSTD_compressBound((size_t)sz);
+        else
+            out_cap = (int)deflateBound(0, (uLong)sz);
     } else {
-        out_cap = (int)deflateBound(0, (uLong)sz);
-        if (out_cap < 256) out_cap = 256;
+        out_cap = sz * 10;
     }
-    if (out_cap < 0) { free(in_buf); return -1; }
+    if (out_cap < 65536) out_cap = 65536;
     out_buf = (uint8_t *)malloc((size_t)out_cap);
     if (!out_buf) { free(in_buf); return -1; }
     int out_len;
