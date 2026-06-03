@@ -187,10 +187,13 @@ void Client::register_data_connection_reader(size_t idx) {
                         int ret = chain_out_writer_.write(out_fd, buf.data(), pos + val);
                         if (ret > 0 && !chain_out_writer_.registered)
                             register_chain_out_epollout(out_fd);
+                    {
+                        std::lock_guard<std::mutex> lock(*dc.pause_mtx);
                         if (chain_out_writer_.size() > 0 && !dc.paused) {
                             dc.paused = true;
                             kernel_->mod_fd_events(dc.fd, 0, EPOLLIN);
                         }
+                    }
                     }
                 } else {
                     dispatch_data_conn_packet(first, buf.data() + pos + 1, val - 1);
@@ -768,9 +771,13 @@ void Client::resume_paused_cfds() {
 
 void Client::resume_paused_dcfds() {
     for (size_t i = 0; i < data_connections_.size(); i++) {
-        if (data_connections_[i].paused) {
-            data_connections_[i].paused = false;
-            kernel_->mod_fd_events(data_connections_[i].fd, EPOLLIN, 0);
+        auto &dc = data_connections_[i];
+        if (dc.paused) {
+            std::lock_guard<std::mutex> lock(*dc.pause_mtx);
+            if (dc.paused) {
+                dc.paused = false;
+                kernel_->mod_fd_events(dc.fd, EPOLLIN, 0);
+            }
         }
     }
 }

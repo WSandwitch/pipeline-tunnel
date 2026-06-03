@@ -108,6 +108,7 @@ private:
         WriteBuffer writer;
         std::vector<uint8_t> read_buf;
         bool paused = false;           // EPOLLIN removed due to chain_out_writer back-pressure
+        std::unique_ptr<std::mutex> pause_mtx = std::make_unique<std::mutex>();
     };
     std::vector<DataConnection> data_connections_;
     uint8_t num_outputs_ = 0;

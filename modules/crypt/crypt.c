@@ -63,7 +63,7 @@ int process(void *ctx_ptr, int dir, int trigger_fd) {
 
     if (dir == 1) {
         unsigned char iv[16];
-        RAND_bytes(iv, 16);
+        do { RAND_bytes(iv, 16); } while (iv[0] == 0xFF);
 
         EVP_CIPHER_CTX *e_ctx = EVP_CIPHER_CTX_new();
         EVP_EncryptInit_ex(e_ctx, EVP_aes_256_ctr(), NULL, ctx->key, iv);
