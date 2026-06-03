@@ -81,6 +81,7 @@ private:
         int fd = -1;
         WriteBuffer writer;                      // buffered writes to this data connection
         std::vector<uint8_t> read_buf;           // varint parse buffer
+        bool paused = false;                     // EPOLLIN removed due to chain_out_writers back-pressure
     };
     std::vector<DataConnection> data_connections_;
     uint8_t num_outputs_ = 0;

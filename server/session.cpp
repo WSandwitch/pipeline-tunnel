@@ -706,6 +706,10 @@ void Session::register_data_connection_reader(size_t idx) {
                     int ret = chain_out_writers_[idx].write(out_fd, buf.data(), pos + val);
                     if (ret > 0 && !chain_out_writers_[idx].registered)
                         register_chain_out_epollout(idx, out_fd);
+                    if (chain_out_writers_[idx].size() > 0 && !dc.paused) {
+                        dc.paused = true;
+                        kernel_->mod_fd_events(dc.fd, 0, EPOLLIN);
+                    }
                 } else {
                     // No chain: old-format data, fall back to dispatch as conn_id
                     dispatch_data_conn_packet(first, buf.data() + pos + 1, val - 1);
@@ -1109,6 +1113,13 @@ void Session::register_chain_out_epollout(size_t idx, int out_fd) {
             if (drained) {
                 chain_out_writers_[idx].registered = false;
                 kernel_->mod_fd_events(fd, 0, EPOLLOUT);
+                if (idx < data_connections_.size()) {
+                    auto &dc = data_connections_[idx];
+                    if (dc.paused) {
+                        dc.paused = false;
+                        kernel_->mod_fd_events(dc.fd, EPOLLIN, 0);
+                    }
+                }
             }
         }
         if (events & (EPOLLERR | EPOLLHUP)) {

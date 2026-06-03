@@ -80,7 +80,7 @@ private:
     int chain_in_fd_ = -1;
     std::vector<int> chain_out_fds_;
 
-    std::unique_ptr<std::atomic<bool>[]> busy_flags_;
+    std::unique_ptr<std::atomic<bool>[]> busy_locks_;
     size_t busy_count_ = 0;
 
     std::unordered_map<int, FdInfo> fd_to_info_;

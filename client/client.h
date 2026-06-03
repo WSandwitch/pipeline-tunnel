@@ -107,6 +107,7 @@ private:
         int fd = -1;
         WriteBuffer writer;
         std::vector<uint8_t> read_buf;
+        bool paused = false;           // EPOLLIN removed due to chain_out_writer back-pressure
     };
     std::vector<DataConnection> data_connections_;
     uint8_t num_outputs_ = 0;
@@ -146,6 +147,7 @@ private:
     void send_pause(uint8_t conn_id);
     void send_resume(uint8_t conn_id);
     void resume_paused_cfds();
+    void resume_paused_dcfds();
 
     void load_module_registry(const std::string &dir);
 

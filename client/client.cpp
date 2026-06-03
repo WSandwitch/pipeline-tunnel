@@ -187,6 +187,10 @@ void Client::register_data_connection_reader(size_t idx) {
                         int ret = chain_out_writer_.write(out_fd, buf.data(), pos + val);
                         if (ret > 0 && !chain_out_writer_.registered)
                             register_chain_out_epollout(out_fd);
+                        if (chain_out_writer_.size() > 0 && !dc.paused) {
+                            dc.paused = true;
+                            kernel_->mod_fd_events(dc.fd, 0, EPOLLIN);
+                        }
                     }
                 } else {
                     dispatch_data_conn_packet(first, buf.data() + pos + 1, val - 1);
@@ -762,6 +766,15 @@ void Client::resume_paused_cfds() {
     }
 }
 
+void Client::resume_paused_dcfds() {
+    for (size_t i = 0; i < data_connections_.size(); i++) {
+        if (data_connections_[i].paused) {
+            data_connections_[i].paused = false;
+            kernel_->mod_fd_events(data_connections_[i].fd, EPOLLIN, 0);
+        }
+    }
+}
+
 void Client::register_chain_out_epollout(int fd) {
     if (chain_out_writer_.registered) return;
     chain_out_writer_.registered = true;
@@ -771,6 +784,7 @@ void Client::register_chain_out_epollout(int fd) {
             if (drained && chain_out_writer_.registered) {
                 chain_out_writer_.registered = false;
                 kernel_->mod_fd_events(fd, 0, EPOLLOUT);
+                resume_paused_dcfds();
             }
         }
         if (events & (EPOLLERR | EPOLLHUP))

@@ -23,6 +23,7 @@ BIDI_SIZE = int(os.environ.get("INTEGRATION_BIDI_SIZE", "262144"))
 BLOCKING_SIZE = int(os.environ.get("INTEGRATION_BLOCKING_SIZE", "2097152"))
 BLOCKING_CHUNK = int(os.environ.get("INTEGRATION_BLOCKING_CHUNK", "131072"))
 TUNNEL_MIN_PCT = int(os.environ.get("INTEGRATION_MIN_PCT", "90"))
+TEST_TIMEOUT = int(os.environ.get("INTEGRATION_TIMEOUT", "120"))
 
 
 def _wait_port(port, timeout=5, listener=False):
@@ -295,8 +296,10 @@ def _stop_tunnel(svr, cli):
     svr.terminate(); svr.wait()
 
 
-def run_tunnel_short_test():
+def run_tunnel_short_test(chain_config=None):
     """Tunnel mode: short HTTP requests only."""
+    label = chain_config or "tunnel"
+    min_pct = 100 if chain_config else TUNNEL_MIN_PCT
     tgt_port = random.randint(31000, 32000)
     svr_port = random.randint(32001, 33000)
     cli_port = random.randint(33001, 34000)
@@ -307,20 +310,22 @@ def run_tunnel_short_test():
                              stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
     _wait_port(tgt_port)
 
-    svr, cli = _start_tunnel(svr_port, cli_port, tgt_port)
+    svr, cli = _start_tunnel(svr_port, cli_port, tgt_port, chain_config)
 
     try:
         short_ok = short_http(cli_port, SHORT_COUNT)
         short_pct = short_ok * 100 // max(SHORT_COUNT, 1)
-        print(f"  [tunnel] short={short_ok}/{SHORT_COUNT} ({short_pct}%)", flush=True)
-        return short_pct >= TUNNEL_MIN_PCT
+        print(f"  [{label}] short={short_ok}/{SHORT_COUNT} ({short_pct}%)", flush=True)
+        return short_pct >= min_pct
     finally:
         httpd.terminate(); httpd.wait(timeout=5)
         _stop_tunnel(svr, cli)
 
 
-def run_tunnel_long_test():
+def run_tunnel_long_test(chain_config=None):
     """Tunnel mode: long echo data (own echo target)."""
+    label = chain_config or "tunnel"
+    min_pct = 100 if chain_config else TUNNEL_MIN_PCT
     tgt_port = random.randint(31000, 32000)
     svr_port = random.randint(32001, 33000)
     cli_port = random.randint(33001, 34000)
@@ -361,21 +366,21 @@ def run_tunnel_long_test():
     t.start()
     echo_ready.wait()
 
-    svr, cli = _start_tunnel(svr_port, cli_port, tgt_port)
+    svr, cli = _start_tunnel(svr_port, cli_port, tgt_port, chain_config)
 
     try:
         long_ok = long_echo(cli_port, LONG_COUNT, LONG_SIZE)
         long_pct = long_ok * 100 // max(LONG_COUNT, 1)
-        print(f"  [tunnel] long={long_ok}/{LONG_COUNT} ({long_pct}%)", flush=True)
-        return long_pct >= TUNNEL_MIN_PCT
+        print(f"  [{label}] long={long_ok}/{LONG_COUNT} ({long_pct}%)", flush=True)
+        return long_pct >= min_pct
     finally:
         echo_stop.set()
         _stop_tunnel(svr, cli)
 
 
-def _long_bidi_once(cli_port, tgt_port, size):
+def _long_bidi_once(cli_port, tgt_port, size, chain_config=None):
     """Single bidi transfer: own tunnel instance, 4 parallel threads."""
-    svr, cli = _start_tunnel(random.randint(32001, 33000), cli_port, tgt_port)
+    svr, cli = _start_tunnel(random.randint(32001, 33000), cli_port, tgt_port, chain_config)
     try:
         client_data = os.urandom(size)
         server_data = os.urandom(size)
@@ -436,22 +441,24 @@ def _long_bidi_once(cli_port, tgt_port, size):
         _stop_tunnel(svr, cli)
 
 
-def run_tunnel_bidi_test():
+def run_tunnel_bidi_test(chain_config=None):
     """Tunnel mode: parallel bidirectional data (fresh tunnel per iteration)."""
+    label = chain_config or "tunnel"
     ok = 0
     for i in range(LONG_COUNT):
         tgt_port = random.randint(31000, 32000)
         cli_port = random.randint(33001, 34000)
-        result = _long_bidi_once(cli_port, tgt_port, BIDI_SIZE)
+        result = _long_bidi_once(cli_port, tgt_port, BIDI_SIZE, chain_config)
         ok += result
-        print(f"  [tunnel] bidi iter {i}: {'OK' if result else 'FAIL'}", flush=True)
+        print(f"  [{label}] bidi iter {i}: {'OK' if result else 'FAIL'}", flush=True)
     bidi_pct = ok * 100 // max(LONG_COUNT, 1)
-    print(f"  [tunnel] bidi={ok}/{LONG_COUNT} ({bidi_pct}%)", flush=True)
+    print(f"  [{label}] bidi={ok}/{LONG_COUNT} ({bidi_pct}%)", flush=True)
     return bidi_pct >= TUNNEL_MIN_PCT
 
 
-def run_tunnel_blocking_test():
+def run_tunnel_blocking_test(chain_config=None):
     """Tunnel mode: blocking write (partial send), interleaved read."""
+    label = chain_config or "tunnel"
     tgt_port = random.randint(31000, 32000)
     svr_port = random.randint(32001, 33000)
     cli_port = random.randint(33001, 34000)
@@ -489,18 +496,19 @@ def run_tunnel_blocking_test():
     t.start()
     echo_ready.wait()
 
-    svr, cli = _start_tunnel(svr_port, cli_port, tgt_port)
+    svr, cli = _start_tunnel(svr_port, cli_port, tgt_port, chain_config)
     try:
         ok = blocking_echo(cli_port)
-        print(f"  [tunnel] blocking={'OK' if ok else 'FAIL'}", flush=True)
+        print(f"  [{label}] blocking={'OK' if ok else 'FAIL'}", flush=True)
         return ok
     finally:
         echo_stop.set()
         _stop_tunnel(svr, cli)
 
 
-def run_tunnel_blocking_bidi_test():
+def run_tunnel_blocking_bidi_test(chain_config=None):
     """Blocking bidi: 2 directions in parallel, partial send + interleaved recv."""
+    label = chain_config or "tunnel"
     tgt_port = random.randint(31000, 32000)
     svr_port = random.randint(32001, 33000)
     cli_port = random.randint(33001, 34000)
@@ -538,7 +546,7 @@ def run_tunnel_blocking_bidi_test():
     t.start()
     echo_ready.wait()
 
-    svr, cli = _start_tunnel(svr_port, cli_port, tgt_port)
+    svr, cli = _start_tunnel(svr_port, cli_port, tgt_port, chain_config)
 
     try:
         data0 = os.urandom(BLOCKING_SIZE)
@@ -565,103 +573,56 @@ def run_tunnel_blocking_bidi_test():
         s1.close()
 
         ok = results.get('a') and results.get('b')
-        print(f"  [tunnel] blocking_bidi={'OK' if ok else 'FAIL'}", flush=True)
+        print(f"  [{label}] blocking_bidi={'OK' if ok else 'FAIL'}", flush=True)
         return ok
     finally:
         echo_stop.set()
         _stop_tunnel(svr, cli)
 
 
-def run_tunnel_test():
+def run_tunnel_test(chain_config=None):
     """Tunnel mode: short HTTP + long echo + blocking + bidi + blocking_bidi."""
-    short_ok = run_tunnel_short_test()
-    long_ok = run_tunnel_long_test()
-    blocking_ok = run_tunnel_blocking_test()
-    blocking_bidi_ok = run_tunnel_blocking_bidi_test()
-    bidi_ok = run_tunnel_bidi_test()
+    short_ok = run_tunnel_short_test(chain_config)
+    long_ok = run_tunnel_long_test(chain_config)
+    blocking_ok = run_tunnel_blocking_test(chain_config)
+    blocking_bidi_ok = run_tunnel_blocking_bidi_test(chain_config)
+    bidi_ok = run_tunnel_bidi_test(chain_config)
     return short_ok and long_ok and blocking_ok and blocking_bidi_ok and bidi_ok
 
 
-def run_module_chain_test(label, chain_config):
-    tgt_port = random.randint(31000, 32000)
-    svr_port = random.randint(32001, 33000)
-    cli_port = random.randint(33001, 34000)
-
-    echo_ready = threading.Event()
-    echo_stop = threading.Event()
-    def echo_server():
-        ls = socket.socket()
-        ls.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
-        ls.bind((HOST, tgt_port))
-        ls.listen(1)
-        echo_ready.set()
-        ls.settimeout(1.0)
-        while not echo_stop.is_set():
-            try:
-                conn, _ = ls.accept()
-                conn.settimeout(20)
-                while True:
-                    try:
-                        d = conn.recv(65536)
-                        if not d: break
-                        conn.sendall(d)
-                    except: break
-                conn.close()
-            except socket.timeout:
-                continue
-            except:
-                break
-        ls.close()
-    t = threading.Thread(target=echo_server, daemon=True)
-    t.start()
-    echo_ready.wait()
-
-    svr, cli = _start_tunnel(svr_port, cli_port, tgt_port, chain_config)
-
-    try:
-        data = os.urandom(MCHAIN_SIZE)
-        s = socket.socket()
-        s.settimeout(15)
-        s.connect((HOST, cli_port))
-        s.sendall(data)
-        total = b""
-        while len(total) < len(data):
-            d = s.recv(65536)
-            if not d: break
-            total += d
-        s.close()
-        ok = (total == data)
-        print(f"  [{label}] recv={len(total)}/{MCHAIN_SIZE} ok={ok}", flush=True)
-        return ok
-    except Exception as e:
-        print(f"  [{label}] exception: {e}", flush=True)
-        return False
-    finally:
-        echo_stop.set()
-        _stop_tunnel(svr, cli)
-
-
 if __name__ == "__main__":
+    if len(sys.argv) > 1 and sys.argv[1] == "--run":
+        # Subprocess mode: run_tunnel_test for a specific config
+        cfg = sys.argv[2] if len(sys.argv) > 2 else None
+        ok = run_tunnel_test(cfg)
+        sys.exit(0 if ok else 1)
+
     killall()
     mods = discover_modules()
     print(f"Modules: {mods}", flush=True)
 
     results = {}
 
-    print("\n--- Tunnel mode (no modules) ---", flush=True)
-    tk = run_tunnel_test()
-    print(f"  tunnel: {'PASS' if tk else 'FAIL'}", flush=True)
-    results['tunnel'] = tk
-
-    if mods:
-        print(f"\n--- Module chain mode ({len(mods)} modules) ---", flush=True)
-        for m in mods:
+    for cfg in [None] + mods:
+        killall()
+        label = cfg or "tunnel"
+        print(f"\n--- {label} ---", flush=True)
+        try:
+            p = subprocess.run(
+                [sys.executable, __file__, "--run", cfg or ""],
+                timeout=TEST_TIMEOUT,
+                capture_output=True, text=True,
+                cwd=os.path.dirname(os.path.abspath(__file__ or "."))
+            )
+            if p.stdout: print(p.stdout, end="", flush=True)
+            if p.stderr: print(p.stderr, end="", flush=True)
+            ok = (p.returncode == 0)
+            print(f"  {label}: {'PASS' if ok else 'FAIL'}", flush=True)
+            results[label] = ok
+        except subprocess.TimeoutExpired:
+            print(f"  {label}: TIMEOUT ({TEST_TIMEOUT}s)", flush=True)
+            results[label] = False
             killall()
-            ok = run_module_chain_test(f"mod_{m}", m)
-            print(f"  mod_{m}: {'PASS' if ok else 'FAIL'}", flush=True)
-            results[f'mod_{m}'] = ok
-    else:
-        print("\n  No modules found, skipping module tests.", flush=True)
 
     passed = sum(1 for v in results.values() if v)
     total = len(results)

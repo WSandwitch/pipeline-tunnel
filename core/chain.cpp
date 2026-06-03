@@ -10,7 +10,7 @@
 #include <fcntl.h>
 
 // Uncomment DEBUG_CHAIN for verbose stderr tracing
-// #define DEBUG_CHAIN
+// // #define DEBUG_CHAIN
 #ifdef DEBUG_CHAIN
 #define chain_trace(...) fprintf(stderr, __VA_ARGS__)
 #else
@@ -64,12 +64,58 @@ void Chain::register_fd(int fd, size_t mod_idx, FdType type) {
 // ── helper: single non-blocking read into per-fd buffer ──
 
 void Chain::read_into_buf(int fd) {
-    // Caller must hold fd_data_mutex_
-    uint8_t tmp[65536];
-    ssize_t n = read(fd, tmp, sizeof(tmp));
-    if (n > 0) {
-        auto &buf = fd_bufs_[fd];
-        buf.insert(buf.end(), tmp, tmp + n);
+    auto &buf = fd_bufs_[fd];
+
+    size_t pkt_val = 0;
+    size_t varint_bytes = 0;
+
+    if (buf.empty()) {
+        // Read varint byte by byte (max 10 bytes for size_t)
+        uint8_t vbuf[10];
+        int shift = 0;
+        size_t vi = 0;
+        while (vi < sizeof(vbuf)) {
+            ssize_t n = read(fd, vbuf + vi, 1);
+            if (n <= 0) {
+                if (vi > 0)
+                    buf.insert(buf.end(), vbuf, vbuf + vi);
+                return;
+            }
+            pkt_val |= (size_t)(vbuf[vi] & 0x7F) << shift;
+            if (!(vbuf[vi] & 0x80)) { vi++; break; }
+            shift += 7;
+            vi++;
+        }
+        if (vi >= sizeof(vbuf) || shift >= 56)
+            return;
+        varint_bytes = vi;
+        buf.insert(buf.end(), vbuf, vbuf + vi);
+    } else {
+        // Parse varint from existing buffer
+        int shift = 0;
+        size_t vi = 0;
+        while (vi < buf.size()) {
+            uint8_t byte = buf[vi++];
+            pkt_val |= (size_t)(byte & 0x7F) << shift;
+            if (!(byte & 0x80)) break;
+            shift += 7;
+        }
+        if (vi >= buf.size())
+            return;
+        varint_bytes = vi;
+    }
+
+    // Read body bytes, leaving last byte in socketpair
+    if (pkt_val > 1) {
+        size_t body_in_buf = buf.size() - varint_bytes;
+        size_t body_wanted = pkt_val - 1;
+        if (body_in_buf < body_wanted) {
+            size_t to_read = body_wanted - body_in_buf;
+            uint8_t body[65536];
+            ssize_t nb = read(fd, body, to_read < sizeof(body) ? to_read : sizeof(body));
+            if (nb > 0)
+                buf.insert(buf.end(), body, body + nb);
+        }
     }
 }
 
@@ -101,15 +147,28 @@ int Chain::handle_read_packet(size_t mod_idx, int fd, uint8_t *buf) {
     int remaining = node.pending_packet_size;
     node.pending_packet_size = 0;
 
-    std::lock_guard<std::mutex> lock(fd_data_mutex_);
-    auto &fdbuf = fd_bufs_[fd];
-    auto &cursor = fd_cursors_[fd];
+    // fd_bufs has: varint + body[0..packetsize-2] (packetsize-1 body bytes)
+    // Last body byte (body[packetsize-1]) is still in socketpair
+    size_t from_buf = (remaining > 0) ? (size_t)remaining - 1 : 0;
 
-    if (cursor + (size_t)remaining > fdbuf.size())
-        return -1;
+    {
+        std::lock_guard<std::mutex> lock(fd_data_mutex_);
+        auto &fdbuf = fd_bufs_[fd];
+        auto &cursor = fd_cursors_[fd];
 
-    memcpy(buf, fdbuf.data() + cursor, (size_t)remaining);
-    cursor += (size_t)remaining;
+        if (cursor + from_buf > fdbuf.size())
+            return -1;
+
+        if (from_buf > 0) {
+            memcpy(buf, fdbuf.data() + cursor, from_buf);
+            cursor += from_buf;
+        }
+    }
+
+    if (remaining > 0) {
+        ssize_t n = read(fd, buf + (remaining - 1), 1);
+        if (n != 1) return -1;
+    }
     return 0;
 }
 
@@ -132,7 +191,7 @@ int Chain::handle_write_packet(size_t mod_idx, int fd,
         if (mod_idx >= nodes_.size()) return;
         std::vector<int> pause_fds;
         if (fd == nodes_[mod_idx].in_fd) {
-            // Backward EAGAIN (writing to in_fd) — pause all out_fds
+            // Forward write (→server) EAGAIN — pause forward input (out_fds)
             for (int ofd : nodes_[mod_idx].out_fds) {
                 if (ofd < 0) continue;
                 if (!fd_paused_.count(ofd)) {
@@ -141,11 +200,11 @@ int Chain::handle_write_packet(size_t mod_idx, int fd,
                 }
             }
         } else {
-            // Forward EAGAIN (writing to out_fd) — pause in_fd
-            int infd = nodes_[mod_idx].in_fd;
-            if (infd >= 0 && !fd_paused_.count(infd)) {
-                fd_paused_.insert(infd);
-                pause_fds.push_back(infd);
+            // Return write (→client) EAGAIN — pause return input (in_fd)
+            int ifd = nodes_[mod_idx].in_fd;
+            if (ifd >= 0 && !fd_paused_.count(ifd)) {
+                fd_paused_.insert(ifd);
+                pause_fds.push_back(ifd);
             }
         }
         for (int pfd : pause_fds)
@@ -466,9 +525,9 @@ bool Chain::build() {
 
     // Phase 6: init busy flags
     busy_count_ = nodes_.size();
-    busy_flags_ = std::make_unique<std::atomic<bool>[]>(busy_count_);
-    for (size_t i = 0; i < busy_count_; i++)
-        busy_flags_[i].store(false);
+    busy_locks_ = std::make_unique<std::atomic<bool>[]>(busy_count_ * 2);
+    for (size_t i = 0; i < busy_count_ * 2; i++)
+        busy_locks_[i].store(false);
 
     log_info("chain %llx built: %zu nodes, %zu out fds",
              (unsigned long long)session_id_, nodes_.size(),
@@ -490,10 +549,6 @@ void Chain::on_fd_ready(int fd) {
     size_t idx = (size_t)it->second.module_idx;
     if (idx >= busy_count_) return;
 
-    bool expected = false;
-    if (!busy_flags_[idx].compare_exchange_strong(expected, true))
-        return;
-
     int dir;
     switch (it->second.type) {
         case FD_IN:  dir = 1; break;
@@ -502,42 +557,57 @@ void Chain::on_fd_ready(int fd) {
         default:     dir = 1; break;
     }
 
+    bool expected = false;
+    if (!busy_locks_[idx * 2 + dir].compare_exchange_strong(expected, true))
+        return;
+
     {
         std::lock_guard<std::mutex> lock(fd_data_mutex_);
         read_into_buf(fd);
     }
 
-    // Remove all module fds from epoll to prevent re-trigger during process()
-    std::vector<int> mfds;
-    for (auto &kv : fd_to_info_)
-        if ((size_t)kv.second.module_idx == idx)
-            mfds.push_back(kv.first);
-    for (int mfd : mfds)
+    // Remove only fds of this direction from epoll
+    std::vector<int> dir_fds;
+    for (auto &kv : fd_to_info_) {
+        if ((size_t)kv.second.module_idx != idx) continue;
+        if (dir == 1) {
+            if (kv.second.type == FD_IN)
+                dir_fds.push_back(kv.first);
+        } else {
+            if (kv.second.type != FD_IN)
+                dir_fds.push_back(kv.first);
+        }
+    }
+    for (int mfd : dir_fds)
         kernel_->del_chain_fd(mfd);
 
-    while (true) {
-        size_t save;
-        {
-            std::lock_guard<std::mutex> lock(fd_data_mutex_);
-            auto &buf = fd_bufs_[fd];
-            auto &cursor = fd_cursors_[fd];
+    // Process 1 complete packet (body - 1 in fd_bufs_, last byte in socketpair)
+    size_t save;
+    bool have_packet = false;
+    {
+        std::lock_guard<std::mutex> lock(fd_data_mutex_);
+        auto &buf = fd_bufs_[fd];
+        auto &cursor = fd_cursors_[fd];
 
-            size_t tmp_pos = cursor;
-            size_t pkt_val = 0;
-            int shift = 0;
-            bool has_varint = false;
-            while (tmp_pos < buf.size()) {
-                uint8_t byte = buf[tmp_pos++];
-                pkt_val |= (size_t)(byte & 0x7F) << shift;
-                if (!(byte & 0x80)) { has_varint = true; break; }
-                shift += 7;
-            }
-            size_t varint_bytes = tmp_pos - cursor;
-            if (!has_varint || cursor + varint_bytes + pkt_val > buf.size())
-                break;
-            save = cursor;
+        size_t tmp_pos = cursor;
+        size_t pkt_val = 0;
+        int shift = 0;
+        bool has_varint = false;
+        while (tmp_pos < buf.size()) {
+            uint8_t byte = buf[tmp_pos++];
+            pkt_val |= (size_t)(byte & 0x7F) << shift;
+            if (!(byte & 0x80)) { has_varint = true; break; }
+            shift += 7;
         }
+        size_t varint_bytes = tmp_pos - cursor;
+        // +1 accounts for last body byte still in socketpair
+        if (has_varint && cursor + varint_bytes + pkt_val <= buf.size() + 1) {
+            save = cursor;
+            have_packet = true;
+        }
+    }
 
+    if (have_packet) {
         int ret = nodes_[idx].mod->process(dir, fd);
         if (ret < 0) {
             log_error("chain %llx: module %zu process returned %d, aborting",
@@ -557,10 +627,10 @@ void Chain::on_fd_ready(int fd) {
         }
     }
 
-    for (int mfd : mfds)
+    for (int mfd : dir_fds)
         kernel_->add_chain_fd(mfd);
 
-    busy_flags_[idx].store(false);
+    busy_locks_[idx * 2 + dir].store(false);
 }
 
 void Chain::retry_buffered() {
@@ -614,27 +684,17 @@ void Chain::on_fd_write_ready(int fd) {
                     size_t midx = (size_t)fi->second.module_idx;
                     if (midx < nodes_.size()) {
                         if (fd == nodes_[midx].in_fd) {
-                            // Backward buffer drained — resume all paused out_fds
+                            // Forward buffer drained — resume all paused out_fds
                             for (int ofd : nodes_[midx].out_fds) {
                                 if (ofd < 0) continue;
                                 if (fd_paused_.erase(ofd))
                                     resume_fds.push_back(ofd);
                             }
                         } else {
-                            // Forward buffer drained — check all out_fds clear
-                            bool all_drained = true;
-                            for (int ofd : nodes_[midx].out_fds) {
-                                if (ofd == fd) continue;
-                                if (fd_pending_writes_.count(ofd) && !fd_pending_writes_[ofd].empty()) {
-                                    all_drained = false;
-                                    break;
-                                }
-                            }
-                            if (all_drained) {
-                                int infd = nodes_[midx].in_fd;
-                                if (infd >= 0 && fd_paused_.erase(infd))
-                                    resume_fds.push_back(infd);
-                            }
+                            // Return buffer drained — resume paused in_fd
+                            int ifd = nodes_[midx].in_fd;
+                            if (ifd >= 0 && fd_paused_.erase(ifd))
+                                resume_fds.push_back(ifd);
                         }
                     }
                 }

@@ -6,7 +6,7 @@
 #include <execinfo.h>
 
 // Uncomment DEBUG_KERNEL for verbose stderr tracing
-//#define DEBUG_KERNEL
+////#define DEBUG_KERNEL
 #ifdef DEBUG_KERNEL
 #define kernel_trace(...) fprintf(stderr, __VA_ARGS__)
 #else

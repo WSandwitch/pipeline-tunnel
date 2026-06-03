@@ -20,7 +20,7 @@ void *init(int in_fd, int out_fd, ModuleKernel *kapi, const char *config) {
     ctx->kapi = kapi;
     ctx->trace = (config && strstr(config, "trace") != NULL);
     ctx->node_id = (kapi && kapi->get_node_id) ? kapi->get_node_id(kapi->ctx) : -1;
-    ctx->delay_us = 100000;
+    ctx->delay_us = 15000;
     if (config) {
         int val = atoi(config);
         if (val > 0) ctx->delay_us = (useconds_t)val;
@@ -66,7 +66,7 @@ const char *moduledesc(void) {
 
 const char *modulehelp(void) {
     return "Introduces a configurable delay (usleep) on each packet.\n"
-           "Config: time in microseconds (default 100000 = 0.1s).\n"
+           "Config: time in microseconds (default 15000 = 15ms).\n"
            "\"trace\" enables debug output.\n"
            "Useful for testing back-pressure and flow control.";
 }
