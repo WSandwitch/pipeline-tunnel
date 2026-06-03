@@ -3,11 +3,15 @@
 #include <string.h>
 #include <stdio.h>
 #include <stdlib.h>
+#include <time.h>
 
 #define min(a,b) ((a) < (b) ? (a) : (b))
+#define CLAMP(x,lo,hi) ((x) < (lo) ? (lo) : (x) > (hi) ? (hi) : (x))
 
 #define MAX_SEQ_WINDOW 256
-#define CHUNK_SIZE 65536
+#define DEF_CHUNK_SIZE 4096
+#define MIN_CHUNK 64
+#define MAX_CHUNK 65536
 
 struct chunk {
     uint8_t *data;
@@ -20,10 +24,11 @@ struct seq_entry {
     int cap;
     int more;
     int used;
+    uint16_t seq;
 };
 
 struct merge_state {
-    unsigned char next_seq;
+    uint16_t next_seq;
     struct seq_entry buf[MAX_SEQ_WINDOW];
 };
 
@@ -35,11 +40,23 @@ struct split_ctx {
     int extra_count;
     int num_outputs;
     int rr_idx;
-    unsigned char seqnum;
+    uint16_t seqnum;
     struct merge_state merge;
     int trace;
     int node_id;
+    int chunk_size_min;
+    int chunk_size_max;
 };
+
+static int parse_size(const char *s, int def) {
+    if (!s || !*s) return def;
+    long val = atol(s);
+    if (val <= 0) return def;
+    size_t len = strlen(s);
+    if (len > 0 && (s[len-1] == 'K' || s[len-1] == 'k'))
+        val *= 1024;
+    return CLAMP((int)val, MIN_CHUNK, MAX_CHUNK);
+}
 
 void *init(int in_fd, int out_fd, ModuleKernel *kapi, const char *config) {
     struct split_ctx *ctx = (struct split_ctx *)calloc(1, sizeof(*ctx));
@@ -51,9 +68,34 @@ void *init(int in_fd, int out_fd, ModuleKernel *kapi, const char *config) {
     ctx->rr_idx = 0;
     ctx->seqnum = 0;
     ctx->merge.next_seq = 0;
+    ctx->chunk_size_min = DEF_CHUNK_SIZE;
+    ctx->chunk_size_max = DEF_CHUNK_SIZE;
 
     int copies = 1;
     if (config && config[0] != '\0') {
+        // Parse s: chunk size
+        const char *sp = strstr(config, "s:");
+        if (sp) {
+            sp += 2;
+            const char *dash = strchr(sp, '-');
+            if (dash) {
+                char tmp[64];
+                size_t len = (size_t)(dash - sp);
+                if (len >= sizeof(tmp)) len = sizeof(tmp) - 1;
+                memcpy(tmp, sp, len); tmp[len] = 0;
+                ctx->chunk_size_min = parse_size(tmp, DEF_CHUNK_SIZE);
+                ctx->chunk_size_max = parse_size(dash + 1, DEF_CHUNK_SIZE);
+            } else {
+                ctx->chunk_size_min = parse_size(sp, DEF_CHUNK_SIZE);
+                ctx->chunk_size_max = ctx->chunk_size_min;
+            }
+            if (ctx->chunk_size_min > ctx->chunk_size_max) {
+                int t = ctx->chunk_size_min;
+                ctx->chunk_size_min = ctx->chunk_size_max;
+                ctx->chunk_size_max = t;
+            }
+        }
+
         if (strncmp(config, "n:", 2) == 0)
             copies = atoi(config + 2);
         else if (strncmp(config, "split:", 6) == 0)
@@ -77,8 +119,13 @@ void *init(int in_fd, int out_fd, ModuleKernel *kapi, const char *config) {
     ctx->trace = config && strstr(config, "trace") != NULL;
     ctx->node_id = kapi && kapi->get_node_id ? kapi->get_node_id(kapi->ctx) : -1;
     if (ctx->trace)
-        fprintf(stderr, "[split node=%d init] outputs=%d\n",
-                ctx->node_id, ctx->num_outputs);
+        fprintf(stderr, "[split node=%d init] outputs=%d chunk=%d-%d\n",
+                ctx->node_id, ctx->num_outputs,
+                ctx->chunk_size_min, ctx->chunk_size_max);
+
+    // Seed random if range is used
+    if (ctx->chunk_size_min < ctx->chunk_size_max)
+        srand((unsigned)(time(NULL) ^ (uintptr_t)ctx));
 
     return ctx;
 }
@@ -89,6 +136,13 @@ static int output_fd_at(struct split_ctx *ctx, int idx) {
     return ctx->out_fd;
 }
 
+static int next_chunk_size(struct split_ctx *ctx) {
+    int lo = ctx->chunk_size_min;
+    int hi = ctx->chunk_size_max;
+    if (lo >= hi) return lo;
+    return lo + (int)((unsigned)rand() % (unsigned)(hi - lo + 1));
+}
+
 static int process_split(struct split_ctx *ctx, int trigger_fd) {
     int sz = ctx->kapi->read_packet_size(ctx->kapi->ctx, trigger_fd);
     if (sz <= 0) return -1;
@@ -97,16 +151,21 @@ static int process_split(struct split_ctx *ctx, int trigger_fd) {
     ctx->kapi->read_packet(ctx->kapi->ctx, trigger_fd, in_buf);
 
     int to_output = (trigger_fd == ctx->in_fd);
+    int max_chunk = ctx->chunk_size_max;
+    uint8_t *out_buf = (uint8_t *)malloc((size_t)(max_chunk + 3));
+    if (!out_buf) { free(in_buf); return -1; }
 
     int offset = 0;
     while (offset < sz) {
-        int chunk_len = min(sz - offset, CHUNK_SIZE);
-        int more = (offset + chunk_len < sz) ? 1 : 0;
+        int remain = sz - offset;
+        int chunk_len = next_chunk_size(ctx);
+        if (chunk_len > remain) chunk_len = remain;
+        int more = (chunk_len < remain) ? 1 : 0;
 
-        uint8_t out_buf[CHUNK_SIZE + 2];
-        out_buf[0] = ctx->seqnum;
-        out_buf[1] = (uint8_t)more;
-        memcpy(out_buf + 2, in_buf + offset, (size_t)chunk_len);
+        out_buf[0] = (uint8_t)(ctx->seqnum & 0xFF);
+        out_buf[1] = (uint8_t)((ctx->seqnum >> 8) & 0xFF);
+        out_buf[2] = (uint8_t)more;
+        memcpy(out_buf + 3, in_buf + offset, (size_t)chunk_len);
 
         int out_idx = ctx->rr_idx % ctx->num_outputs;
         ctx->rr_idx++;
@@ -114,23 +173,26 @@ static int process_split(struct split_ctx *ctx, int trigger_fd) {
 
         ctx->seqnum++;
 
-        int ret = ctx->kapi->write_packet(ctx->kapi->ctx, fd, out_buf, (size_t)chunk_len + 2);
-        if (ret < 0) { free(in_buf); return ret; }
+        int ret = ctx->kapi->write_packet(ctx->kapi->ctx, fd, out_buf, (size_t)chunk_len + 3);
+        if (ret < 0) { free(out_buf); free(in_buf); return ret; }
         offset += chunk_len;
     }
+    free(out_buf);
     free(in_buf);
     return 0;
 }
 
-static void merge_flush_packet(struct split_ctx *ctx, unsigned char last_seq, int write_fd) {
+static void merge_flush_packet(struct split_ctx *ctx, uint16_t last_seq, int write_fd) {
     uint8_t *out_buf = NULL;
     int out_len = 0;
     int out_cap = 0;
 
-    for (unsigned char s = ctx->merge.next_seq; s <= last_seq; s++) {
-        struct seq_entry *e = &ctx->merge.buf[s];
-        for (int i = 0; i < e->count; i++) {
-            int needed = out_len + e->chunks[i].len;
+    int n = (int)(uint16_t)(last_seq - ctx->merge.next_seq) + 1;
+    for (int i = 0; i < n; i++) {
+        uint16_t s = (uint16_t)(ctx->merge.next_seq + i);
+        struct seq_entry *e = &ctx->merge.buf[s % MAX_SEQ_WINDOW];
+        for (int j = 0; j < e->count; j++) {
+            int needed = out_len + e->chunks[j].len;
             if (needed > out_cap) {
                 out_cap = out_cap ? out_cap * 2 : 65536;
                 if (out_cap < needed) out_cap = needed;
@@ -138,19 +200,19 @@ static void merge_flush_packet(struct split_ctx *ctx, unsigned char last_seq, in
                 if (!tmp) { free(out_buf); return; }
                 out_buf = tmp;
             }
-            memcpy(out_buf + out_len, e->chunks[i].data, (size_t)e->chunks[i].len);
-            out_len += e->chunks[i].len;
+            memcpy(out_buf + out_len, e->chunks[j].data, (size_t)e->chunks[j].len);
+            out_len += e->chunks[j].len;
         }
         e->used = 0;
         e->more = 0;
-        for (int i = 0; i < e->count; i++) free(e->chunks[i].data);
+        for (int j = 0; j < e->count; j++) free(e->chunks[j].data);
         free(e->chunks);
         e->chunks = NULL;
         e->count = 0;
         e->cap = 0;
     }
 
-    ctx->merge.next_seq = (unsigned char)(last_seq + 1);
+    ctx->merge.next_seq = (uint16_t)(last_seq + 1);
 
     if (out_len > 0 && out_buf) {
         ctx->kapi->write_packet(ctx->kapi->ctx, write_fd, out_buf, (size_t)out_len);
@@ -165,13 +227,26 @@ static int process_merge(struct split_ctx *ctx, int trigger_fd) {
     if (!buf) return -1;
     ctx->kapi->read_packet(ctx->kapi->ctx, trigger_fd, buf);
 
-    if (sz < 2) { free(buf); return -1; }
-    unsigned char seq = buf[0];
-    int more = buf[1];
-    uint8_t *data = buf + 2;
-    int data_len = sz - 2;
+    if (sz < 3) { free(buf); return -1; }
+    uint16_t seq = (uint16_t)buf[0] | ((uint16_t)buf[1] << 8);
+    int more = buf[2];
+    uint8_t *data = buf + 3;
+    int data_len = sz - 3;
 
-    struct seq_entry *e = &ctx->merge.buf[seq];
+    size_t slot = seq % MAX_SEQ_WINDOW;
+    struct seq_entry *e = &ctx->merge.buf[slot];
+    if (e->used && e->seq != seq) {
+        // Slot occupied by stale entry from a previous wrap-around.
+        // Free old chunks and reuse.
+        e->used = 0;
+        e->more = 0;
+        for (int i = 0; i < e->count; i++) free(e->chunks[i].data);
+        free(e->chunks);
+        e->chunks = NULL;
+        e->count = 0;
+        e->cap = 0;
+    }
+    e->seq = seq;
 
     if (e->count >= e->cap) {
         int new_cap = e->cap ? e->cap * 2 : 4;
@@ -185,8 +260,7 @@ static int process_merge(struct split_ctx *ctx, int trigger_fd) {
     e->chunks[e->count].len = data_len;
     e->count++;
     e->used = 1;
-    if (more) e->more = 1;
-    else e->more = 0;
+    e->more = more ? 1 : 0;
 
     free(buf);
 
@@ -194,12 +268,11 @@ static int process_merge(struct split_ctx *ctx, int trigger_fd) {
 
     // Try to flush from next_seq by scanning for a contiguous used sequence
     // ending with a chunk that has more==0 (last chunk of a packet).
-    // Loop until no more contiguous packets can be flushed (handles
-    // out-of-order arrival where a later seqnum was stored before an
-    // earlier one — when the earlier arrives, keep scanning forward).
-    unsigned char scan = ctx->merge.next_seq;
-    while (ctx->merge.buf[scan].used) {
-        if (!ctx->merge.buf[scan].more) {
+    uint16_t scan = ctx->merge.next_seq;
+    while (1) {
+        struct seq_entry *se = &ctx->merge.buf[scan % MAX_SEQ_WINDOW];
+        if (!se->used || se->seq != scan) break;
+        if (!se->more) {
             merge_flush_packet(ctx, scan, write_fd);
             scan = ctx->merge.next_seq;
             continue;
@@ -229,6 +302,7 @@ const char *moduledesc(void) {
 const char *modulehelp(void) {
     return "Splits large packets into chunks (round-robin), merges by seqnum.\n"
            "Config: \"n:N\" for N extra streams (default 1).\n"
-           "\"trace\" enables debug output.\n"
-            "Chunk max size: 65536 bytes, uses more flag for packet boundaries.";
+           "        \"s:SIZE\" fixed chunk size, \"s:MIN-MAX\" random range (suffix K).\n"
+           "        \"trace\" enables debug output.\n"
+            "Default chunk size: 4096, min 64, max 65536. 2-byte seqnum, more flag.";
 }

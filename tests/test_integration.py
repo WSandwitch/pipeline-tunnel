@@ -765,28 +765,26 @@ class Task:
             echo_stop.set()
             return (False, 0.0, 0.0)
 
-        total_data = b""
         chunk = BENCHMARK_CHUNK
         nchunks = max(1, BENCHMARK_TOTAL // chunk)
         try:
             data = os.urandom(chunk)
+            s = socket.socket()
+            s.settimeout(60)
+            s.connect((HOST, cli_port))
             t0 = time.time()
             for _ in range(nchunks):
-                s = socket.socket()
-                s.settimeout(60)
-                s.connect((HOST, cli_port))
                 s.sendall(data)
                 resp = b""
                 while len(resp) < len(data):
                     d = s.recv(65536)
                     if not d: break
                     resp += d
-                s.close()
                 if resp != data:
                     raise RuntimeError("data mismatch")
             elapsed = time.time() - t0
-            total_sent = chunk * nchunks
-            mbps = total_sent / elapsed / 1_000_000
+            s.close()
+            mbps = (chunk * nchunks) / elapsed / 1_000_000
             return (True, mbps, elapsed)
         except Exception as e:
             return (False, 0.0, 0.0)
