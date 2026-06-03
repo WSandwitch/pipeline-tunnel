@@ -25,6 +25,8 @@ BLOCKING_CHUNK = int(os.environ.get("INTEGRATION_BLOCKING_CHUNK", "131072"))
 TUNNEL_MIN_PCT = int(os.environ.get("INTEGRATION_MIN_PCT", "90"))
 TEST_TIMEOUT = int(os.environ.get("INTEGRATION_TIMEOUT", "120"))
 PER_TEST_TIMEOUT = int(os.environ.get("INTEGRATION_PER_TEST_TIMEOUT", str(TEST_TIMEOUT)))
+BENCHMARK_TOTAL = int(os.environ.get("INTEGRATION_BENCHMARK_TOTAL", str(64 * 1024 * 1024)))
+BENCHMARK_CHUNK = int(os.environ.get("INTEGRATION_BENCHMARK_CHUNK", str(256 * 1024)))
 
 
 def _kill(proc):
@@ -718,6 +720,81 @@ class Task:
         """Run all 5 subtests. Returns True if all pass."""
         return run_tunnel_test(chain_config=config, threads=workers)
 
+    def benchmark(self, workers=1, config=None):
+        """Measure throughput: send BENCHMARK_TOTAL bytes in BENCHMARK_CHUNK chunks.
+        Returns (ok, mbps, elapsed_sec)."""
+        tgt_port = _find_free_port(31000, 32000)
+        echo_stop = threading.Event()
+        echo_ready = threading.Event()
+        def echo_server():
+            ls = socket.socket()
+            ls.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+            ls.bind((HOST, tgt_port))
+            ls.listen(5)
+            echo_ready.set()
+            while not echo_stop.is_set():
+                ls.settimeout(1.0)
+                try:
+                    conn, _ = ls.accept()
+                    conn.settimeout(60)
+                    t = threading.Thread(target=_echo_inner, args=(conn,), daemon=True)
+                    t.start()
+                except socket.timeout:
+                    continue
+                except:
+                    break
+            ls.close()
+        def _echo_inner(conn):
+            while True:
+                try:
+                    d = conn.recv(65536)
+                    if not d: break
+                    conn.sendall(d)
+                except:
+                    break
+            conn.close()
+        t = threading.Thread(target=echo_server, daemon=True)
+        t.start()
+        echo_ready.wait()
+
+        try:
+            svr, cli, _, cli_port = _start_tunnel(
+                _find_free_port(32001, 33000), _find_free_port(33001, 34000),
+                tgt_port, config, threads=workers)
+        except:
+            echo_stop.set()
+            return (False, 0.0, 0.0)
+
+        total_data = b""
+        chunk = BENCHMARK_CHUNK
+        nchunks = max(1, BENCHMARK_TOTAL // chunk)
+        try:
+            data = os.urandom(chunk)
+            t0 = time.time()
+            for _ in range(nchunks):
+                s = socket.socket()
+                s.settimeout(60)
+                s.connect((HOST, cli_port))
+                s.sendall(data)
+                resp = b""
+                while len(resp) < len(data):
+                    d = s.recv(65536)
+                    if not d: break
+                    resp += d
+                s.close()
+                if resp != data:
+                    raise RuntimeError("data mismatch")
+            elapsed = time.time() - t0
+            total_sent = chunk * nchunks
+            mbps = total_sent / elapsed / 1_000_000
+            return (True, mbps, elapsed)
+        except Exception as e:
+            return (False, 0.0, 0.0)
+        finally:
+            echo_stop.set()
+            _stop_tunnel(svr, cli)
+            killall()
+
 
 _TEST_FUNCS = {
     "short": run_tunnel_short_test,
@@ -758,6 +835,29 @@ if __name__ == "__main__":
         cfg = sys.argv[3] if len(sys.argv) > 3 and sys.argv[3] else None
         ok = Task().test(workers=workers, config=cfg)
         sys.exit(0 if ok else 1)
+
+    if len(sys.argv) > 1 and sys.argv[1] == "--benchmark":
+        workers = int(sys.argv[2]) if len(sys.argv) > 2 and sys.argv[2] else 1
+        cfg = sys.argv[3] if len(sys.argv) > 3 and sys.argv[3] else None
+        ok, mbps, elapsed = Task().benchmark(workers=workers, config=cfg)
+        label = cfg or "tunnel"
+        if ok:
+            print(f"  [{label}] benchmark: {mbps:.2f} MB/s ({elapsed:.2f}s, {BENCHMARK_TOTAL // 1_000_000}MB)", flush=True)
+        else:
+            print(f"  [{label}] benchmark: FAIL", flush=True)
+        sys.exit(0 if ok else 1)
+
+    if len(sys.argv) > 1 and sys.argv[1] == "--benchmark-all":
+        workers = int(sys.argv[2]) if len(sys.argv) > 2 and sys.argv[2] else 1
+        from test_tester import Tester
+        task = Task()
+        tester = Tester(workers=[workers])
+        results = tester.run_benchmark(task)
+        passed = sum(1 for v in results.values() if v)
+        total = len(results)
+        print(f"\n  {passed}/{total} passed", flush=True)
+        print(f"{'ALL PASS' if all(results.values()) else 'SOME FAILED'}", flush=True)
+        sys.exit(0 if all(results.values()) else 1)
 
     from test_tester import Tester
     task = Task()
