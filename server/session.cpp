@@ -33,6 +33,8 @@ Session::~Session() {
     if (chain_) {
         for (int fd : chain_->output_fds())
             kernel_->del_fd(fd);
+        if (chain_->input_fd() >= 0)
+            kernel_->del_fd(chain_->input_fd());
     }
     if (chain_)
         kernel_->remove_chain(session_id_);

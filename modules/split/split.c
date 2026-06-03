@@ -4,6 +4,8 @@
 #include <stdio.h>
 #include <stdlib.h>
 
+#define min(a,b) ((a) < (b) ? (a) : (b))
+
 #define MAX_SEQ_WINDOW 256
 #define CHUNK_SIZE 65536
 
@@ -95,36 +97,25 @@ static int process_split(struct split_ctx *ctx, int trigger_fd) {
     int to_output = (trigger_fd == ctx->in_fd);
 
     int offset = 0;
-    int chunks = 0;
     while (offset < sz) {
-        int chunk_len = sz - offset;
-        if (chunk_len > CHUNK_SIZE) chunk_len = CHUNK_SIZE;
+        int chunk_len = min(sz - offset, CHUNK_SIZE);
         int more = (offset + chunk_len < sz) ? 1 : 0;
 
         uint8_t out_buf[CHUNK_SIZE + 2];
-        out_buf[0] = ctx->seqnum++;
+        out_buf[0] = ctx->seqnum;
         out_buf[1] = (uint8_t)more;
         memcpy(out_buf + 2, in_buf + offset, (size_t)chunk_len);
 
-        int fd;
-        if (to_output) {
-            int out_idx = ctx->rr_idx % ctx->num_outputs;
-            ctx->rr_idx++;
-            fd = output_fd_at(ctx, out_idx);
-        } else {
-            fd = ctx->in_fd;
-        }
+        int out_idx = ctx->rr_idx % ctx->num_outputs;
+        ctx->rr_idx++;
+        int fd = to_output ? output_fd_at(ctx, out_idx) : ctx->in_fd;
+
+        ctx->seqnum++;
 
         int ret = ctx->kapi->write_packet(ctx->kapi->ctx, fd, out_buf, (size_t)chunk_len + 2);
         if (ret < 0) { free(in_buf); return ret; }
         offset += chunk_len;
-        chunks++;
     }
-
-    if (ctx->trace)
-        fprintf(stderr, "[split node=%d fw] chunks=%d sum=%d\n",
-                ctx->node_id, chunks, sz);
-
     free(in_buf);
     return 0;
 }
@@ -160,9 +151,6 @@ static void merge_flush_packet(struct split_ctx *ctx, unsigned char last_seq, in
     ctx->merge.next_seq = (unsigned char)(last_seq + 1);
 
     if (out_len > 0 && out_buf) {
-        if (ctx->trace)
-            fprintf(stderr, "[split node=%d rv] flush seq=%u total=%d\n",
-                    ctx->node_id, last_seq, out_len);
         ctx->kapi->write_packet(ctx->kapi->ctx, write_fd, out_buf, (size_t)out_len);
         free(out_buf);
     }
@@ -204,11 +192,15 @@ static int process_merge(struct split_ctx *ctx, int trigger_fd) {
 
     // Try to flush from next_seq by scanning for a contiguous used sequence
     // ending with a chunk that has more==0 (last chunk of a packet).
+    // Loop until no more contiguous packets can be flushed (handles
+    // out-of-order arrival where a later seqnum was stored before an
+    // earlier one — when the earlier arrives, keep scanning forward).
     unsigned char scan = ctx->merge.next_seq;
     while (ctx->merge.buf[scan].used) {
         if (!ctx->merge.buf[scan].more) {
             merge_flush_packet(ctx, scan, write_fd);
-            break;
+            scan = ctx->merge.next_seq;
+            continue;
         }
         scan++;
     }
