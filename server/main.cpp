@@ -181,13 +181,12 @@ int main(int argc, char *argv[]) {
     }
 
     Server server(listen_addr, listen_port, password);
-    if (!server.start(thread_count)) {
+    if (!server.start()) {
         log_error("server failed to start");
         return 1;
     }
 
     log_info("server running. press Ctrl+C to stop.");
-    pause();
     server.stop();
     return 0;
 }

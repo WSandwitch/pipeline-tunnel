@@ -3,22 +3,24 @@
 
 #include <cstdint>
 #include <vector>
-#include <memory>
-#include <mutex>
 #include <unistd.h>
 
 struct WriteBuffer {
     std::vector<uint8_t> buf;
-    std::unique_ptr<std::mutex> mtx = std::make_unique<std::mutex>();
+    size_t read_offset = 0;
     bool registered = false;
     size_t high_water = 262144;
     size_t low_water = 131072;
 
     int write(int fd, const uint8_t *data, size_t len) {
-        std::lock_guard<std::mutex> lock(*mtx);
-        if (!buf.empty()) {
+        size_t pending = buf.size() - read_offset;
+        if (pending > 0) {
             buf.insert(buf.end(), data, data + len);
             return 1;
+        }
+        if (read_offset > 0) {
+            buf.clear();
+            read_offset = 0;
         }
         ssize_t n = ::write(fd, data, len);
         if (n < 0) {
@@ -29,38 +31,43 @@ struct WriteBuffer {
             return -1;
         }
         if ((size_t)n < len) {
-            buf.assign(data + n, data + len - n);
+            buf.assign(data + n, data + len);
             return 1;
         }
         return 0;
     }
 
     bool flush(int fd) {
-        std::lock_guard<std::mutex> lock(*mtx);
-        if (buf.empty()) return true;
-        ssize_t n = ::write(fd, buf.data(), buf.size());
+        size_t pending = buf.size() - read_offset;
+        if (pending == 0) return true;
+        ssize_t n = ::write(fd, buf.data() + read_offset, pending);
         if (n > 0) {
-            buf.erase(buf.begin(), buf.begin() + n);
+            read_offset += n;
+            if (read_offset >= buf.size()) {
+                buf.clear();
+                read_offset = 0;
+            } else if (read_offset > 65536) {
+                buf.erase(buf.begin(), buf.begin() + read_offset);
+                read_offset = 0;
+            }
         }
         if (n < 0 && (errno == EAGAIN || errno == EWOULDBLOCK)) {
             return false;
         }
-        return buf.empty();
+        return buf.empty() && read_offset == 0;
     }
 
     void clear() {
-        std::lock_guard<std::mutex> lock(*mtx);
         buf.clear();
+        read_offset = 0;
     }
 
     bool empty() {
-        std::lock_guard<std::mutex> lock(*mtx);
-        return buf.empty();
+        return buf.empty() || read_offset == buf.size();
     }
 
     size_t size() {
-        std::lock_guard<std::mutex> lock(*mtx);
-        return buf.size();
+        return buf.size() - read_offset;
     }
 };
 

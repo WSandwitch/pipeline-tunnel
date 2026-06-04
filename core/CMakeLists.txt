@@ -2,7 +2,6 @@ add_library(core STATIC
     config.cpp
     protocol.cpp
     module.cpp
-    chain.cpp
     kernel.cpp
 )
 target_include_directories(core PUBLIC

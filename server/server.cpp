@@ -1,13 +1,14 @@
 #include "server.h"
 #include "session.h"
 #include "common/logger.h"
+#include "common/utils.h"
 #include <sys/socket.h>
 #include <netinet/in.h>
 #include <arpa/inet.h>
 #include <unistd.h>
 #include <fcntl.h>
-#include <poll.h>
 #include <cstring>
+#include <poll.h>
 
 extern std::unordered_map<uint64_t, std::weak_ptr<Session>> g_session_registry;
 extern std::unordered_map<uint64_t, std::shared_ptr<Session>> g_paused_sessions;
@@ -20,7 +21,7 @@ Server::~Server() {
     stop();
 }
 
-bool Server::start(int thread_count) {
+bool Server::start() {
     kernel_ = std::make_shared<Kernel>();
 
     listen_fd_ = socket(AF_INET, SOCK_STREAM, 0);
@@ -51,11 +52,123 @@ bool Server::start(int thread_count) {
         return false;
     }
 
-    kernel_->start(thread_count);
+    set_nonblock(listen_fd_);
 
-    std::thread([this] { accept_loop(); }).detach();
+    // Register listen fd with kernel for accept
+    auto k = kernel_;
+    kernel_->add_fd_handler(listen_fd_, [this, k](int fd, uint32_t events) {
+        if (!(events & EPOLLIN)) return;
+        while (true) {
+            struct sockaddr_in client_addr;
+            socklen_t addrlen = sizeof(client_addr);
+            int cfd = accept(fd, (struct sockaddr *)&client_addr, &addrlen);
+            if (cfd < 0) {
+                if (errno == EAGAIN || errno == EWOULDBLOCK) break;
+                if (errno == EINTR) continue;
+                log_error("accept: %s", strerror(errno));
+                break;
+            }
+
+            char client_ip[64];
+            inet_ntop(AF_INET, &client_addr.sin_addr, client_ip, sizeof(client_ip));
+
+            int fl = fcntl(cfd, F_GETFL, 0);
+            if (fl >= 0) fcntl(cfd, F_SETFL, fl | O_NONBLOCK);
+
+            // Try to read up to 9 bytes — data connections send 9-byte handshake immediately
+            uint8_t header[9];
+            ssize_t nread = read(cfd, header, 9);
+
+            if (nread == 9) {
+                uint64_t sid;
+                memcpy(&sid, header, 8);
+                uint8_t output_idx = header[8];
+                auto it = g_session_registry.find(sid);
+                if (it != g_session_registry.end()) {
+                    auto session = it->second.lock();
+                    if (session) {
+                        log_info("data connection for session %llx output %u (fd=%d)",
+                                 (unsigned long long)sid, output_idx, cfd);
+                        session->add_data_connection(output_idx, cfd);
+                        continue;
+                    }
+                }
+                log_error("data connection handshake for unknown session %llx, closing",
+                          (unsigned long long)sid);
+                close(cfd);
+                continue;
+            }
+
+            if (nread > 0 && nread < 9) {
+                close(cfd);
+                continue;
+            }
+
+            if (nread < 0 && errno == EAGAIN) {
+                struct pollfd pfd = {cfd, POLLIN, 0};
+                int pret = poll(&pfd, 1, 200);
+                if (pret > 0 && (pfd.revents & POLLIN)) {
+                    nread = read(cfd, header, 9);
+                    if (nread == 9) {
+                        uint64_t sid;
+                        memcpy(&sid, header, 8);
+                        uint8_t output_idx = header[8];
+                        auto it = g_session_registry.find(sid);
+                        if (it != g_session_registry.end()) {
+                            auto session = it->second.lock();
+                            if (session) {
+                                log_info("data connection for session %llx output %u (fd=%d) (deferred)",
+                                         (unsigned long long)sid, output_idx, cfd);
+                                session->add_data_connection(output_idx, cfd);
+                                continue;
+                            }
+                        }
+                        log_error("data connection handshake for unknown session %llx (deferred), closing",
+                                  (unsigned long long)sid);
+                        close(cfd);
+                        continue;
+                    }
+                    if (nread > 0 && nread < 9) {
+                        close(cfd);
+                        continue;
+                    }
+                }
+            }
+
+            log_info("client connected: %s:%d", client_ip, ntohs(client_addr.sin_port));
+
+            auto session = std::make_shared<Session>(cfd, password_, kernel_);
+            g_session_registry[session->session_id()] = session;
+
+            std::string challenge = std::to_string(rand()) + std::to_string(time(nullptr));
+            session->set_challenge(challenge);
+            Packet challenge_pkt = Protocol::make_msg(MSG_AUTH_CHALLENGE,
+                                                      challenge.data(), challenge.size());
+            session->send_packet(challenge_pkt);
+
+            kernel_->add_fd_handler(cfd, [session, k](int ev_fd, uint32_t events) {
+                if (session->client_fd() < 0) return;
+                uint8_t buf[65536];
+                ssize_t n;
+                while ((n = read(session->client_fd(), buf, sizeof(buf))) > 0) {
+                    session->on_data(buf, (size_t)n);
+                    if (session->client_fd() < 0) break;
+                }
+                if (n == 0) {
+                    k->del_fd(ev_fd);
+                    session->on_disconnect();
+                    g_paused_sessions[session->session_id()] = session;
+                } else if (n < 0 && errno != EAGAIN) {
+                    k->del_fd(ev_fd);
+                    session->on_disconnect();
+                    g_paused_sessions[session->session_id()] = session;
+                }
+            });
+        }
+    }, EPOLLIN);
 
     log_info("server started on %s:%d", listen_addr_.c_str(), listen_port_);
+    kernel_->start();
     return true;
 }
 
@@ -67,129 +180,5 @@ void Server::stop() {
     if (kernel_) {
         kernel_->stop();
         kernel_.reset();
-    }
-}
-
-void Server::accept_loop() {
-    while (true) {
-        struct sockaddr_in client_addr;
-        socklen_t addrlen = sizeof(client_addr);
-        int fd = accept(listen_fd_, (struct sockaddr *)&client_addr, &addrlen);
-        if (fd < 0) {
-            if (errno == EINTR) continue;
-            log_error("accept: %s", strerror(errno));
-            break;
-        }
-
-        char client_ip[64];
-        inet_ntop(AF_INET, &client_addr.sin_addr, client_ip, sizeof(client_ip));
-
-        // Set non-blocking
-        int fl = fcntl(fd, F_GETFL, 0);
-        if (fl >= 0) fcntl(fd, F_SETFL, fl | O_NONBLOCK);
-
-        // Try to read up to 9 bytes — data connections send 9-byte handshake immediately.
-        // New sessions wait for server's challenge, so no data arrives first.
-        uint8_t header[9];
-        ssize_t nread = read(fd, header, 9);
-
-        if (nread == 9) {
-            // Possible data connection: check session_id registry
-            uint64_t sid;
-            memcpy(&sid, header, 8);
-            uint8_t output_idx = header[8];
-
-            auto it = g_session_registry.find(sid);
-            if (it != g_session_registry.end()) {
-                auto session = it->second.lock();
-                if (session) {
-                    log_info("data connection for session %llx output %u (fd=%d)",
-                             (unsigned long long)sid, output_idx, fd);
-                    session->add_data_connection(output_idx, fd);
-                    continue;
-                }
-            }
-            // Session not found — close
-            log_error("data connection handshake for unknown session %llx, closing",
-                      (unsigned long long)sid);
-            close(fd);
-            continue;
-        }
-
-        if (nread > 0 && nread < 9) {
-            // Partial read — unexpected, close
-            close(fd);
-            continue;
-        }
-
-        if (nread < 0 && errno == EAGAIN) {
-            // Data connection may not have sent handshake yet — brief wait
-            struct pollfd pfd = {fd, POLLIN, 0};
-            int pret = poll(&pfd, 1, 200);
-            if (pret > 0 && (pfd.revents & POLLIN)) {
-                nread = read(fd, header, 9);
-                if (nread == 9) {
-                    uint64_t sid;
-                    memcpy(&sid, header, 8);
-                    uint8_t output_idx = header[8];
-                    auto it = g_session_registry.find(sid);
-                    if (it != g_session_registry.end()) {
-                        auto session = it->second.lock();
-                        if (session) {
-                            log_info("data connection for session %llx output %u (fd=%d) (deferred)",
-                                     (unsigned long long)sid, output_idx, fd);
-                            session->add_data_connection(output_idx, fd);
-                            continue;
-                        }
-                    }
-                    log_error("data connection handshake for unknown session %llx (deferred), closing",
-                              (unsigned long long)sid);
-                    close(fd);
-                    continue;
-                }
-                if (nread > 0 && nread < 9) {
-                    close(fd);
-                    continue;
-                }
-            }
-        }
-
-        // nread < 0 (EAGAIN) or nread == 0: no data from client yet → new session
-        log_info("client connected: %s:%d", client_ip, ntohs(client_addr.sin_port));
-
-        auto session = std::make_shared<Session>(fd, password_, kernel_);
-        g_session_registry[session->session_id()] = session;
-
-        // Generate challenge
-        std::string challenge = std::to_string(rand()) + std::to_string(time(nullptr));
-        session->set_challenge(challenge);
-        Packet challenge_pkt = Protocol::make_msg(MSG_AUTH_CHALLENGE,
-                                                  challenge.data(), challenge.size());
-        session->send_packet(challenge_pkt);
-
-        // Register fd with kernel for read events
-        auto k = kernel_;
-        kernel_->add_fd_handler(fd, [session, k](int ev_fd, uint32_t events) {
-            (void)events;
-            if (session->client_fd() < 0)
-                return;
-            uint8_t buf[65536];
-            ssize_t n;
-            while ((n = read(session->client_fd(), buf, sizeof(buf))) > 0) {
-                session->on_data(buf, (size_t)n);
-                if (session->client_fd() < 0) break;
-            }
-            if (n == 0) {
-                k->del_fd(ev_fd);
-                session->on_disconnect();
-                g_paused_sessions[session->session_id()] = session;
-            } else if (n < 0 && errno != EAGAIN) {
-                log_debug("session %llx: read error fd=%d errno=%d",
-                          (unsigned long long)session->session_id(), ev_fd, errno);
-                k->del_fd(ev_fd);
-                session->on_disconnect();
-                g_paused_sessions[session->session_id()] = session;
-            }
-        });
     }
 }

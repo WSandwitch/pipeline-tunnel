@@ -183,16 +183,9 @@ int main(int argc, char *argv[]) {
                   listen_addr, listen_port,
                   target_addr,
                   cfg.modules,
-                  mod_dir,
-                  thread_count);
+                  mod_dir);
 
     if (!client.start()) {
-        log_error("client failed to start");
-        return 1;
-    }
-
-    log_info("client: waiting for chain...");
-    if (!client.wait_ready()) {
         log_error("client: tunnel setup failed");
         return 1;
     }
@@ -200,7 +193,6 @@ int main(int argc, char *argv[]) {
     log_info("client running. Listening on %s:%d, forwarding to %s",
              listen_addr.c_str(), listen_port, target_addr.c_str());
     log_info("press Ctrl+C to stop.");
-    pause();
 
     client.stop();
     return 0;

@@ -13,7 +13,7 @@ public:
            const std::string &password);
     ~Server();
 
-    bool start(int thread_count = 4);
+    bool start();
     void stop();
 
 private:
@@ -23,8 +23,6 @@ private:
     std::shared_ptr<Kernel> kernel_;
 
     int listen_fd_ = -1;
-
-    void accept_loop();
 };
 
 #endif

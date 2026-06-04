@@ -8,10 +8,10 @@
 #include <atomic>
 #include <mutex>
 #include <unordered_map>
-#include "core/chain.h"
 #include "core/kernel.h"
 #include "core/protocol.h"
 #include "common/write_buffer.h"
+#include "common/utils.h"
 
 class Session : public std::enable_shared_from_this<Session> {
 public:
@@ -23,12 +23,10 @@ public:
 
     // Auth state machine
     enum State {
-        AWAIT_AUTH1_CHALLENGE_RESP, // sent challenge, wait response
-        AWAIT_AUTH1_OK,             // sent OK, wait client challenge
-        AWAIT_AUTH2_RESPONSE,       // sent response, wait OK
+        AWAIT_AUTH1_CHALLENGE_RESP,
+        AWAIT_AUTH1_OK,
+        AWAIT_AUTH2_RESPONSE,
         AUTH_DONE,
-        AWAIT_MODULE_LIST_REQ,
-        AWAIT_CHAIN_CREATE,
         AWAIT_CONNECT_REQ,
         RUNNING,
         DISCONNECTED,
@@ -36,25 +34,18 @@ public:
 
     State state() const { return state_; }
 
-    // Process incoming data from client (serialized by io_mutex_)
+    // Process incoming data from client
     void on_data(const uint8_t *data, size_t len);
 
     // Send packet to client
     void send_packet(const Packet &pkt);
 
-    // Set auth challenge (called by server before sending)
+    // Set auth challenge
     void set_challenge(const std::string &challenge) { challenge1_ = challenge; }
 
-    // Get chain
-    std::shared_ptr<Chain> chain() const { return chain_; }
-
-    // Called when client disconnects — pauses chain, saves for reconnection
     void on_disconnect();
-
-    // Called on reconnection — reassigns client_fd, restarts chain handlers
     bool reconnect(int new_client_fd);
 
-    // Add a data connection (from handshake accept)
     void add_data_connection(uint8_t output_idx, int fd);
 
 private:
@@ -62,6 +53,8 @@ private:
     std::string password_;
     std::shared_ptr<Kernel> kernel_;
     uint64_t session_id_;
+
+    FrameBuf frame_buf_;
 
     std::mutex io_mutex_;
 
@@ -71,60 +64,37 @@ private:
 
     std::string challenge1_;
 
-    struct ModuleInfo { uint8_t id; std::string name; };
-    std::vector<ModuleInfo> loaded_modules_;
-
-    std::shared_ptr<Chain> chain_;
-
-    // Data connections — one per chain output, used after chain setup
+    // Single data connection (passthrough, no chain)
     struct DataConnection {
         int fd = -1;
-        WriteBuffer writer;                      // buffered writes to this data connection
-        std::vector<uint8_t> read_buf;           // varint parse buffer
-        bool paused = false;                     // EPOLLIN removed due to chain_out_writers back-pressure
-        std::unique_ptr<std::mutex> pause_mtx = std::make_unique<std::mutex>();
+        WriteBuffer writer;
+        std::vector<uint8_t> read_buf;
+        size_t read_offset = 0;
+        std::vector<uint8_t> paused_data;
+        bool paused = false;
     };
+    // data_connections_[0] is the client-facing fd (tunnel wire)
     std::vector<DataConnection> data_connections_;
-    uint8_t num_outputs_ = 0;
 
-    // Write buffering for chain input backpressure
-    WriteBuffer chain_in_writer_;
-    std::vector<WriteBuffer> chain_out_writers_;  // per chain output fd (target→chain)
-
-    // Read buffers for streaming varint parsing (avoids data loss on partial reads)
-    std::vector<uint8_t> chain_in_read_buf_;
-
-    void flush_write_buf();
-    void register_chain_input_out();
-    void resume_paused_targets();
-
-    // Per-target epollout registration (chain output → target_fd)
+    // Per-target epollout registration
     void register_target_epollout(uint8_t conn_id, int tfd);
-    // Per-chain-output epollout (target_fd → chain output pipe)
-    void register_chain_out_epollout(size_t idx, int out_fd);
-    // Register epollout on a data connection
     void register_data_conn_epollout(size_t idx, int fd);
 
     void send_pause(uint8_t conn_id);
     void send_resume(uint8_t conn_id);
-
-    // Send a control message (conn_id=255) over the data connection
     void send_control(const Packet &pkt);
 
-    // Register data connection reader (reads raw varint, dispatches by conn_id)
     void register_data_connection_reader(size_t idx);
-
-    // Dispatch a raw varint payload from a data connection
     void dispatch_data_conn_packet(uint8_t conn_id, const uint8_t *payload, size_t len);
 
-    // Target connections (connection_id → target fd)
+    // Target connections
     struct TargetConn {
         int fd = -1;
         std::string addr;
-        WriteBuffer writer;                // buffered writes to target_fd
-        bool paused_by_client = false;     // MSG_CONNECT_PAUSE received from client
-        bool pause_sent = false;           // we sent MSG_CONNECT_PAUSE to client
-        bool paused_by_backpressure = false; // chain_in_writer full, EPOLLIN removed
+        WriteBuffer writer;
+        bool paused_by_client = false;
+        bool pause_sent = false;
+        bool paused_by_backpressure = false;
     };
     std::unordered_map<uint8_t, TargetConn> targets_;
     uint8_t next_conn_id_ = 0;
@@ -135,8 +105,6 @@ private:
     void handle_auth_challenge_response(const Packet &pkt);
     void handle_auth2_challenge(const Packet &pkt);
     void handle_auth2_response(const Packet &pkt);
-    void handle_module_list_req(const Packet &pkt);
-    void handle_chain_create(const Packet &pkt);
     void handle_reconnect(const Packet &pkt);
     void handle_connect_req(const Packet &pkt);
     void handle_disconnect(const Packet &pkt);
