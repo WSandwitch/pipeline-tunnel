@@ -35,16 +35,31 @@ static int gzip_compress(const uint8_t *in, int in_len,
 }
 
 static int gzip_decompress(const uint8_t *in, int in_len,
-                           uint8_t *out, int out_cap) {
+                           uint8_t **out, int *out_cap) {
     z_stream strm;
     memset(&strm, 0, sizeof(strm));
     if (inflateInit2(&strm, 15 | 16) != Z_OK)
         return -1;
     strm.next_in = (uint8_t *)in;
     strm.avail_in = (uInt)in_len;
-    strm.next_out = out;
-    strm.avail_out = (uInt)out_cap;
-    int ret = inflate(&strm, Z_FINISH);
+    strm.next_out = *out;
+    strm.avail_out = (uInt)*out_cap;
+    int ret;
+    do {
+        ret = inflate(&strm, Z_FINISH);
+        if (ret == Z_OK && strm.avail_out == 0) {
+            size_t written = strm.total_out;
+            int new_cap = *out_cap * 2;
+            uint8_t *new_buf = (uint8_t *)realloc(*out, (size_t)new_cap);
+            if (!new_buf) { inflateEnd(&strm); return -1; }
+            *out = new_buf;
+            *out_cap = new_cap;
+            strm.next_out = *out + written;
+            strm.avail_out = (uInt)(*out_cap - written);
+        } else if (ret != Z_OK) {
+            break;
+        }
+    } while (ret == Z_OK);
     int out_len = (int)strm.total_out;
     inflateEnd(&strm);
     if (ret != Z_STREAM_END) return -1;
@@ -59,9 +74,20 @@ static int zstd_compress(const uint8_t *in, int in_len,
 }
 
 static int zstd_decompress(const uint8_t *in, int in_len,
-                           uint8_t *out, int out_cap) {
-    size_t ret = ZSTD_decompress(out, (size_t)out_cap, in, (size_t)in_len);
-    if (ZSTD_isError(ret)) return -1;
+                           uint8_t **out, int *out_cap) {
+    size_t ret = ZSTD_decompress(*out, (size_t)*out_cap, in, (size_t)in_len);
+    if (ret == 0) return -1;
+    if (ZSTD_isError(ret)) {
+        size_t needed = ZSTD_getFrameContentSize(in, (size_t)in_len);
+        if (needed == ZSTD_CONTENTSIZE_UNKNOWN || needed == ZSTD_CONTENTSIZE_ERROR)
+            return -1;
+        uint8_t *new_buf = (uint8_t *)realloc(*out, (size_t)needed);
+        if (!new_buf) return -1;
+        *out = new_buf;
+        *out_cap = (int)needed;
+        ret = ZSTD_decompress(*out, (size_t)*out_cap, in, (size_t)in_len);
+        if (ZSTD_isError(ret)) return -1;
+    }
     return (int)ret;
 }
 
@@ -123,14 +149,14 @@ int process(void *ctx_ptr, int dir, int trigger_fd) {
             out_len = zstd_compress(in_buf, sz, out_buf, out_cap, ctx->level);
         else
             out_len = gzip_compress(in_buf, sz, out_buf, out_cap, ctx->level);
+        free(in_buf);
     } else {
         if (ctx->use_zstd)
-            out_len = zstd_decompress(in_buf, sz, out_buf, out_cap);
+            out_len = zstd_decompress(in_buf, sz, &out_buf, &out_cap);
         else
-            out_len = gzip_decompress(in_buf, sz, out_buf, out_cap);
+            out_len = gzip_decompress(in_buf, sz, &out_buf, &out_cap);
+        free(in_buf);
     }
-
-    free(in_buf);
 
     if (out_len < 0) {
         free(out_buf);

@@ -105,16 +105,19 @@ void Chain::read_into_buf(int fd) {
         varint_bytes = vi;
     }
 
-    // Read body bytes, leaving last byte in socketpair
+    // Read body bytes directly into fd_bufs_ (no stack cap)
     if (pkt_val > 1) {
         size_t body_in_buf = buf.size() - varint_bytes;
         size_t body_wanted = pkt_val - 1;
         if (body_in_buf < body_wanted) {
             size_t to_read = body_wanted - body_in_buf;
-            uint8_t body[65536];
-            ssize_t nb = read(fd, body, to_read < sizeof(body) ? to_read : sizeof(body));
+            size_t old = buf.size();
+            buf.resize(old + to_read);
+            ssize_t nb = read(fd, buf.data() + old, to_read);
             if (nb > 0)
-                buf.insert(buf.end(), body, body + nb);
+                buf.resize(old + nb);
+            else
+                buf.resize(old);
         }
     }
 }
