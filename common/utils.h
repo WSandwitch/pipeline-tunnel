@@ -4,7 +4,6 @@
 #include <cstdint>
 #include <string>
 #include <vector>
-#include <array>
 #include <arpa/inet.h>
 #include <sys/socket.h>
 #include <fcntl.h>
@@ -27,13 +26,8 @@ constexpr uint8_t TYPE_CONNECT_REQ = 0x10;
 constexpr uint8_t TYPE_CONNECT_OK = 0x11;
 constexpr uint8_t TYPE_CONNECT_FAIL = 0x12;
 
-using FrameBuf = std::array<uint8_t, 262144>;
-
 std::vector<uint8_t> make_varint_packet(const uint8_t *data, size_t len);
 std::vector<uint8_t> make_varint_packet_with_conn_id(uint8_t conn_id, const uint8_t *data, size_t len);
-void make_varint_packet_with_conn_id(FrameBuf &buf, size_t &out_len,
-                                     uint8_t conn_id,
-                                     const uint8_t *data, size_t len);
 std::vector<std::string> scan_modules(const std::string &dir);
 
 #endif

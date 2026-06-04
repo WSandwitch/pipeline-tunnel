@@ -43,22 +43,6 @@ std::vector<uint8_t> make_varint_packet_with_conn_id(uint8_t conn_id, const uint
     return buf;
 }
 
-void make_varint_packet_with_conn_id(FrameBuf &buf, size_t &out_len,
-                                     uint8_t conn_id,
-                                     const uint8_t *data, size_t len) {
-    size_t inner_len = 1 + len;
-    size_t pos = 0;
-    size_t val = inner_len;
-    while (val > 0x7F) {
-        buf[pos++] = (uint8_t)((val & 0x7F) | 0x80);
-        val >>= 7;
-    }
-    buf[pos++] = (uint8_t)(val & 0x7F);
-    buf[pos++] = conn_id;
-    memcpy(buf.data() + pos, data, len);
-    out_len = pos + len;
-}
-
 std::vector<std::string> scan_modules(const std::string &dir) {
     std::vector<std::string> paths;
     DIR *d = opendir(dir.c_str());

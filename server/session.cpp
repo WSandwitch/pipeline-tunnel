@@ -266,11 +266,10 @@ void Session::handle_connect_req(const Packet &pkt) {
                 uint8_t rbuf[65536];
                 ssize_t n = read(fd, rbuf, sizeof(rbuf));
                 if (n > 0) {
-                    size_t fl = 0;
-                    make_varint_packet_with_conn_id(frame_buf_, fl, conn_id, rbuf, (size_t)n);
+                    auto framed = make_varint_packet_with_conn_id(conn_id, rbuf, (size_t)n);
                     if (!data_connections_.empty() && data_connections_[0].fd >= 0) {
                         int dc_fd = data_connections_[0].fd;
-                        int ret = data_connections_[0].writer.write(dc_fd, frame_buf_.data(), fl);
+                        int ret = data_connections_[0].writer.write(dc_fd, framed.data(), framed.size());
                         if (ret > 0 && !data_connections_[0].writer.registered)
                             register_data_conn_epollout(0, dc_fd);
                     }
@@ -318,11 +317,10 @@ void Session::add_data_connection(uint8_t output_idx, int fd) {
 
 void Session::send_control(const Packet &pkt) {
     auto serialized = proto_.serialize(pkt);
-    size_t fl = 0;
-    make_varint_packet_with_conn_id(frame_buf_, fl, 255, serialized.data(), serialized.size());
+    auto framed = make_varint_packet_with_conn_id(255, serialized.data(), serialized.size());
     if (!data_connections_.empty() && data_connections_[0].fd >= 0) {
         int fd = data_connections_[0].fd;
-        int ret = data_connections_[0].writer.write(fd, frame_buf_.data(), fl);
+        int ret = data_connections_[0].writer.write(fd, framed.data(), framed.size());
         if (ret > 0 && !data_connections_[0].writer.registered)
             register_data_conn_epollout(0, fd);
     }
@@ -598,11 +596,10 @@ bool Session::reconnect(int new_client_fd) {
                 uint8_t rbuf[65536];
                 ssize_t n = read(fd, rbuf, sizeof(rbuf));
                 if (n > 0) {
-                    size_t fl = 0;
-                    make_varint_packet_with_conn_id(frame_buf_, fl, conn_id, rbuf, (size_t)n);
+                    auto framed = make_varint_packet_with_conn_id(conn_id, rbuf, (size_t)n);
                     if (!data_connections_.empty() && data_connections_[0].fd >= 0) {
                         int dc_fd = data_connections_[0].fd;
-                        int ret = data_connections_[0].writer.write(dc_fd, frame_buf_.data(), fl);
+                        int ret = data_connections_[0].writer.write(dc_fd, framed.data(), framed.size());
                         if (ret > 0 && !data_connections_[0].writer.registered)
                             register_data_conn_epollout(0, dc_fd);
                     }

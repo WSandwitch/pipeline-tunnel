@@ -76,11 +76,10 @@ void Client::send_packet(const Packet &pkt) {
 
 void Client::send_control(const Packet &pkt) {
     auto serialized = proto_.serialize(pkt);
-    size_t fl = 0;
-    make_varint_packet_with_conn_id(frame_buf_, fl, 255, serialized.data(), serialized.size());
+    auto framed = make_varint_packet_with_conn_id(255, serialized.data(), serialized.size());
     if (!data_connections_.empty() && data_connections_[0].fd >= 0) {
         int fd = data_connections_[0].fd;
-        int ret = data_connections_[0].writer.write(fd, frame_buf_.data(), fl);
+        int ret = data_connections_[0].writer.write(fd, framed.data(), framed.size());
         if (ret > 0 && !data_connections_[0].writer.registered)
             register_data_conn_epollout(0, fd);
         if (ret < 0)
@@ -301,10 +300,9 @@ void Client::on_listener_accept(int cfd, const struct sockaddr_in &addr) {
 
 void Client::on_external_recv(int conn_id, const uint8_t *data, size_t len) {
     if (data_connections_.empty() || data_connections_[0].fd < 0) return;
-    size_t fl = 0;
-    make_varint_packet_with_conn_id(frame_buf_, fl, (uint8_t)conn_id, data, len);
+    auto framed = make_varint_packet_with_conn_id((uint8_t)conn_id, data, len);
     int dc_fd = data_connections_[0].fd;
-    int ret = data_connections_[0].writer.write(dc_fd, frame_buf_.data(), fl);
+    int ret = data_connections_[0].writer.write(dc_fd, framed.data(), framed.size());
     if (ret > 0 && !data_connections_[0].writer.registered)
         register_data_conn_epollout(0, dc_fd);
 }

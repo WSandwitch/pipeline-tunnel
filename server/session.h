@@ -11,7 +11,6 @@
 #include "core/kernel.h"
 #include "core/protocol.h"
 #include "common/write_buffer.h"
-#include "common/utils.h"
 
 class Session : public std::enable_shared_from_this<Session> {
 public:
@@ -53,8 +52,6 @@ private:
     std::string password_;
     std::shared_ptr<Kernel> kernel_;
     uint64_t session_id_;
-
-    FrameBuf frame_buf_;
 
     std::mutex io_mutex_;
 

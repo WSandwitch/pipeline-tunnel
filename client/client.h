@@ -12,7 +12,6 @@
 #include "core/protocol.h"
 #include "core/config.h"
 #include "common/write_buffer.h"
-#include "common/utils.h"
 
 using DataCallback = std::function<void(const uint8_t *, size_t)>;
 
@@ -81,8 +80,6 @@ private:
     std::string mod_dir_;
 
     std::shared_ptr<Kernel> kernel_;
-
-    FrameBuf frame_buf_;
 
     struct DataConnection {
         int fd = -1;
