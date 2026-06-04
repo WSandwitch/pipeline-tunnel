@@ -47,7 +47,7 @@ static int gzip_decompress(const uint8_t *in, int in_len,
     int ret;
     do {
         ret = inflate(&strm, Z_FINISH);
-        if (ret == Z_OK && strm.avail_out == 0) {
+        if ((ret == Z_OK || ret == Z_BUF_ERROR) && strm.avail_out == 0) {
             size_t written = strm.total_out;
             int new_cap = *out_cap * 2;
             uint8_t *new_buf = (uint8_t *)realloc(*out, (size_t)new_cap);
@@ -56,10 +56,10 @@ static int gzip_decompress(const uint8_t *in, int in_len,
             *out_cap = new_cap;
             strm.next_out = *out + written;
             strm.avail_out = (uInt)(*out_cap - written);
-        } else if (ret != Z_OK) {
+        } else if (ret != Z_OK && ret != Z_BUF_ERROR) {
             break;
         }
-    } while (ret == Z_OK);
+    } while (ret != Z_STREAM_END);
     int out_len = (int)strm.total_out;
     inflateEnd(&strm);
     if (ret != Z_STREAM_END) return -1;
