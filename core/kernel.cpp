@@ -105,7 +105,9 @@ void Kernel::mod_chain_fd_events(int fd, uint32_t add, uint32_t remove) {
     struct epoll_event ev;
     ev.events = new_events;
     ev.data.u64 = (uint64_t)fd;
-    epoll_ctl(epoll_fd_, EPOLL_CTL_MOD, fd, &ev);
+    if (epoll_ctl(epoll_fd_, EPOLL_CTL_MOD, fd, &ev) < 0 && errno == ENOENT) {
+        epoll_ctl(epoll_fd_, EPOLL_CTL_ADD, fd, &ev);
+    }
 }
 
 void Kernel::del_fd(int fd) {
@@ -125,8 +127,10 @@ void Kernel::add_chain_fd(int fd) {
     auto it = fd_to_chain_.find(fd);
     if (it == fd_to_chain_.end()) return;
     it->second.pending_in.store(false);
+    uint32_t events = it->second.current_events;
+    if (events == 0) return;
     struct epoll_event ev;
-    ev.events = it->second.current_events;
+    ev.events = events;
     ev.data.u64 = (uint64_t)fd;
     if (epoll_ctl(epoll_fd_, EPOLL_CTL_ADD, fd, &ev) < 0)
         if (errno == EEXIST)

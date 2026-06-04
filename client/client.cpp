@@ -342,6 +342,8 @@ void Client::on_listener_accept(int cfd, const struct sockaddr_in &addr) {
              conn_id, sockaddr_to_str(addr).c_str());
 
     set_nonblock(cfd);
+    int bufsz = 1048576;
+    setsockopt(cfd, SOL_SOCKET, SO_SNDBUF, &bufsz, sizeof(bufsz));
     {
         std::lock_guard<std::mutex> lock(conns_mtx_);
         conns_.emplace(conn_id, ExternalConn{cfd, addr, false});

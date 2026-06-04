@@ -843,6 +843,9 @@ bool Session::setup_tunnel_target(const std::string &target_addr, uint8_t conn_i
         return false;
     }
 
+    int bufsz = 1048576;
+    setsockopt(fd, SOL_SOCKET, SO_SNDBUF, &bufsz, sizeof(bufsz));
+
     int flags = fcntl(fd, F_GETFL, 0);
     fcntl(fd, F_SETFL, flags | O_NONBLOCK);
 
