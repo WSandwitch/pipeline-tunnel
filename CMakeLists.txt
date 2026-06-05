@@ -24,10 +24,7 @@ add_custom_target(pack
   COMMAND ${CMAKE_COMMAND} -E make_directory ${PACK_DIR}/modules
   COMMAND ${CMAKE_COMMAND} -E copy $<TARGET_FILE:modtunnel-server> ${PACK_DIR}/
   COMMAND ${CMAKE_COMMAND} -E copy $<TARGET_FILE:modtunnel-client> ${PACK_DIR}/
-  COMMAND ${CMAKE_COMMAND} -E copy $<TARGET_FILE:compress> ${PACK_DIR}/modules/
-  COMMAND ${CMAKE_COMMAND} -E copy $<TARGET_FILE:split> ${PACK_DIR}/modules/
-  COMMAND ${CMAKE_COMMAND} -E copy $<TARGET_FILE:crypt> ${PACK_DIR}/modules/
-  COMMAND ${CMAKE_COMMAND} -E copy $<TARGET_FILE:base64> ${PACK_DIR}/modules/
+  COMMAND ${CMAKE_COMMAND} -E copy $<TARGET_FILE:copy> ${PACK_DIR}/modules/
   COMMENT "Packing binaries and modules to ${PACK_DIR}"
-  DEPENDS modtunnel-server modtunnel-client compress split crypt base64
+  DEPENDS modtunnel-server modtunnel-client copy
 )

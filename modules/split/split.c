@@ -35,7 +35,7 @@ struct merge_state {
 struct split_ctx {
     int in_fd;
     int out_fd;
-    ModuleKernel *kapi;
+    ModuleChain *chain_api;
     int *extra_fds;
     int extra_count;
     int num_outputs;
@@ -58,7 +58,7 @@ static int parse_size(const char *s, int def) {
     return CLAMP((int)val, MIN_CHUNK, MAX_CHUNK);
 }
 
-void *init(int in_fd, int out_fd, ModuleKernel *kapi, const char *config) {
+void *init(int in_fd, int out_fd, ModuleChain *chain_api, const char *config) {
     struct split_ctx *ctx = (struct split_ctx *)calloc(1, sizeof(*ctx));
     ctx->in_fd = in_fd;
     ctx->out_fd = out_fd;

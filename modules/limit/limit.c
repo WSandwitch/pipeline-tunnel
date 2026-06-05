@@ -11,7 +11,7 @@
 struct limit_ctx {
     int in_fd;
     int out_fd;
-    ModuleKernel *kapi;
+    ModuleChain *chain_api;
     int trace;
     int node_id;
     uint64_t rate_bps;
@@ -25,7 +25,7 @@ static uint64_t now_us(void) {
     return (uint64_t)ts.tv_sec * 1000000 + (uint64_t)ts.tv_nsec / 1000;
 }
 
-void *init(int in_fd, int out_fd, ModuleKernel *kapi, const char *config) {
+void *init(int in_fd, int out_fd, ModuleChain *chain_api, const char *config) {
     struct limit_ctx *ctx = (struct limit_ctx *)calloc(1, sizeof(*ctx));
     ctx->in_fd = in_fd;
     ctx->out_fd = out_fd;

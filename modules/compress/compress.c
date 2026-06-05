@@ -10,7 +10,7 @@
 struct compress_ctx {
     int in_fd;
     int out_fd;
-    ModuleKernel *kapi;
+    ModuleChain *chain_api;
     int level;
     int use_zstd;
     int trace;
@@ -91,7 +91,7 @@ static int zstd_decompress(const uint8_t *in, int in_len,
     return (int)ret;
 }
 
-void *init(int in_fd, int out_fd, ModuleKernel *kapi, const char *config) {
+void *init(int in_fd, int out_fd, ModuleChain *chain_api, const char *config) {
     struct compress_ctx *ctx = (struct compress_ctx *)malloc(sizeof(*ctx));
     ctx->in_fd = in_fd;
     ctx->out_fd = out_fd;

@@ -59,12 +59,12 @@ static int b64_decode(const char *in, size_t len, unsigned char *out) {
 struct b64_ctx {
     int in_fd;
     int out_fd;
-    ModuleKernel *kapi;
+    ModuleChain *chain_api;
     int trace;
     int node_id;
 };
 
-void *init(int in_fd, int out_fd, ModuleKernel *kapi, const char *config) {
+void *init(int in_fd, int out_fd, ModuleChain *chain_api, const char *config) {
     struct b64_ctx *ctx = (struct b64_ctx *)malloc(sizeof(*ctx));
     ctx->in_fd = in_fd;
     ctx->out_fd = out_fd;

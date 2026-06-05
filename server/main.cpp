@@ -1,5 +1,5 @@
 #include "server.h"
-#include "core/module.h"
+#include "core/module_base.h"
 #include "common/logger.h"
 #include "common/utils.h"
 #include <cstring>
@@ -12,26 +12,11 @@
 
 class Session;
 
-// Global module registry: module_name -> .so path
-std::unordered_map<std::string, std::string> g_module_registry;
-
 // Session registry for reconnection: session_id -> weak_ptr<Session>
 std::unordered_map<uint64_t, std::weak_ptr<Session>> g_session_registry;
 
 // Paused sessions kept alive during disconnect (awaiting reconnect)
 std::unordered_map<uint64_t, std::shared_ptr<Session>> g_paused_sessions;
-
-static void load_modules(const std::string &dir) {
-    auto paths = scan_modules(dir);
-    for (auto &p : paths) {
-        Module m;
-        if (m.load(p)) {
-            std::string mod_name = m.name();
-            g_module_registry[mod_name] = p;
-            log_info("registered module: %s -> %s", mod_name.c_str(), p.c_str());
-        }
-    }
-}
 
 static void print_usage(const char *prog) {
     fprintf(stderr,
@@ -134,12 +119,12 @@ int main(int argc, char *argv[]) {
             fprintf(stderr, "Use -M <modpath> to specify module directory\n");
             return 1;
         }
-        Module m;
-        std::string so_path = mod_dir + "/" + module_help_name + ".so";
-        if (m.load(so_path)) {
-            fprintf(stderr, "Module: %s\n", m.name());
-            fprintf(stderr, "Description: %s\n", m.desc());
-            const char *help = m.help_text();
+        ModuleBase::load(mod_dir);
+        auto *base = ModuleBase::find(module_help_name);
+        if (base) {
+            fprintf(stderr, "Module: %s\n", base->name.c_str());
+            fprintf(stderr, "Description: %s\n", base->desc_fn());
+            const char *help = base->help_fn();
             if (help && help[0])
                 fprintf(stderr, "\n%s\n", help);
             else
@@ -155,14 +140,10 @@ int main(int argc, char *argv[]) {
             fprintf(stderr, "Use -M <modpath> to specify module directory\n");
             return 1;
         }
-        auto paths = scan_modules(mod_dir);
+        ModuleBase::load(mod_dir);
         fprintf(stderr, "Modules in %s:\n", mod_dir.c_str());
-        for (auto &p : paths) {
-            Module m;
-            if (m.load(p)) {
-                fprintf(stderr, "  %-20s %s\n", m.name(), m.desc());
-            }
-        }
+        for (auto &kv : ModuleBase::bases)
+            fprintf(stderr, "  %-20s %s\n", kv.first.c_str(), kv.second.desc_fn());
         return 0;
     }
 
@@ -177,7 +158,7 @@ int main(int argc, char *argv[]) {
 
     // Load modules from directory
     if (!mod_dir.empty()) {
-        load_modules(mod_dir);
+        ModuleBase::load(mod_dir);
     }
 
     Server server(listen_addr, listen_port, password);

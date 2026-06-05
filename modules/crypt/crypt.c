@@ -11,14 +11,14 @@
 struct crypt_ctx {
     int in_fd;
     int out_fd;
-    ModuleKernel *kapi;
+    ModuleChain *chain_api;
     unsigned char key[32];
     int key_set;
     int trace;
     int node_id;
 };
 
-void *init(int in_fd, int out_fd, ModuleKernel *kapi, const char *config) {
+void *init(int in_fd, int out_fd, ModuleChain *chain_api, const char *config) {
     struct crypt_ctx *ctx = (struct crypt_ctx *)calloc(1, sizeof(*ctx));
     ctx->in_fd = in_fd;
     ctx->out_fd = out_fd;

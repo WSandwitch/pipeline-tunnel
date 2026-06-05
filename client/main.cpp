@@ -2,7 +2,7 @@
 #include "common/logger.h"
 #include "common/utils.h"
 #include "core/config.h"
-#include "core/module.h"
+#include "core/module_base.h"
 #include <cstring>
 #include <cstdlib>
 #include <unistd.h>
@@ -133,12 +133,12 @@ int main(int argc, char *argv[]) {
             fprintf(stderr, "Use -M <modpath> to specify module directory\n");
             return 1;
         }
-        Module m;
-        std::string so_path = mod_dir + "/" + module_help_name + ".so";
-        if (m.load(so_path)) {
-            fprintf(stderr, "Module: %s\n", m.name());
-            fprintf(stderr, "Description: %s\n", m.desc());
-            const char *help = m.help_text();
+        ModuleBase::load(mod_dir);
+        auto *base = ModuleBase::find(module_help_name);
+        if (base) {
+            fprintf(stderr, "Module: %s\n", base->name.c_str());
+            fprintf(stderr, "Description: %s\n", base->desc_fn());
+            const char *help = base->help_fn();
             if (help && help[0])
                 fprintf(stderr, "\n%s\n", help);
             else
@@ -154,13 +154,10 @@ int main(int argc, char *argv[]) {
             fprintf(stderr, "Use -M <modpath> to specify module directory\n");
             return 1;
         }
-        auto paths = scan_modules(mod_dir);
+        ModuleBase::load(mod_dir);
         fprintf(stderr, "Modules in %s:\n", mod_dir.c_str());
-        for (auto &p : paths) {
-            Module m;
-            if (m.load(p))
-                fprintf(stderr, "  %-20s %s\n", m.name(), m.desc());
-        }
+        for (auto &kv : ModuleBase::bases)
+            fprintf(stderr, "  %-20s %s\n", kv.first.c_str(), kv.second.desc_fn());
         return 0;
     }
 
