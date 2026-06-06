@@ -110,7 +110,7 @@ set_target_properties(my_module PROPERTIES PREFIX "" SUFFIX ".so")
 
 ## Example: copy module
 
-See `examples/copy_module/copy.c`.
+See `modules/copy/copy.c`.
 
 ```c
 void *init(ModuleChain *api, const char *config) {

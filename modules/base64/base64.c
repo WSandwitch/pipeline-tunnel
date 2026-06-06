@@ -57,65 +57,59 @@ static int b64_decode(const char *in, size_t len, unsigned char *out) {
 }
 
 struct b64_ctx {
-    int in_fd;
-    int out_fd;
-    ModuleChain *chain_api;
+    ModuleChain *api;
     int trace;
     int node_id;
 };
 
-void *init(int in_fd, int out_fd, ModuleChain *chain_api, const char *config) {
+void *init(ModuleChain *api, const char *config) {
     struct b64_ctx *ctx = (struct b64_ctx *)malloc(sizeof(*ctx));
-    ctx->in_fd = in_fd;
-    ctx->out_fd = out_fd;
-    ctx->kapi = kapi;
+    ctx->api = api;
     ctx->trace = config && strstr(config, "trace") != NULL;
-    ctx->node_id = kapi && kapi->get_node_id ? kapi->get_node_id(kapi->ctx) : -1;
+    ctx->node_id = (api && api->get_node_id) ? api->get_node_id(api->ctx) : -1;
     if (ctx->trace)
         fprintf(stderr, "[base64 node=%d init]\n", ctx->node_id);
     return ctx;
 }
 
-int process(void *ctx_ptr, int dir, int trigger_fd) {
+int process(void *ctx_ptr, int dir, int trigger_idx) {
+    (void)dir;
     struct b64_ctx *ctx = (struct b64_ctx *)ctx_ptr;
 
-    int sz = ctx->kapi->read_packet_size(ctx->kapi->ctx, trigger_fd);
-    if (sz <= 0) return -1;
-    uint8_t *buf = (uint8_t *)malloc((size_t)sz);
-    if (!buf) return -1;
-    ctx->kapi->read_packet(ctx->kapi->ctx, trigger_fd, buf);
+    int sz = 0;
+    uint8_t *pkt = (uint8_t *)ctx->api->get_packet(ctx->api->ctx, 0, &sz);
+    if (!pkt || sz <= 0) return -1;
 
-    int write_fd = (trigger_fd == ctx->in_fd) ? ctx->out_fd : ctx->in_fd;
+    int write_dst = (trigger_idx == 0) ? 1 : 0;
     int ret;
 
-    if (dir == 1) {
+    if (trigger_idx == 0) {
         size_t elen = b64_enc_len((size_t)sz);
         char *ebuf = (char *)malloc(elen);
-        if (!ebuf) { free(buf); return -1; }
-        b64_encode(buf, (size_t)sz, ebuf);
-        ret = ctx->kapi->write_packet(ctx->kapi->ctx, write_fd, (const uint8_t *)ebuf, elen);
+        if (!ebuf) { free(pkt); return -1; }
+        b64_encode(pkt, (size_t)sz, ebuf);
         if (ctx->trace)
-            fprintf(stderr, "[base64 node=%d fw] sz=%d → out=%zu\n",
-                    ctx->node_id, sz, elen);
+            fprintf(stderr, "[base64 node=%d fw] sz=%d -> out=%zu\n", ctx->node_id, sz, elen);
+        free(pkt);
+        ret = ctx->api->write_packet(ctx->api->ctx, write_dst, (const uint8_t *)ebuf, elen);
         free(ebuf);
     } else {
-        size_t mlen = b64_dec_len((char *)buf, (size_t)sz);
+        size_t mlen = b64_dec_len((char *)pkt, (size_t)sz);
         unsigned char *rbuf = (unsigned char *)malloc(mlen);
-        if (!rbuf) { free(buf); return -1; }
-        if (b64_decode((char *)buf, (size_t)sz, rbuf) < 0) {
-            free(rbuf); free(buf); return -1;
+        if (!rbuf) { free(pkt); return -1; }
+        if (b64_decode((char *)pkt, (size_t)sz, rbuf) < 0) {
+            free(rbuf); free(pkt); return -1;
         }
         size_t actual = mlen;
-        if ((size_t)sz >= 2 && buf[sz - 1] == '=') actual--;
-        if ((size_t)sz >= 2 && buf[sz - 2] == '=') actual--;
-        ret = ctx->kapi->write_packet(ctx->kapi->ctx, write_fd, rbuf, actual);
+        if ((size_t)sz >= 2 && pkt[sz - 1] == '=') actual--;
+        if ((size_t)sz >= 2 && pkt[sz - 2] == '=') actual--;
         if (ctx->trace)
-            fprintf(stderr, "[base64 node=%d %s] sz=%d → out=%zu\n",
-                    ctx->node_id, dir ? "fw" : "rv", sz, actual);
+            fprintf(stderr, "[base64 node=%d rv] sz=%d -> out=%zu\n", ctx->node_id, sz, actual);
+        free(pkt);
+        ret = ctx->api->write_packet(ctx->api->ctx, write_dst, rbuf, actual);
         free(rbuf);
     }
 
-    free(buf);
     return ret;
 }
 
@@ -132,6 +126,6 @@ const char *moduledesc(void) {
 }
 
 const char *modulehelp(void) {
-    return "dir=1 encode, dir=0 decode.\n"
+    return "Encodes data from external->wire, decodes from wire->external.\n"
            "Config: \"trace\" enables debug output.";
 }
