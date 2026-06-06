@@ -203,7 +203,13 @@ void Session::handle_auth2_response(const Packet &pkt) {
             auto *self = (Session*)ctx;
             auto *ref = &self->chain_ref_;
             if (dst == 0) {
-                if (len < 1) { free(const_cast<uint8_t*>(data)); return -1; }
+                if (len < 1 || data[0] == 255) {
+                    if (len >= 1)
+                        log_error("session %llx: wire_write dst=0 conn_id=255 invalid",
+                                  (unsigned long long)self->session_id_);
+                    free(const_cast<uint8_t*>(data));
+                    return -1;
+                }
                 uint8_t conn_id = data[0];
                 auto it = ref->in_fd.find(conn_id);
                 if (it == ref->in_fd.end()) {
@@ -301,6 +307,13 @@ void Session::handle_auth2_response(const Packet &pkt) {
         chain_ref_.out_fds = {client_fd_};
         chain_ref_.out_writer = &data_connections_[0].writer;
         register_data_connection_reader(0);
+        // Process any leftover wire-format data that arrived in the same TCP segment
+        if (!recv_buf_.empty()) {
+            log_debug("session %llx: processing %zu leftover wire bytes",
+                      (unsigned long long)session_id_, recv_buf_.size());
+            process_wire_buffer(recv_buf_.data(), recv_buf_.size());
+            recv_buf_.clear();
+        }
         state_ = AWAIT_CHAIN_CREATE;
 
         // Set heartbeat tick
@@ -314,6 +327,8 @@ void Session::handle_auth2_response(const Packet &pkt) {
 }
 
 void Session::handle_module_list_req(const Packet &pkt) {
+    log_debug("session %llx: MSG_MODULE_LIST_REQ received (payload_size=%zu)",
+              (unsigned long long)session_id_, pkt.payload.size());
     // Parse: [count:u8][mid_32bytes]...
     size_t pos = 0;
     if (pkt.payload.size() < 1) return;
@@ -557,7 +572,16 @@ void Session::add_data_connection(uint8_t output_idx, int fd) {
 
 void Session::send_control(const Packet &pkt) {
     auto serialized = proto_.serialize(pkt);
-    auto framed = make_varint_packet_with_conn_id(255, serialized.data(), serialized.size());
+    // Wire format: [varint(1+proto_len)][WIRE_CONTROL][proto_data]
+    std::vector<uint8_t> framed;
+    size_t val = 1 + serialized.size(); // type byte + proto
+    while (val > 0x7F) {
+        framed.push_back((uint8_t)((val & 0x7F) | 0x80));
+        val >>= 7;
+    }
+    framed.push_back((uint8_t)(val & 0x7F));
+    framed.push_back(WIRE_CONTROL);
+    framed.insert(framed.end(), serialized.begin(), serialized.end());
     if (!data_connections_.empty() && data_connections_[0].fd >= 0) {
         int fd = data_connections_[0].fd;
         int ret = data_connections_[0].writer.write(fd, framed.data(), framed.size());
@@ -566,62 +590,112 @@ void Session::send_control(const Packet &pkt) {
     }
 }
 
-void Session::dispatch_data_conn_packet(uint8_t conn_id, const uint8_t *payload, size_t len) {
-    if (conn_id == 255) {
-        Packet pkt;
-        size_t consumed = proto_.try_parse(payload, len, pkt);
-        if (consumed == 0) return;
-        switch (pkt.type) {
-            case MSG_CONNECT_REQ:
-                handle_connect_req(pkt);
-                break;
-            case MSG_DISCONNECT:
-                handle_disconnect(pkt);
-                break;
-            case MSG_MODULE_LIST_REQ:
-                handle_module_list_req(pkt);
-                break;
-            case MSG_CHAIN_CREATE:
-                handle_chain_create(pkt);
-                break;
-            case MSG_CONNECT_PAUSE: {
-                uint8_t cid = pkt.payload.empty() ? 0 : pkt.payload[0];
-                log_debug("session %llx: PAUSE conn_id=%u",
-                          (unsigned long long)session_id_, cid);
-                auto it = targets_.find(cid);
-                if (it != targets_.end()) {
-                    it->second.paused_by_client = true;
-                    kernel_->mod_fd_events(it->second.fd, 0, EPOLLIN);
-                }
-                break;
-            }
-            case MSG_CONNECT_RESUME: {
-                uint8_t cid = pkt.payload.empty() ? 0 : pkt.payload[0];
-                log_debug("session %llx: RESUME conn_id=%u",
-                          (unsigned long long)session_id_, cid);
-                auto it = targets_.find(cid);
-                if (it != targets_.end()) {
-                    it->second.paused_by_client = false;
-                    kernel_->mod_fd_events(it->second.fd, EPOLLIN, 0);
-                }
-                break;
-            }
-            default:
-                log_debug("session %llx: unexpected control msg %d via data conn",
-                          (unsigned long long)session_id_, (int)pkt.type);
-                break;
+void Session::process_wire_buffer(const uint8_t *data, size_t len) {
+    size_t pos = 0;
+    while (pos < len) {
+        size_t val = 0;
+        int shift = 0;
+        size_t save = pos;
+        while (pos < len && shift < 56) {
+            uint8_t byte = data[pos++];
+            val |= (size_t)(byte & 0x7F) << shift;
+            if (!(byte & 0x80)) break;
+            shift += 7;
         }
+        if (pos >= save + 10 || shift >= 56) {
+            log_debug("session %llx: process_wire_buffer varint overflow at pos=%zu",
+                      (unsigned long long)session_id_, save);
+            break;
+        }
+        if (pos + val > len || val < 1) {
+            log_debug("session %llx: process_wire_buffer val=%zu > len=%zu at pos=%zu",
+                      (unsigned long long)session_id_, val, len, save);
+            break;
+        }
+        uint8_t type = data[pos];
+        log_debug("session %llx: process_wire_buffer type=%u val=%zu at pos=%zu",
+                  (unsigned long long)session_id_, type, val, save);
+        if (type == WIRE_CONTROL) {
+            Packet pkt;
+            size_t consumed = proto_.try_parse(data + pos + 1, val - 1, pkt);
+            if (consumed > 0) {
+                switch (pkt.type) {
+                    case MSG_CONNECT_REQ:
+                        handle_connect_req(pkt);
+                        break;
+                    case MSG_DISCONNECT:
+                        handle_disconnect(pkt);
+                        break;
+                    case MSG_MODULE_LIST_REQ:
+                        handle_module_list_req(pkt);
+                        break;
+                    case MSG_CHAIN_CREATE:
+                        handle_chain_create(pkt);
+                        break;
+                    case MSG_CONNECT_PAUSE:
+                    case MSG_CONNECT_RESUME: {
+                        uint8_t cid = pkt.payload.empty() ? 0 : pkt.payload[0];
+                        if (pkt.type == MSG_CONNECT_PAUSE) {
+                            log_debug("session %llx: PAUSE conn_id=%u",
+                                      (unsigned long long)session_id_, cid);
+                            auto it = targets_.find(cid);
+                            if (it != targets_.end()) {
+                                it->second.paused_by_client = true;
+                                kernel_->mod_fd_events(it->second.fd, 0, EPOLLIN);
+                            }
+                        } else {
+                            log_debug("session %llx: RESUME conn_id=%u",
+                                      (unsigned long long)session_id_, cid);
+                            auto it = targets_.find(cid);
+                            if (it != targets_.end()) {
+                                it->second.paused_by_client = false;
+                                kernel_->mod_fd_events(it->second.fd, EPOLLIN, 0);
+                            }
+                        }
+                        break;
+                    }
+                    default:
+                        log_debug("session %llx: unexpected control msg %d",
+                                  (unsigned long long)session_id_, (int)pkt.type);
+                        break;
+                }
+            }
+        } else if (type == WIRE_SHUTDOWN_WR) {
+            if (val >= 2) {
+                uint8_t cid = data[pos + 1];
+                auto it = targets_.find(cid);
+                if (it != targets_.end()) {
+                    it->second.shutdown_wr = true;
+                    if (it->second.writer.empty() ||
+                        it->second.writer.flush(it->second.fd)) {
+                        shutdown(it->second.fd, SHUT_WR);
+                        it->second.shutdown_wr_sent = true;
+                    }
+                    if (!it->second.shutdown_wr_sent && !it->second.writer.registered)
+                        register_target_epollout(cid, it->second.fd);
+                }
+            }
+        } else if (type == 0) {
+            dispatch_data_conn_packet(data + pos + 1, val - 1);
+        }
+        pos += val;
+    }
+}
+
+void Session::dispatch_data_conn_packet(const uint8_t *payload, size_t len) {
+    // Data packet — payload already includes conn_id at [0]
+    if (len < 1) return;
+    if (payload[0] == 255) {
+        log_error("session %llx: conn_id=255 in data packet, disconnecting",
+                  (unsigned long long)session_id_);
         return;
     }
-
-    // Data packet — go through Chain
     if (chain_ && state_ == RUNNING) {
-        uint8_t *blob = (uint8_t*)malloc(1 + len);
+        uint8_t *blob = (uint8_t*)malloc(len);
         if (!blob) return;
-        blob[0] = conn_id;
-        memcpy(blob + 1, payload, len);
+        memcpy(blob, payload, len);
         // Reverse direction: src_idx=1, dir=1 (wire→target)
-        chain_->push_packet(blob, 1 + len, 1, 1);
+        chain_->push_packet(blob, len, 1, 1);
     }
 }
 
@@ -695,20 +769,64 @@ void Session::register_data_connection_reader(size_t idx) {
                         off += pos + val;
                         continue;
                     }
-                    if (type > WIRE_SHUTDOWN_WR_ACK) {
+                    if (type == WIRE_CONTROL) {
+                        // Control message — parse proto directly, bypass Chain
+                        Packet pkt;
+                        size_t consumed = proto_.try_parse(ptr + pos + 1, val - 1, pkt);
+                        if (consumed > 0) {
+                            switch (pkt.type) {
+                                case MSG_CONNECT_REQ:
+                                    handle_connect_req(pkt);
+                                    break;
+                                case MSG_DISCONNECT:
+                                    handle_disconnect(pkt);
+                                    break;
+                                case MSG_MODULE_LIST_REQ:
+                                    handle_module_list_req(pkt);
+                                    break;
+                                case MSG_CHAIN_CREATE:
+                                    handle_chain_create(pkt);
+                                    break;
+                                case MSG_CONNECT_PAUSE:
+                                case MSG_CONNECT_RESUME: {
+                                    uint8_t cid = pkt.payload.empty() ? 0 : pkt.payload[0];
+                                    if (pkt.type == MSG_CONNECT_PAUSE) {
+                                        log_debug("session %llx: PAUSE conn_id=%u",
+                                                  (unsigned long long)session_id_, cid);
+                                        auto it = targets_.find(cid);
+                                        if (it != targets_.end()) {
+                                            it->second.paused_by_client = true;
+                                            kernel_->mod_fd_events(it->second.fd, 0, EPOLLIN);
+                                        }
+                                    } else {
+                                        log_debug("session %llx: RESUME conn_id=%u",
+                                                  (unsigned long long)session_id_, cid);
+                                        auto it = targets_.find(cid);
+                                        if (it != targets_.end()) {
+                                            it->second.paused_by_client = false;
+                                            kernel_->mod_fd_events(it->second.fd, EPOLLIN, 0);
+                                        }
+                                    }
+                                    break;
+                                }
+                                default:
+                                    log_debug("session %llx: unexpected control msg %d",
+                                              (unsigned long long)session_id_, (int)pkt.type);
+                                    break;
+                            }
+                        }
+                        off += pos + val;
+                        continue;
+                    }
+                    if (type > WIRE_CONTROL) {
                         log_error("session %llx: wire protocol violation type=%u",
                                   (unsigned long long)session_id_, type);
                         buf.clear(); off = 0;
                         break;
                     }
-                    if (val < 2) {
-                        log_error("session %llx: data without conn_id",
-                                  (unsigned long long)session_id_);
-                        buf.clear(); off = 0;
-                        break;
-                    }
-                    uint8_t conn_id = ptr[pos + 1];
-                    dispatch_data_conn_packet(conn_id, ptr + pos + 2, val - 2);
+
+                    // type == 0: data — payload includes conn_id at [0], pass as-is
+                    dispatch_data_conn_packet(ptr + pos + 1, val - 1);
                     off += pos + val;
                 }
                 if (off > 65536) {

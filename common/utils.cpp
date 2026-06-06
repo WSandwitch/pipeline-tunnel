@@ -28,22 +28,6 @@ std::vector<uint8_t> make_varint_packet(const uint8_t *data, size_t len) {
     return buf;
 }
 
-std::vector<uint8_t> make_varint_packet_with_conn_id(uint8_t conn_id, const uint8_t *data, size_t len) {
-    // Wire format: [varint(2+len)][type=0][conn_id][payload]
-    size_t inner_len = 2 + len;  // type(1) + conn_id(1) + payload
-    std::vector<uint8_t> buf;
-    size_t val = inner_len;
-    while (val > 0x7F) {
-        buf.push_back((uint8_t)((val & 0x7F) | 0x80));
-        val >>= 7;
-    }
-    buf.push_back((uint8_t)(val & 0x7F));
-    buf.push_back(0);            // type=0 (data)
-    buf.push_back(conn_id);
-    buf.insert(buf.end(), data, data + len);
-    return buf;
-}
-
 std::vector<std::string> scan_modules(const std::string &dir) {
     std::vector<std::string> paths;
     DIR *d = opendir(dir.c_str());

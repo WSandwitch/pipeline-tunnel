@@ -23,7 +23,6 @@ constexpr uint8_t TYPE_HEARTBEAT1 = 1;   // [varint(1)][1] — empty, ping
 constexpr uint8_t TYPE_HEARTBEAT2 = 2;   // [varint(1)][2] — empty, pong
 
 std::vector<uint8_t> make_varint_packet(const uint8_t *data, size_t len);
-std::vector<uint8_t> make_varint_packet_with_conn_id(uint8_t conn_id, const uint8_t *data, size_t len);
 std::vector<std::string> scan_modules(const std::string &dir);
 
 #endif

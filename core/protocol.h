@@ -46,5 +46,6 @@ const uint8_t WIRE_HEARTBEAT_PING = 1;
 const uint8_t WIRE_HEARTBEAT_PONG = 2;
 const uint8_t WIRE_SHUTDOWN_WR = 3;
 const uint8_t WIRE_SHUTDOWN_WR_ACK = 4;
+const uint8_t WIRE_CONTROL = 5;
 
 #endif

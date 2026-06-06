@@ -121,7 +121,8 @@ private:
     void register_external_epollout(uint8_t conn_id, int fd);
 
     void register_data_connection_reader(size_t idx);
-    void dispatch_data_conn_packet(uint8_t conn_id, const uint8_t *payload, size_t len);
+    void dispatch_data_conn_packet(const uint8_t *payload, size_t len);
+    void process_wire_buffer(const uint8_t *data, size_t len);
 
     void send_pause(uint8_t conn_id);
     void send_resume(uint8_t conn_id);

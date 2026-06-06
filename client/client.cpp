@@ -82,7 +82,16 @@ void Client::send_packet(const Packet &pkt) {
 
 void Client::send_control(const Packet &pkt) {
     auto serialized = proto_.serialize(pkt);
-    auto framed = make_varint_packet_with_conn_id(255, serialized.data(), serialized.size());
+    // Wire format: [varint(1+proto_len)][WIRE_CONTROL][proto_data]
+    std::vector<uint8_t> framed;
+    size_t val = 1 + serialized.size(); // type byte + proto
+    while (val > 0x7F) {
+        framed.push_back((uint8_t)((val & 0x7F) | 0x80));
+        val >>= 7;
+    }
+    framed.push_back((uint8_t)(val & 0x7F));
+    framed.push_back(WIRE_CONTROL);
+    framed.insert(framed.end(), serialized.begin(), serialized.end());
     if (!data_connections_.empty() && data_connections_[0].fd >= 0) {
         int fd = data_connections_[0].fd;
         int ret = data_connections_[0].writer.write(fd, framed.data(), framed.size());
@@ -155,7 +164,42 @@ void Client::register_data_connection_reader(size_t idx) {
                         off += pos + val;
                         continue;
                     }
-                    if (type > WIRE_SHUTDOWN_WR_ACK) {
+                    if (type == WIRE_CONTROL) {
+                        // Control message — parse proto directly, bypass Chain
+                        Packet pkt;
+                        size_t consumed = proto_.try_parse(ptr + pos + 1, val - 1, pkt);
+                        if (consumed > 0) {
+                            switch (pkt.type) {
+                                case MSG_MODULE_LIST_RES:
+                                    handle_module_list_res(pkt);
+                                    break;
+                                case MSG_CONNECT_OK:
+                                    handle_connect_ok(pkt);
+                                    break;
+                                case MSG_CONNECT_FAIL:
+                                    handle_connect_fail(pkt);
+                                    break;
+                                case MSG_DISCONNECT:
+                                    handle_disconnect(pkt);
+                                    break;
+                                case MSG_CONNECT_PAUSE:
+                                    handle_connect_pause(pkt);
+                                    break;
+                                case MSG_CONNECT_RESUME:
+                                    handle_connect_resume(pkt);
+                                    break;
+                                case MSG_CHAIN_READY:
+                                    handle_chain_ready(pkt);
+                                    break;
+                                default:
+                                    log_debug("client: unexpected control msg %d", (int)pkt.type);
+                                    break;
+                            }
+                        }
+                        off += pos + val;
+                        continue;
+                    }
+                    if (type > WIRE_CONTROL) {
                         // Critical error — disconnect
                         log_error("client: wire protocol violation type=%u, disconnecting", type);
                         buf.clear(); off = 0;
@@ -163,17 +207,9 @@ void Client::register_data_connection_reader(size_t idx) {
                         break;
                     }
 
-                    // type == 0: data
-                    if (val < 2) {
-                        // Data without conn_id — protocol error
-                        log_error("client: data packet without conn_id, disconnecting");
-                        buf.clear(); off = 0;
-                        Kernel::request_stop();
-                        break;
-                    }
-                    uint8_t conn_id = ptr[pos + 1];
+                    // type == 0: data — payload includes conn_id at [0], pass as-is to Chain
                     try {
-                        dispatch_data_conn_packet(conn_id, ptr + pos + 2, val - 2);
+                        dispatch_data_conn_packet(ptr + pos + 1, val - 1);
                     } catch (const std::exception &e) {
                         log_error("client: dispatch exception: %s (val=%zu, buf_sz=%zu)", e.what(), val, buf.size());
                         buf.clear(); off = 0;
@@ -193,59 +229,75 @@ void Client::register_data_connection_reader(size_t idx) {
     }, EPOLLIN);
 }
 
-void Client::dispatch_data_conn_packet(uint8_t conn_id, const uint8_t *payload, size_t len) {
-    if (conn_id != 255 && len <= 32) {
-        std::string hex;
-        for (size_t i = 0; i < len; i++)
-            hex += "0123456789abcdef"[payload[i] >> 4] + "0123456789abcdef"[payload[i] & 0xf];
-        log_debug("dispatch: conn_id=%u len=%zu hex=[%s]", conn_id, len, hex.c_str());
-    } else if (conn_id != 255) {
-        log_debug("dispatch: conn_id=%u len=%zu", conn_id, len);
-    }
-    if (conn_id == 255) {
-        // Control message — dispatch directly, bypass Chain
-        Packet pkt;
-        size_t consumed = proto_.try_parse(payload, len, pkt);
-        if (consumed == 0) return;
-        switch (pkt.type) {
-            case MSG_MODULE_LIST_RES:
-                handle_module_list_res(pkt);
-                break;
-            case MSG_CONNECT_OK:
-                handle_connect_ok(pkt);
-                break;
-            case MSG_CONNECT_FAIL:
-                handle_connect_fail(pkt);
-                break;
-            case MSG_DISCONNECT:
-                handle_disconnect(pkt);
-                break;
-            case MSG_CONNECT_PAUSE:
-                handle_connect_pause(pkt);
-                break;
-            case MSG_CONNECT_RESUME:
-                handle_connect_resume(pkt);
-                break;
-            case MSG_CHAIN_READY:
-                handle_chain_ready(pkt);
-                break;
-            default:
-                log_debug("client: unexpected control msg %d via data conn", (int)pkt.type);
-                break;
-        }
+void Client::dispatch_data_conn_packet(const uint8_t *payload, size_t len) {
+    // Data packet — payload already includes conn_id at [0]
+    if (len < 1) return;
+    if (payload[0] == 255) {
+        log_error("client: conn_id=255 in data packet, disconnecting");
+        Kernel::request_stop();
         return;
     }
-
-    // Data packet
     if (state_ < RUNNING) {
-        log_debug("client: data for conn_id=%u before ready, dropped", conn_id);
+        log_debug("client: data for conn_id=%u before ready, dropped", payload[0]);
         return;
     }
-    uint8_t *blob = (uint8_t*)malloc(1 + len);
+    uint8_t *blob = (uint8_t*)malloc(len);
     if (!blob) { log_error("client: dispatch OOM"); return; }
-    blob[0] = conn_id;
-    memcpy(blob + 1, payload, len);
-    chain_->push_packet(blob, 1 + len, 1, 1);
+    memcpy(blob, payload, len);
+    chain_->push_packet(blob, len, 1, 1);
+}
+
+void Client::process_wire_buffer(const uint8_t *data, size_t len) {
+    size_t pos = 0;
+    while (pos < len) {
+        size_t val = 0;
+        int shift = 0;
+        size_t save = pos;
+        while (pos < len && shift < 56) {
+            uint8_t byte = data[pos++];
+            val |= (size_t)(byte & 0x7F) << shift;
+            if (!(byte & 0x80)) break;
+            shift += 7;
+        }
+        if (pos >= save + 10 || shift >= 56) break;
+        if (pos + val > len || val < 1) break;
+        uint8_t type = data[pos];
+        if (type == WIRE_CONTROL) {
+            Packet pkt;
+            size_t consumed = proto_.try_parse(data + pos + 1, val - 1, pkt);
+            if (consumed > 0) {
+                switch (pkt.type) {
+                    case MSG_MODULE_LIST_RES:
+                        handle_module_list_res(pkt);
+                        break;
+                    case MSG_CONNECT_OK:
+                        handle_connect_ok(pkt);
+                        break;
+                    case MSG_CONNECT_FAIL:
+                        handle_connect_fail(pkt);
+                        break;
+                    case MSG_DISCONNECT:
+                        handle_disconnect(pkt);
+                        break;
+                    case MSG_CONNECT_PAUSE:
+                        handle_connect_pause(pkt);
+                        break;
+                    case MSG_CONNECT_RESUME:
+                        handle_connect_resume(pkt);
+                        break;
+                    case MSG_CHAIN_READY:
+                        handle_chain_ready(pkt);
+                        break;
+                    default:
+                        log_debug("client: unexpected control msg %d", (int)pkt.type);
+                        break;
+                }
+            }
+        } else if (type == 0) {
+            dispatch_data_conn_packet(data + pos + 1, val - 1);
+        }
+        pos += val;
+    }
 }
 
 void Client::register_data_conn_epollout(size_t idx, int fd) {
@@ -528,7 +580,11 @@ void Client::handle_auth2_challenge(const Packet &pkt) {
     chain_kapi_.wire_write = [](void *ctx, int dst, const uint8_t *data, size_t len) -> int {
         auto *ref = (ChainRef*)ctx;
         if (dst == 0) {
-            if (len < 1) { free(const_cast<uint8_t*>(data)); return -1; }
+            if (len < 1 || data[0] == 255) {
+                log_error("client: wire_write dst=0 invalid data[0]=%u", len<1?0:data[0]);
+                free(const_cast<uint8_t*>(data));
+                return -1;
+            }
             uint8_t conn_id = data[0];
             auto *self = (Client*)ref->cb_ctx;
             self->send_raw_to_external(conn_id, data + 1, len - 1);
@@ -619,6 +675,11 @@ void Client::handle_auth2_challenge(const Packet &pkt) {
     chain_ref_.out_fds = {tcp_fd_};
     chain_ref_.out_writer = &data_connections_[0].writer;
     register_data_connection_reader(0);
+    // Process any leftover wire-format data that arrived in the same TCP segment
+    if (!recv_buf_.empty()) {
+        process_wire_buffer(recv_buf_.data(), recv_buf_.size());
+        recv_buf_.clear();
+    }
 
     // Set heartbeat tick
     kernel_->set_tick_callback([this]() {
@@ -643,14 +704,7 @@ void Client::handle_auth2_challenge(const Packet &pkt) {
         }
     }
     Packet mid_req = Protocol::make_msg(MSG_MODULE_LIST_REQ, mids);
-    auto serialized = proto_.serialize(mid_req);
-    auto framed = make_varint_packet_with_conn_id(255, serialized.data(), serialized.size());
-    if (!data_connections_.empty() && data_connections_[0].fd >= 0) {
-        int fd = data_connections_[0].fd;
-        int ret = data_connections_[0].writer.write(fd, framed.data(), framed.size());
-        if (ret > 0 && !data_connections_[0].writer.registered)
-            register_data_conn_epollout(0, fd);
-    }
+    send_control(mid_req);
     state_ = AWAIT_MODULE_LIST_RES;
     log_info("client: MSG_MODULE_LIST_REQ sent, waiting for MSG_MODULE_LIST_RES");
 }
@@ -672,14 +726,7 @@ void Client::handle_module_list_res(const Packet &pkt) {
             cfg_bytes.insert(cfg_bytes.end(), m.params.begin(), m.params.end());
         }
         Packet create_pkt = Protocol::make_msg(MSG_CHAIN_CREATE, cfg_bytes);
-        auto serialized = proto_.serialize(create_pkt);
-        auto framed = make_varint_packet_with_conn_id(255, serialized.data(), serialized.size());
-        if (!data_connections_.empty() && data_connections_[0].fd >= 0) {
-            int fd = data_connections_[0].fd;
-            int ret = data_connections_[0].writer.write(fd, framed.data(), framed.size());
-            if (ret > 0 && !data_connections_[0].writer.registered)
-                register_data_conn_epollout(0, fd);
-        }
+        send_control(create_pkt);
         state_ = AWAIT_CHAIN_READY;
         log_info("client: MSG_CHAIN_CREATE sent, waiting for MSG_CHAIN_READY");
     } else {
