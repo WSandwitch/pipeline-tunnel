@@ -26,6 +26,8 @@ public:
 
     Protocol &protocol() { return proto_; }
 
+    void set_tick_callback(std::function<void()> cb) { tick_cb_ = std::move(cb); }
+
 private:
     int epoll_fd_ = -1;
     std::atomic<bool> running_{false};
@@ -39,6 +41,8 @@ private:
         uint32_t events = 0;
     };
     std::unordered_map<int, FdState> fd_to_handler_;
+
+    std::function<void()> tick_cb_;
 
     void event_loop();
 };

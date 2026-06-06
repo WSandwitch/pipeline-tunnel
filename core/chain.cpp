@@ -1,16 +1,14 @@
 #include "chain.h"
 #include "common/logger.h"
-#include <cstring>
-#include <cstdlib>
 
-Chain::Chain(const ChainConfig &cfg, KernelAPI *kapi, const ChainRef &ref)
-    : _kapi(kapi), _ref(ref)
+Chain::Chain(const ChainConfig &cfg, KernelAPI *kapi)
+    : _kapi(kapi)
 {
     for (auto &spec : cfg.modules) {
         auto base = ModuleBase::find(spec.name);
         if (!base) {
             log_error("chain: module '%s' not found", spec.name.c_str());
-            return; // FIXME: better error handling
+            return;
         }
 
         auto mod = std::make_unique<Module>();
@@ -39,14 +37,37 @@ Chain::Chain(const ChainConfig &cfg, KernelAPI *kapi, const ChainRef &ref)
 
 Chain::~Chain() = default;
 
-void Chain::push_packet(const uint8_t *data, size_t len, int src_idx) {
+struct PushContext {
+    const uint8_t *data = nullptr;
+    size_t len = 0;
+    int src_idx = 0;
+};
+
+thread_local PushContext g_push_ctx;
+thread_local bool g_push_ctx_valid = false;
+
+void Chain::push_packet(const uint8_t *data, size_t len, int src_idx, int dir) {
     if (_modules.empty()) return;
-    _push_data = data;
-    _push_len = len;
-    _push_src_idx = src_idx;
+    if (_in_push) {
+        log_error("chain: re-entrant push_packet detected, dropping packet");
+        return;
+    }
+    _in_push = true;
+
+    PushContext old_ctx = g_push_ctx;
+    bool old_valid = g_push_ctx_valid;
+    g_push_ctx = PushContext{data, len, src_idx};
+    g_push_ctx_valid = true;
 
     auto &mod = *_modules[0];
-    mod.base->process_fn(mod.ctx, 0, src_idx);
+    int ret = mod.base->process_fn(mod.ctx, dir, src_idx);
+    if (ret < 0) {
+        log_debug("chain: module process_fn returned %d, dropping packet", ret);
+    }
+
+    g_push_ctx = old_ctx;
+    g_push_ctx_valid = old_valid;
+    _in_push = false;
 }
 
 void *Chain::get_packet_static(void *chain_ctx, int idx, int *out_size) {
@@ -66,29 +87,16 @@ int Chain::get_node_id_static(void *chain_ctx) {
 
 void *Chain::get_packet_impl(Module *mod, int idx, int *out_size) {
     (void)mod;
-    if (idx == 0) {
-        *out_size = (int)_push_len;
-        return const_cast<uint8_t *>(_push_data);
+    (void)idx;
+    if (!g_push_ctx_valid) {
+        *out_size = 0;
+        return nullptr;
     }
-    *out_size = 0;
-    return nullptr;
+    *out_size = (int)g_push_ctx.len;
+    return const_cast<uint8_t*>(g_push_ctx.data);
 }
 
 int Chain::write_packet_impl(Module *mod, int dst, const uint8_t *data, size_t len) {
     (void)mod;
-    int fd = -1;
-    if (dst == 1 && !_ref.out_fds.empty())
-        fd = _ref.out_fds[0];
-    else if (dst == 0 && !_ref.in_fds.empty())
-        fd = _ref.in_fds[0];
-
-    if (fd < 0) {
-        log_error("chain: write_packet no fd for dst=%d", dst);
-        free(const_cast<uint8_t *>(data));
-        return -1;
-    }
-
-    int ret = _kapi->wire_write(_kapi->ctx, fd, data, len);
-    free(const_cast<uint8_t *>(data));
-    return ret;
+    return _kapi->wire_write(_kapi->ctx, dst, data, len);
 }

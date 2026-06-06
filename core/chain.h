@@ -3,17 +3,17 @@
 
 #include <memory>
 #include <vector>
+#include <cstdint>
 #include "config.h"
-#include "chain_ref.h"
 #include "kernel_api.h"
 #include "module_instance.h"
 
 class Chain {
 public:
-    Chain(const ChainConfig &cfg, KernelAPI *kapi, const ChainRef &ref);
+    Chain(const ChainConfig &cfg, KernelAPI *kapi);
     ~Chain();
 
-    void push_packet(const uint8_t *data, size_t len, int src_idx);
+    void push_packet(const uint8_t *data, size_t len, int src_idx, int dir);
 
     // ModuleChain callback targets — called with Module* as chain_ctx
     static void *get_packet_static(void *chain_ctx, int idx, int *out_size);
@@ -25,12 +25,10 @@ public:
 
 private:
     KernelAPI *_kapi = nullptr;
-    ChainRef _ref;
     std::vector<std::unique_ptr<Module>> _modules;
 
-    const uint8_t *_push_data = nullptr;
-    size_t _push_len = 0;
-    int _push_src_idx = 0;
+    // Re-entrancy guard
+    bool _in_push = false;
 };
 
 #endif

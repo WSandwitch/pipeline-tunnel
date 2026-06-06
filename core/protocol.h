@@ -40,4 +40,11 @@ public:
     static Packet make_msg(MessageType type, const std::vector<uint8_t> &data);
 };
 
+// Wire-level protocol types (in the varint-framed wire format, after it's decoded)
+const uint8_t WIRE_DATA = 0;
+const uint8_t WIRE_HEARTBEAT_PING = 1;
+const uint8_t WIRE_HEARTBEAT_PONG = 2;
+const uint8_t WIRE_SHUTDOWN_WR = 3;
+const uint8_t WIRE_SHUTDOWN_WR_ACK = 4;
+
 #endif

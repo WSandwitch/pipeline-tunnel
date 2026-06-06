@@ -1,6 +1,7 @@
 #include "client.h"
 #include "common/logger.h"
 #include "common/utils.h"
+#include "core/module_base.h"
 #include <sys/socket.h>
 #include <netinet/in.h>
 #include <arpa/inet.h>
@@ -40,6 +41,8 @@ Client::Client(const std::string &server_host, uint16_t server_port,
       modules_(modules),
       mod_dir_(mod_dir) {
     kernel_ = std::make_shared<Kernel>();
+    chain_config_.modules = modules_;
+    last_wire_activity_ = std::chrono::steady_clock::now();
 }
 
 Client::~Client() {
@@ -64,6 +67,9 @@ bool Client::connect_to_server() {
         return false;
     }
     set_nonblock(tcp_fd_);
+    int bufsz = 1048576;
+    setsockopt(tcp_fd_, SOL_SOCKET, SO_SNDBUF, &bufsz, sizeof(bufsz));
+    setsockopt(tcp_fd_, SOL_SOCKET, SO_RCVBUF, &bufsz, sizeof(bufsz));
     log_info("client connected to %s:%d", server_host_.c_str(), server_port_);
     return true;
 }
@@ -82,8 +88,6 @@ void Client::send_control(const Packet &pkt) {
         int ret = data_connections_[0].writer.write(fd, framed.data(), framed.size());
         if (ret > 0 && !data_connections_[0].writer.registered)
             register_data_conn_epollout(0, fd);
-        if (ret < 0)
-            log_error("client: send_control pkt_type=%d failed (ret=%d)", (int)pkt.type, ret);
     }
 }
 
@@ -98,6 +102,8 @@ void Client::register_data_connection_reader(size_t idx) {
             uint8_t tmp[65536];
             ssize_t n = read(dc.fd, tmp, sizeof(tmp));
             if (n > 0) {
+                last_wire_activity_ = std::chrono::steady_clock::now();
+                heartbeating_ = false;
                 dc.read_buf.insert(dc.read_buf.end(), tmp, tmp + n);
                 size_t &off = dc.read_offset;
                 auto &buf = dc.read_buf;
@@ -116,8 +122,58 @@ void Client::register_data_connection_reader(size_t idx) {
                     }
                     if (pos >= 10 || shift >= 56) { buf.clear(); off = 0; break; }
                     if (pos > avail || pos + val > avail || val < 1) break;
+
+                    uint8_t type = ptr[pos];
+                    if (type == WIRE_HEARTBEAT_PING || type == WIRE_HEARTBEAT_PONG) {
+                        // Heartbeat — reset timer, nothing to dispatch
+                        off += pos + val;
+                        if (type == WIRE_HEARTBEAT_PING) {
+                            // Received ping — send pong
+                            uint8_t pkt[2] = {1, WIRE_HEARTBEAT_PONG};
+                            dc.writer.write(dc.fd, pkt, 2);
+                            if (!dc.writer.registered && dc.writer.size() > 0)
+                                register_data_conn_epollout(idx, dc.fd);
+                        }
+                        continue;
+                    }
+                    if (type == WIRE_SHUTDOWN_WR_ACK) {
+                        if (val < 2) { buf.clear(); off = 0; break; }
+                        uint8_t cid = ptr[pos + 1];
+                        log_debug("client: SHUTDOWN_WR_ACK conn_id=%u", cid);
+                        auto it = conns_.find(cid);
+                        if (it != conns_.end()) {
+                            it->second.shutting_down_wr = true;
+                            // Don't erase conn — ext fd can still receive data (half-close)
+                            if (!it->second.writer.empty() && !it->second.writer.registered)
+                                register_external_epollout(cid, it->second.fd);
+                        }
+                        off += pos + val;
+                        continue;
+                    }
+                    if (type == WIRE_SHUTDOWN_WR) {
+                        // Unexpected from server — just skip
+                        off += pos + val;
+                        continue;
+                    }
+                    if (type > WIRE_SHUTDOWN_WR_ACK) {
+                        // Critical error — disconnect
+                        log_error("client: wire protocol violation type=%u, disconnecting", type);
+                        buf.clear(); off = 0;
+                        Kernel::request_stop();
+                        break;
+                    }
+
+                    // type == 0: data
+                    if (val < 2) {
+                        // Data without conn_id — protocol error
+                        log_error("client: data packet without conn_id, disconnecting");
+                        buf.clear(); off = 0;
+                        Kernel::request_stop();
+                        break;
+                    }
+                    uint8_t conn_id = ptr[pos + 1];
                     try {
-                        dispatch_data_conn_packet(ptr[pos], ptr + pos + 1, val - 1);
+                        dispatch_data_conn_packet(conn_id, ptr + pos + 2, val - 2);
                     } catch (const std::exception &e) {
                         log_error("client: dispatch exception: %s (val=%zu, buf_sz=%zu)", e.what(), val, buf.size());
                         buf.clear(); off = 0;
@@ -138,7 +194,16 @@ void Client::register_data_connection_reader(size_t idx) {
 }
 
 void Client::dispatch_data_conn_packet(uint8_t conn_id, const uint8_t *payload, size_t len) {
+    if (conn_id != 255 && len <= 32) {
+        std::string hex;
+        for (size_t i = 0; i < len; i++)
+            hex += "0123456789abcdef"[payload[i] >> 4] + "0123456789abcdef"[payload[i] & 0xf];
+        log_debug("dispatch: conn_id=%u len=%zu hex=[%s]", conn_id, len, hex.c_str());
+    } else if (conn_id != 255) {
+        log_debug("dispatch: conn_id=%u len=%zu", conn_id, len);
+    }
     if (conn_id == 255) {
+        // Control message — dispatch directly, bypass Chain
         Packet pkt;
         size_t consumed = proto_.try_parse(payload, len, pkt);
         if (consumed == 0) return;
@@ -158,13 +223,53 @@ void Client::dispatch_data_conn_packet(uint8_t conn_id, const uint8_t *payload, 
             case MSG_CONNECT_RESUME:
                 handle_connect_resume(pkt);
                 break;
+            case MSG_CHAIN_READY:
+                handle_chain_ready(pkt);
+                break;
             default:
                 log_debug("client: unexpected control msg %d via data conn", (int)pkt.type);
                 break;
         }
         return;
     }
-    send_raw_to_external(conn_id, payload, len);
+
+    // Data packet
+    if (state_ < RUNNING) {
+        log_debug("client: data for conn_id=%u before ready, dropped", conn_id);
+        return;
+    }
+    if (chain_) {
+        uint8_t *blob = (uint8_t*)malloc(1 + len);
+        if (!blob) { log_error("client: dispatch OOM"); return; }
+        blob[0] = conn_id;
+        memcpy(blob + 1, payload, len);
+        chain_->push_packet(blob, 1 + len, 1, 1);
+    } else {
+        // No chain — write directly to external fd
+        auto it = conns_.find(conn_id);
+        if (it == conns_.end()) {
+            log_debug("dispatch: conn_id=%u NOT FOUND in conns_, dropping %zu bytes", conn_id, len);
+            return;
+        }
+        int ret = it->second.writer.write(it->second.fd, payload, len);
+        if (ret < 0)
+            log_debug("dispatch: conn_id=%u write error %d", conn_id, errno);
+        else if (ret > 0 && conn_id == 0)
+            log_debug("dispatch: conn_id=0 buffered %zu bytes (buf=%zu)", len, it->second.writer.size());
+        if (ret > 0 && !it->second.writer.registered) {
+            it->second.writer.registered = true;
+            kernel_->add_fd_handler(it->second.fd, [this, conn_id](int fd, uint32_t events) {
+                if (events & EPOLLOUT) {
+                    auto cit = conns_.find(conn_id);
+                    if (cit == conns_.end()) return;
+                    if (cit->second.writer.flush(fd)) {
+                        kernel_->mod_fd_events(fd, 0, EPOLLOUT);
+                        cit->second.writer.registered = false;
+                    }
+                }
+            }, EPOLLOUT);
+        }
+    }
 }
 
 void Client::register_data_conn_epollout(size_t idx, int fd) {
@@ -176,6 +281,15 @@ void Client::register_data_conn_epollout(size_t idx, int fd) {
         if (events & EPOLLOUT) {
             if (idx >= data_connections_.size()) return;
             bool drained = data_connections_[idx].writer.flush(data_connections_[idx].fd);
+            if (data_connections_[idx].writer.size() <= data_connections_[idx].writer.low_water) {
+                for (auto &[cid, ext] : conns_) {
+                    if (ext.paused_by_backpressure) {
+                        ext.paused_by_backpressure = false;
+                        kernel_->mod_fd_events(ext.fd, EPOLLIN, 0);
+                        log_debug("client: BW resume ext conn_id=%u (flush)", cid);
+                    }
+                }
+            }
             if (drained) {
                 data_connections_[idx].writer.registered = false;
                 kernel_->mod_fd_events(data_connections_[idx].fd, 0, EPOLLOUT);
@@ -261,58 +375,53 @@ void Client::start_listener() {
 }
 
 void Client::on_listener_accept(int cfd, const struct sockaddr_in &addr) {
-    uint8_t conn_id = next_conn_id_++;
-    log_info("client: external connection conn_id=%u from %s",
-             conn_id, sockaddr_to_str(addr).c_str());
+    log_info("client: external connection from %s (pending conn_id)", sockaddr_to_str(addr).c_str());
 
     set_nonblock(cfd);
     int bufsz = 1048576;
     setsockopt(cfd, SOL_SOCKET, SO_SNDBUF, &bufsz, sizeof(bufsz));
 
-    conns_.emplace(conn_id, ExternalConn{cfd, addr, false});
-
-    std::string target = target_addr_;
-    if (target.empty()) {
-        log_error("client: no target address for conn_id=%u", conn_id);
+    if (pending_ext_fd_ >= 0) {
+        log_error("client: already waiting for conn_id, rejecting connection");
         close(cfd);
-        conns_.erase(conn_id);
         return;
     }
 
-    std::vector<uint8_t> payload = {conn_id, (uint8_t)target.size()};
-    payload.insert(payload.end(), target.begin(), target.end());
+    pending_ext_fd_ = cfd;
+    pending_ext_addr_ = addr;
+
+    std::vector<uint8_t> payload;
+    payload.push_back((uint8_t)target_addr_.size());
+    payload.insert(payload.end(), target_addr_.begin(), target_addr_.end());
     Packet pkt = Protocol::make_msg(MSG_CONNECT_REQ, payload);
     send_control(pkt);
-
-    kernel_->add_fd_handler(cfd, [this, conn_id](int fd, uint32_t events) {
-        if (events & EPOLLIN) {
-            uint8_t buf[65536];
-            ssize_t n = read(fd, buf, sizeof(buf));
-            if (n > 0)
-                on_external_recv(conn_id, buf, (size_t)n);
-            else if (n == 0)
-                on_external_disconnect(conn_id);
-        }
-        if (events & (EPOLLERR | EPOLLHUP))
-            on_external_disconnect(conn_id);
-    }, EPOLLIN);
 }
 
-void Client::on_external_recv(int conn_id, const uint8_t *data, size_t len) {
-    if (data_connections_.empty() || data_connections_[0].fd < 0) return;
-    auto framed = make_varint_packet_with_conn_id((uint8_t)conn_id, data, len);
-    int dc_fd = data_connections_[0].fd;
-    int ret = data_connections_[0].writer.write(dc_fd, framed.data(), framed.size());
-    if (ret > 0 && !data_connections_[0].writer.registered)
-        register_data_conn_epollout(0, dc_fd);
+void Client::on_external_recv(uint8_t conn_id, const uint8_t *data, size_t len) {
+    if (state_ < RUNNING) return;
+    if (chain_) {
+        uint8_t *blob = (uint8_t*)malloc(1 + len);
+        if (!blob) { log_error("client: on_external_recv OOM"); return; }
+        blob[0] = conn_id;
+        memcpy(blob + 1, data, len);
+        chain_->push_packet(blob, 1 + len, 0, 0);
+    } else {
+        // No chain — write directly to wire
+        auto framed = make_varint_packet_with_conn_id(conn_id, data, len);
+        if (!data_connections_.empty() && data_connections_[0].fd >= 0) {
+            int fd = data_connections_[0].fd;
+            int ret = data_connections_[0].writer.write(fd, framed.data(), framed.size());
+            if (ret > 0 && !data_connections_[0].writer.registered)
+                register_data_conn_epollout(0, fd);
+        }
+    }
 }
 
 void Client::on_external_disconnect(uint8_t conn_id) {
     log_info("client: external conn_id=%u disconnected", conn_id);
-    int fd = -1;
     auto it = conns_.find(conn_id);
     if (it == conns_.end()) return;
-    fd = it->second.fd;
+    int fd = it->second.fd;
     conns_.erase(it);
     if (fd >= 0) {
         kernel_->del_fd(fd);
@@ -348,9 +457,6 @@ void Client::send_raw_to_external(uint8_t conn_id, const uint8_t *data, size_t l
     auto &w = it->second.writer;
     fd = it->second.fd;
     if (fd < 0) return;
-    if (len > 1024 * 1024) {
-        log_error("client: send_raw_to_external huge len=%zu, conn_id=%u", len, conn_id);
-    }
     int ret = w.write(fd, data, len);
     if (ret > 0 && !w.registered)
         need_epollout = true;
@@ -365,11 +471,11 @@ void Client::send_raw_to_external(uint8_t conn_id, const uint8_t *data, size_t l
     if (need_epollout)
         register_external_epollout(conn_id, fd);
     if (should_pause) {
-        log_debug("client: pause_sent conn_id=%u (writer=%zu)", conn_id, w.size());
+        log_debug("client: PAUSE sent conn_id=%u (writer=%zu)", conn_id, w.size());
         send_pause(conn_id);
     }
     if (should_resume) {
-        log_debug("client: RESUME sent conn_id=%u (writer=%zu via send_raw)", conn_id, w.size());
+        log_debug("client: RESUME sent conn_id=%u (writer=%zu)", conn_id, w.size());
         send_resume(conn_id);
     }
 }
@@ -393,13 +499,13 @@ void Client::on_server_data(const uint8_t *data, size_t len) {
                 if (state_ == AWAIT_AUTH2_OK) handle_auth2_challenge(pkt);
                 break;
             case MSG_CONNECT_OK:
-                if (state_ == AWAIT_CONNECT_OK || state_ == RUNNING) handle_connect_ok(pkt);
+                if (state_ == AWAIT_CHAIN_READY || state_ == RUNNING) handle_connect_ok(pkt);
                 break;
             case MSG_CONNECT_FAIL:
-                if (state_ == AWAIT_CONNECT_OK || state_ == RUNNING) handle_connect_fail(pkt);
+                if (state_ == AWAIT_CHAIN_READY || state_ == RUNNING) handle_connect_fail(pkt);
                 break;
             case MSG_DISCONNECT:
-                if (state_ == RUNNING || state_ == AWAIT_CONNECT_OK) handle_disconnect(pkt);
+                if (state_ != DISCONNECTED) handle_disconnect(pkt);
                 break;
             case MSG_CONNECT_PAUSE:
                 if (state_ == RUNNING) handle_connect_pause(pkt);
@@ -438,23 +544,158 @@ void Client::handle_auth1_ok(const Packet &pkt) {
 void Client::handle_auth2_challenge(const Packet &pkt) {
     std::string got((const char *)pkt.payload.data(), pkt.payload.size());
     std::string expected = hex_sha256(client_challenge_ + password_);
-    if (got == expected) {
-        log_info("client: mutual auth done");
-        send_packet(Protocol::make_msg(MSG_AUTH_OK, "\x01", 1));
-        data_connections_.resize(1);
-        data_connections_[0].fd = tcp_fd_;
-        register_data_connection_reader(0);
-        state_ = RUNNING;
-        setup_ok_ = true;
-        if (listen_port_ > 0) {
-            log_info("client: starting listener on %s:%d",
-                     listen_addr_.c_str(), listen_port_);
-            start_listener();
-        }
-    } else {
+    if (got != expected) {
         log_error("client: auth2 failed");
         state_ = DISCONNECTED;
         Kernel::request_stop();
+        return;
+    }
+    log_info("client: mutual auth done");
+
+    // Load modules if not already loaded
+    if (!mod_dir_.empty()) {
+        ModuleBase::load(mod_dir_);
+    }
+
+    // Setup kernel_wire_write lambda
+    chain_kapi_.ctx = &chain_ref_;
+    chain_kapi_.alloc_module_id = [](void*) -> int { static int n; return n++; };
+    chain_kapi_.wire_write = [](void *ctx, int dst, const uint8_t *data, size_t len) -> int {
+        auto *ref = (ChainRef*)ctx;
+        if (dst == 0) {
+            if (len < 1) { free(const_cast<uint8_t*>(data)); return -1; }
+            uint8_t conn_id = data[0];
+            auto *self = (Client*)ref->cb_ctx;
+            self->send_raw_to_external(conn_id, data + 1, len - 1);
+            free(const_cast<uint8_t*>(data));
+            return 0;
+        }
+        // dst == 1: forward to wire with varint+type=0
+        if (ref->out_fds.empty() || !ref->out_writer) {
+            log_error("client: wire_write dst=1 no wire fd");
+            free(const_cast<uint8_t*>(data));
+            return -1;
+        }
+        int fd = ref->out_fds[0];
+        uint8_t varint_buf[10];
+        size_t varint_len = 0;
+        uint64_t total = 1 + len; // type + data
+        while (total > 0x7F) {
+            varint_buf[varint_len++] = (uint8_t)((total & 0x7F) | 0x80);
+            total >>= 7;
+        }
+        varint_buf[varint_len++] = (uint8_t)(total & 0x7F);
+        uint8_t *packet = (uint8_t*)malloc(varint_len + 1 + len);
+        memcpy(packet, varint_buf, varint_len);
+        packet[varint_len] = 0; // type=0 (data)
+        memcpy(packet + varint_len + 1, data, len);
+        int ret = ref->out_writer->write(fd, packet, varint_len + 1 + len);
+        free(packet);
+        if (ret > 0 && ref->register_out_epollout)
+            ref->register_out_epollout(ref->cb_ctx);
+        if (ref->out_writer->size() >= ref->out_writer->high_water) {
+            auto *self = (Client*)ref->cb_ctx;
+            for (auto &[cid, ext] : self->conns_) {
+                if (!ext.paused_by_backpressure) {
+                    ext.paused_by_backpressure = true;
+                    self->kernel_->mod_fd_events(ext.fd, 0, EPOLLIN);
+                    log_debug("client: BW pause ext conn_id=%u", cid);
+                }
+            }
+        } else if (ref->out_writer->size() <= ref->out_writer->low_water) {
+            auto *self = (Client*)ref->cb_ctx;
+            for (auto &[cid, ext] : self->conns_) {
+                if (ext.paused_by_backpressure) {
+                    ext.paused_by_backpressure = false;
+                    self->kernel_->mod_fd_events(ext.fd, EPOLLIN, 0);
+                    log_debug("client: BW resume ext conn_id=%u", cid);
+                }
+            }
+        }
+        free(const_cast<uint8_t*>(data));
+        return ret;
+    };
+
+    // Setup pause/resume and epollout callbacks
+    chain_ref_.cb_ctx = this;
+    chain_ref_.send_pause = [](void *ctx, uint8_t conn_id) {
+        auto *self = (Client*)ctx;
+        self->send_pause(conn_id);
+    };
+    chain_ref_.send_resume = [](void *ctx, uint8_t conn_id) {
+        auto *self = (Client*)ctx;
+        self->send_resume(conn_id);
+    };
+    chain_ref_.register_out_epollout = [](void *ctx) {
+        auto *self = (Client*)ctx;
+        int fd = self->chain_ref_.out_fds.empty() ? -1 : self->chain_ref_.out_fds[0];
+        if (fd >= 0) self->register_data_conn_epollout(0, fd);
+    };
+    chain_ref_.register_in_epollout = [](void *ctx, uint8_t conn_id) {
+        auto *self = (Client*)ctx;
+        auto it = self->conns_.find(conn_id);
+        if (it != self->conns_.end())
+            self->register_external_epollout(conn_id, it->second.fd);
+    };
+
+    // Create Chain
+    if (!modules_.empty()) {
+        chain_ = std::make_unique<Chain>(chain_config_, &chain_kapi_);
+        log_info("client: chain created with %zu module(s)", modules_.size());
+    } else {
+        chain_ = nullptr;
+        log_info("client: no modules, chain disabled");
+    }
+
+    // Setup data connection on wire fd
+    send_packet(Protocol::make_msg(MSG_AUTH_OK, "\x01", 1));
+    data_connections_.resize(1);
+    data_connections_[0].fd = tcp_fd_;
+    chain_ref_.out_fds = {tcp_fd_};
+    chain_ref_.out_writer = &data_connections_[0].writer;
+    register_data_connection_reader(0);
+    state_ = AWAIT_CHAIN_READY;
+
+    // Set heartbeat tick
+    kernel_->set_tick_callback([this]() {
+        check_heartbeat();
+    });
+
+    // Send MSG_CHAIN_CREATE
+    // Serialize chain config: [count:u8][name_len:u8][name...][params_len:u16][params...]...
+    std::vector<uint8_t> cfg_bytes;
+    auto &mods = modules_;
+    cfg_bytes.push_back((uint8_t)mods.size());
+    for (auto &m : mods) {
+        cfg_bytes.push_back((uint8_t)m.name.size());
+        cfg_bytes.insert(cfg_bytes.end(), m.name.begin(), m.name.end());
+        uint16_t plen = (uint16_t)m.params.size();
+        cfg_bytes.push_back((uint8_t)(plen & 0xFF));
+        cfg_bytes.push_back((uint8_t)(plen >> 8));
+        cfg_bytes.insert(cfg_bytes.end(), m.params.begin(), m.params.end());
+    }
+    Packet create_pkt = Protocol::make_msg(MSG_CHAIN_CREATE, cfg_bytes);
+    auto serialized = proto_.serialize(create_pkt);
+    auto framed = make_varint_packet_with_conn_id(255, serialized.data(), serialized.size());
+    if (!data_connections_.empty() && data_connections_[0].fd >= 0) {
+        int fd = data_connections_[0].fd;
+        int ret = data_connections_[0].writer.write(fd, framed.data(), framed.size());
+        if (ret > 0 && !data_connections_[0].writer.registered)
+            register_data_conn_epollout(0, fd);
+    }
+    log_info("client: MSG_CHAIN_CREATE sent, waiting for MSG_CHAIN_READY");
+}
+
+void Client::handle_chain_ready(const Packet &pkt) {
+    (void)pkt;
+    log_info("client: MSG_CHAIN_READY received, chain is ready");
+    state_ = RUNNING;
+    setup_ok_ = true;
+
+    if (listen_port_ > 0) {
+        log_info("client: starting listener on %s:%d",
+                 listen_addr_.c_str(), listen_port_);
+        start_listener();
     }
 }
 
@@ -487,6 +728,7 @@ void Client::register_external_epollout(uint8_t conn_id, int fd) {
                     need_resume = true;
                     resume_cid = conn_id;
                 }
+                // shutting_down_wr: half-close — keep conn alive for receiving data
             }
             if (need_close && close_fd >= 0) {
                 kernel_->del_fd(close_fd);
@@ -546,32 +788,67 @@ void Client::handle_connect_resume(const Packet &pkt) {
 void Client::handle_connect_ok(const Packet &pkt) {
     if (pkt.payload.size() < 1) return;
     uint8_t conn_id = pkt.payload[0];
-    if (state_ == AWAIT_CONNECT_OK) {
-        state_ = RUNNING;
-        setup_ok_ = true;
-        if (listen_port_ > 0) {
-            log_info("client: starting listener on %s:%d",
-                     listen_addr_.c_str(), listen_port_);
-            start_listener();
+    log_info("client: MSG_CONNECT_OK conn_id=%u", conn_id);
+
+    if (pending_ext_fd_ < 0) {
+        log_error("client: MSG_CONNECT_OK with no pending external fd");
+        Packet pkt2 = Protocol::make_msg(MSG_DISCONNECT, &conn_id, 1);
+        send_control(pkt2);
+        return;
+    }
+
+    int cfd = pending_ext_fd_;
+    pending_ext_fd_ = -1;
+
+    // Register external connection
+    conns_.emplace(conn_id, ExternalConn{cfd, pending_ext_addr_, true});
+    chain_ref_.in_fd[conn_id] = cfd;
+    chain_ref_.in_writer[conn_id] = &conns_[conn_id].writer;
+    chain_ref_.in_paused[conn_id] = false;
+
+    // EPOLLIN handler for external fd
+    kernel_->add_fd_handler(cfd, [this, conn_id](int fd, uint32_t events) {
+        if (events & EPOLLIN) {
+            uint8_t buf[65536];
+            ssize_t n = read(fd, buf, sizeof(buf));
+            if (n > 0)
+                on_external_recv(conn_id, buf, (size_t)n);
+            else if (n == 0) {
+                kernel_->mod_fd_events(fd, 0, EPOLLIN);
+                auto it = conns_.find(conn_id);
+                if (it != conns_.end())
+                    it->second.shutting_down_wr = true;
+                if (!data_connections_.empty() && data_connections_[0].fd >= 0) {
+                    uint8_t pkt[3] = {2, WIRE_SHUTDOWN_WR, conn_id};
+                    data_connections_[0].writer.write(data_connections_[0].fd, pkt, 3);
+                    if (data_connections_[0].writer.size() > 0 && !data_connections_[0].writer.registered)
+                        register_data_conn_epollout(0, data_connections_[0].fd);
+                }
+            }
         }
-    }
-    auto it = conns_.find(conn_id);
-    if (it != conns_.end()) {
-        it->second.connected = true;
-        log_info("client: conn_id=%u connected to target", conn_id);
-    }
+        if (events & (EPOLLERR | EPOLLHUP)) {
+            auto it = conns_.find(conn_id);
+            if (it != conns_.end() && it->second.shutting_down_wr) {
+                if (it->second.fd >= 0) {
+                    kernel_->del_fd(it->second.fd);
+                    close(it->second.fd);
+                }
+                conns_.erase(it);
+            } else {
+                on_external_disconnect(conn_id);
+            }
+        }
+    }, EPOLLIN);
 }
 
 void Client::handle_connect_fail(const Packet &pkt) {
+    if (pkt.payload.size() < 1) return;
     uint8_t conn_id = pkt.payload[0];
     log_error("client: MSG_CONNECT_FAIL conn_id=%u", conn_id);
-    auto it = conns_.find(conn_id);
-    if (it == conns_.end()) return;
-    int fd = it->second.fd;
-    conns_.erase(it);
-    if (fd >= 0) {
-        kernel_->del_fd(fd);
-        close(fd);
+    // Cleanup pending fd
+    if (pending_ext_fd_ >= 0) {
+        close(pending_ext_fd_);
+        pending_ext_fd_ = -1;
     }
 }
 
@@ -602,10 +879,34 @@ void Client::handle_disconnect(const Packet &pkt) {
         shutdown(fd, SHUT_RDWR);
         close(fd);
     }
+    chain_ref_.in_fd.erase(conn_id);
+    chain_ref_.in_writer.erase(conn_id);
+    chain_ref_.in_paused.erase(conn_id);
 }
 
-void Client::send_raw(const uint8_t *data, size_t len) {
-    (void)data; (void)len;
+void Client::check_heartbeat() {
+    if (state_ != RUNNING) return;
+    auto now = std::chrono::steady_clock::now();
+    auto idle_ms = std::chrono::duration_cast<std::chrono::milliseconds>(
+        now - last_wire_activity_).count();
+
+    if (idle_ms > 60000) {
+        // 60 seconds without any data — wire dead
+        log_error("client: heartbeat timeout, reconnecting");
+        Kernel::request_stop();
+        return;
+    }
+
+    if (idle_ms > 30000 && !heartbeating_) {
+        // 30 seconds idle — send heartbeat
+        heartbeating_ = true;
+        uint8_t hb[2] = {1, 1}; // varint(1), type=1
+        if (!data_connections_.empty() && data_connections_[0].fd >= 0) {
+            data_connections_[0].writer.write(data_connections_[0].fd, hb, 2);
+            if (!data_connections_[0].writer.registered && data_connections_[0].writer.size() > 0)
+                register_data_conn_epollout(0, data_connections_[0].fd);
+        }
+    }
 }
 
 bool Client::start() {

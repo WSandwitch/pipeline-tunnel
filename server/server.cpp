@@ -74,6 +74,9 @@ bool Server::start() {
 
             int fl = fcntl(cfd, F_GETFL, 0);
             if (fl >= 0) fcntl(cfd, F_SETFL, fl | O_NONBLOCK);
+            int bufsz = 1048576;
+            setsockopt(cfd, SOL_SOCKET, SO_SNDBUF, &bufsz, sizeof(bufsz));
+            setsockopt(cfd, SOL_SOCKET, SO_RCVBUF, &bufsz, sizeof(bufsz));
 
             // Try to read up to 9 bytes — data connections send 9-byte handshake immediately
             uint8_t header[9];

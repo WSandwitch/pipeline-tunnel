@@ -51,17 +51,21 @@ void Kernel::mod_fd_events(int fd, uint32_t add, uint32_t remove) {
     auto hit = fd_to_handler_.find(fd);
     if (hit == fd_to_handler_.end()) return;
     auto &state = hit->second;
+    bool was_empty = (state.events == 0);
     state.events |= add;
     state.events &= ~remove;
     if (state.events == 0 || (!state.in_cb && !state.out_cb)) {
         epoll_ctl(epoll_fd_, EPOLL_CTL_DEL, fd, nullptr);
-        // Keep the fd entry — RESUME may re-add EPOLLIN later
         return;
     }
     struct epoll_event ev;
     ev.events = state.events;
     ev.data.u64 = (uint64_t)fd;
-    epoll_ctl(epoll_fd_, EPOLL_CTL_MOD, fd, &ev);
+    if (was_empty) {
+        epoll_ctl(epoll_fd_, EPOLL_CTL_ADD, fd, &ev);
+    } else {
+        epoll_ctl(epoll_fd_, EPOLL_CTL_MOD, fd, &ev);
+    }
 }
 
 void Kernel::del_fd(int fd) {
@@ -95,10 +99,42 @@ void Kernel::event_loop() {
             break;
         }
 
+        if (tick_cb_) {
+            try { tick_cb_(); } catch (const std::exception &e) {
+                log_error("exception in tick callback: %s", e.what());
+            }
+        }
+
         for (int i = 0; i < nfds; i++) {
             int fd = (int)events[i].data.u64;
+            uint32_t e = events[i].events;
 
-            if (events[i].events & (EPOLLERR | EPOLLHUP)) {
+            // Process EPOLLIN first to drain data before handling hangup
+            if (e & EPOLLIN) {
+                auto hit = fd_to_handler_.find(fd);
+                if (hit != fd_to_handler_.end() && hit->second.in_cb) {
+                    try {
+                        auto cb = hit->second.in_cb;
+                        cb(fd, EPOLLIN);
+                    } catch (const std::exception &e) {
+                        log_error("exception in EPOLLIN handler for fd=%d: %s", fd, e.what());
+                    }
+                }
+            }
+
+            if (e & EPOLLOUT) {
+                auto hit = fd_to_handler_.find(fd);
+                if (hit != fd_to_handler_.end() && hit->second.out_cb) {
+                    try {
+                        auto cb = hit->second.out_cb;
+                        cb(fd, EPOLLOUT);
+                    } catch (const std::exception &e) {
+                        log_error("exception in EPOLLOUT handler for fd=%d: %s", fd, e.what());
+                    }
+                }
+            }
+
+            if (e & (EPOLLERR | EPOLLHUP)) {
                 log_debug("fd=%d hangup/error", fd);
                 auto hit = fd_to_handler_.find(fd);
                 if (hit != fd_to_handler_.end()) {
@@ -112,31 +148,6 @@ void Kernel::event_loop() {
                     }
                 }
                 del_fd(fd);
-                continue;
-            }
-
-            if (events[i].events & EPOLLIN) {
-                auto hit = fd_to_handler_.find(fd);
-                if (hit != fd_to_handler_.end() && hit->second.in_cb) {
-                    try {
-                        auto cb = hit->second.in_cb;
-                        cb(fd, EPOLLIN);
-                    } catch (const std::exception &e) {
-                        log_error("exception in EPOLLIN handler for fd=%d: %s", fd, e.what());
-                    }
-                }
-            }
-
-            if (events[i].events & EPOLLOUT) {
-                auto hit = fd_to_handler_.find(fd);
-                if (hit != fd_to_handler_.end() && hit->second.out_cb) {
-                    try {
-                        auto cb = hit->second.out_cb;
-                        cb(fd, EPOLLOUT);
-                    } catch (const std::exception &e) {
-                        log_error("exception in EPOLLOUT handler for fd=%d: %s", fd, e.what());
-                    }
-                }
             }
         }
     }

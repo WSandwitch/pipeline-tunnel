@@ -8,12 +8,14 @@
 #include <functional>
 #include <netinet/in.h>
 #include <unordered_map>
+#include <chrono>
 #include "core/kernel.h"
 #include "core/protocol.h"
 #include "core/config.h"
+#include "core/chain.h"
+#include "core/chain_ref.h"
+#include "core/kernel_api.h"
 #include "common/write_buffer.h"
-
-using DataCallback = std::function<void(const uint8_t *, size_t)>;
 
 class Client {
 public:
@@ -29,9 +31,6 @@ public:
     void stop();
 
     bool setup_ok() const { return setup_ok_; }
-
-    void set_data_callback(DataCallback cb) { on_data_callback_ = std::move(cb); }
-    void send_raw(const uint8_t *data, size_t len);
 
 private:
     std::string server_host_;
@@ -54,7 +53,7 @@ private:
         AWAIT_AUTH1_CHALLENGE,
         AWAIT_AUTH1_OK,
         AWAIT_AUTH2_OK,
-        AWAIT_CONNECT_OK,
+        AWAIT_CHAIN_READY,
         RUNNING,
     };
     State state_ = DISCONNECTED;
@@ -63,6 +62,15 @@ private:
 
     bool setup_ok_ = false;
 
+    // Chain integration
+    KernelAPI chain_kapi_;
+    ChainRef chain_ref_;
+    std::unique_ptr<Chain> chain_;
+    std::vector<ModuleSpec> modules_;
+    std::string mod_dir_;
+    ChainConfig chain_config_;
+
+    // External connections from listener
     struct ExternalConn {
         int fd = -1;
         struct sockaddr_in addr;
@@ -72,12 +80,13 @@ private:
         bool pause_sent = false;
         bool disconnecting = false;
         bool paused_by_backpressure = false;
+        bool shutting_down_wr = false;
     };
     std::unordered_map<uint8_t, ExternalConn> conns_;
-    uint8_t next_conn_id_ = 0;
 
-    std::vector<ModuleSpec> modules_;
-    std::string mod_dir_;
+    // Pending ext fd waiting for conn_id from server
+    int pending_ext_fd_ = -1;
+    struct sockaddr_in pending_ext_addr_;
 
     std::shared_ptr<Kernel> kernel_;
 
@@ -90,13 +99,15 @@ private:
     };
     std::vector<DataConnection> data_connections_;
 
-    DataCallback on_data_callback_;
+    // Heartbeat
+    std::chrono::steady_clock::time_point last_wire_activity_;
+    bool heartbeating_ = false;  // true after idle_timeout, waiting for response
 
     bool connect_to_server();
     void start_listener();
     void stop_listener();
     void on_listener_accept(int client_fd, const struct sockaddr_in &addr);
-    void on_external_recv(int conn_id, const uint8_t *data, size_t len);
+    void on_external_recv(uint8_t conn_id, const uint8_t *data, size_t len);
     void on_external_disconnect(uint8_t conn_id);
     void on_server_data(const uint8_t *data, size_t len);
 
@@ -123,6 +134,10 @@ private:
     void handle_disconnect(const Packet &pkt);
     void handle_connect_pause(const Packet &pkt);
     void handle_connect_resume(const Packet &pkt);
+    void handle_chain_ready(const Packet &pkt);
+
+    // Heartbeat check — called from kernel tick
+    void check_heartbeat();
 };
 
 #endif
