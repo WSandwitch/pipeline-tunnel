@@ -17,6 +17,9 @@ inline void set_nonblock(int fd) {
         fcntl(fd, F_SETFL, fl | O_NONBLOCK);
 }
 
+// Maximum data chunk size
+constexpr size_t MAX_PACKET_SIZE = 262144;
+
 // Wire protocol type byte values
 constexpr uint8_t TYPE_DATA = 0;         // [varint(2+len)][0][conn_id][payload] → dispatch → Chain
 constexpr uint8_t TYPE_HEARTBEAT1 = 1;   // [varint(1)][1] — empty, ping
