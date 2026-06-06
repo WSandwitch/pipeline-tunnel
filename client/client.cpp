@@ -872,12 +872,16 @@ void Client::handle_connect_ok(const Packet &pkt) {
     // EPOLLIN handler for external fd
     kernel_->add_fd_handler(cfd, [this, conn_id](int fd, uint32_t events) {
         if (events & EPOLLIN) {
-            uint8_t buf[65536];
-            ssize_t n = read(fd, buf, sizeof(buf));
-            if (n > 0)
-                on_external_recv(conn_id, buf, (size_t)n);
-            else if (n == 0) {
-                kernel_->mod_fd_events(fd, 0, EPOLLIN);
+            uint8_t *buf = (uint8_t*)malloc(65536);
+            if (!buf) { log_error("client: OOM in ext handler"); return; }
+            ssize_t n = read(fd, buf + 1, 65535);
+            if (n > 0) {
+                buf[0] = conn_id;
+                chain_->push_packet(buf, (size_t)n + 1, 0, 0);
+            } else {
+                free(buf);
+            }
+            if (n == 0) {
                 auto it = conns_.find(conn_id);
                 if (it != conns_.end())
                     it->second.shutting_down_wr = true;
