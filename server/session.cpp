@@ -248,12 +248,19 @@ void Session::handle_auth2_response(const Packet &pkt) {
                 total >>= 7;
             }
             varint_buf[varint_len++] = (uint8_t)(total & 0x7F);
-            uint8_t *packet = (uint8_t*)malloc(varint_len + 1 + len);
-            memcpy(packet, varint_buf, varint_len);
-            packet[varint_len] = 0; // type=0
-            memcpy(packet + varint_len + 1, data, len);
-            int ret = ref->out_writer->write(fd, packet, varint_len + 1 + len);
-            free(packet);
+            static uint8_t *fb = nullptr;
+            static size_t fb_cap = 0;
+            size_t need = varint_len + 1 + len;
+            if (need > fb_cap) {
+                uint8_t *tmp = (uint8_t*)realloc(fb, need);
+                if (!tmp) { free(fb); fb_cap = 0; free(const_cast<uint8_t*>(data)); return -1; }
+                fb = tmp;
+                fb_cap = need;
+            }
+            memcpy(fb, varint_buf, varint_len);
+            fb[varint_len] = 0; // type=0
+            memcpy(fb + varint_len + 1, data, len);
+            int ret = ref->out_writer->write(fd, fb, need);
             if (ret > 0 && ref->register_out_epollout)
                 ref->register_out_epollout(ref->cb_ctx);
             if (ref->out_writer->size() >= ref->out_writer->high_water) {
