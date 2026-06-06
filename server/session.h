@@ -71,8 +71,6 @@ private:
         WriteBuffer writer;
         std::vector<uint8_t> read_buf;
         size_t read_offset = 0;
-        std::vector<uint8_t> paused_data;
-        bool paused = false;
     };
     std::vector<DataConnection> data_connections_;
 

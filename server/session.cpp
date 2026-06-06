@@ -432,67 +432,33 @@ void Session::handle_connect_req(const Packet &pkt) {
                     ssize_t n = read(fd, rbuf, sizeof(rbuf));
                     if (n > 0) {
                         if (chain_ && state_ == RUNNING) {
-                            uint8_t *blob = (uint8_t*)malloc(1 + (size_t)n);
-                            if (!blob) return;
-                            blob[0] = conn_id;
-                            memcpy(blob + 1, rbuf, (size_t)n);
-                            chain_->push_packet(blob, 1 + (size_t)n, 0, 0);
-                        } else {
-                            auto framed = make_varint_packet_with_conn_id(conn_id, rbuf, (size_t)n);
-                            if (!data_connections_.empty() && data_connections_[0].fd >= 0) {
-                                int dc_fd = data_connections_[0].fd;
-                                auto &w = data_connections_[0].writer;
-                                int ret = w.write(dc_fd, framed.data(), framed.size());
-                                if (ret > 0 && !w.registered)
-                                    register_data_conn_epollout(0, dc_fd);
-                                if (w.size() >= w.high_water) {
-                                    for (auto &[cid, tgt] : targets_) {
-                                        if (!tgt.paused_by_backpressure) {
-                                            tgt.paused_by_backpressure = true;
-                                            kernel_->mod_fd_events(tgt.fd, 0, EPOLLIN);
-                                        }
-                                    }
-                                }
-                            }
-                        }
-                    } else if (n == 0) {
-                        handle_target_eof(conn_id);
-                    } else {
-                        if (errno != EAGAIN && errno != EWOULDBLOCK)
-                            handle_target_eof(conn_id);
-                    }
-                }
-            }
-            if (events & (EPOLLERR | EPOLLHUP)) {
-                // Drain remaining data then detect EOF
-                while (true) {
-                    uint8_t tmp[65536];
-                    ssize_t n = read(fd, tmp, sizeof(tmp));
-                    if (n > 0) {
-                        if (chain_ && state_ == RUNNING) {
-                            uint8_t *blob = (uint8_t*)malloc(1 + (size_t)n);
-                            if (!blob) return;
-                            blob[0] = conn_id;
-                            memcpy(blob + 1, tmp, (size_t)n);
-                            chain_->push_packet(blob, 1 + (size_t)n, 0, 0);
-                        } else {
-                            auto framed = make_varint_packet_with_conn_id(conn_id, tmp, (size_t)n);
-                            if (!data_connections_.empty() && data_connections_[0].fd >= 0) {
-                                int dc_fd = data_connections_[0].fd;
-                                auto &w = data_connections_[0].writer;
-                                int ret = w.write(dc_fd, framed.data(), framed.size());
-                                if (ret > 0 && !w.registered)
-                                    register_data_conn_epollout(0, dc_fd);
-                                if (w.size() >= w.high_water) {
-                                    for (auto &[cid, tgt] : targets_) {
-                                        if (!tgt.paused_by_backpressure) {
-                                            tgt.paused_by_backpressure = true;
-                                            kernel_->mod_fd_events(tgt.fd, 0, EPOLLIN);
-                                        }
-                                    }
-                                }
-                            }
-                        }
+                             uint8_t *blob = (uint8_t*)malloc(1 + (size_t)n);
+                             if (!blob) return;
+                             blob[0] = conn_id;
+                             memcpy(blob + 1, rbuf, (size_t)n);
+                             chain_->push_packet(blob, 1 + (size_t)n, 0, 0);
+                         }
+                     } else if (n == 0) {
+                         handle_target_eof(conn_id);
+                     } else {
+                         if (errno != EAGAIN && errno != EWOULDBLOCK)
+                             handle_target_eof(conn_id);
+                     }
+                 }
+             }
+             if (events & (EPOLLERR | EPOLLHUP)) {
+                 // Drain remaining data then detect EOF
+                 while (true) {
+                     uint8_t tmp[65536];
+                     ssize_t n = read(fd, tmp, sizeof(tmp));
+                     if (n > 0) {
+                         if (chain_ && state_ == RUNNING) {
+                             uint8_t *blob = (uint8_t*)malloc(1 + (size_t)n);
+                             if (!blob) return;
+                             blob[0] = conn_id;
+                             memcpy(blob + 1, tmp, (size_t)n);
+                             chain_->push_packet(blob, 1 + (size_t)n, 0, 0);
+                         }
                     } else {
                         if (n == 0 || (errno != EAGAIN && errno != EWOULDBLOCK)) {
                             handle_target_eof(conn_id);
@@ -561,19 +527,28 @@ void Session::dispatch_data_conn_packet(uint8_t conn_id, const uint8_t *payload,
             case MSG_CHAIN_CREATE:
                 handle_chain_create(pkt);
                 break;
-            case MSG_CONNECT_PAUSE:
-                log_debug("session %llx: PAUSE recv — pausing data conn reader",
-                          (unsigned long long)session_id_);
-                if (!data_connections_.empty())
-                    data_connections_[0].paused = true;
-                break;
-            case MSG_CONNECT_RESUME:
-                log_debug("session %llx: RESUME recv — resuming data conn reader",
-                          (unsigned long long)session_id_);
-                if (!data_connections_.empty() && data_connections_[0].paused) {
-                    data_connections_[0].paused = false;
+            case MSG_CONNECT_PAUSE: {
+                uint8_t cid = pkt.payload.empty() ? 0 : pkt.payload[0];
+                log_debug("session %llx: PAUSE conn_id=%u",
+                          (unsigned long long)session_id_, cid);
+                auto it = targets_.find(cid);
+                if (it != targets_.end()) {
+                    it->second.paused_by_client = true;
+                    kernel_->mod_fd_events(it->second.fd, 0, EPOLLIN);
                 }
                 break;
+            }
+            case MSG_CONNECT_RESUME: {
+                uint8_t cid = pkt.payload.empty() ? 0 : pkt.payload[0];
+                log_debug("session %llx: RESUME conn_id=%u",
+                          (unsigned long long)session_id_, cid);
+                auto it = targets_.find(cid);
+                if (it != targets_.end()) {
+                    it->second.paused_by_client = false;
+                    kernel_->mod_fd_events(it->second.fd, EPOLLIN, 0);
+                }
+                break;
+            }
             default:
                 log_debug("session %llx: unexpected control msg %d via data conn",
                           (unsigned long long)session_id_, (int)pkt.type);
@@ -590,17 +565,6 @@ void Session::dispatch_data_conn_packet(uint8_t conn_id, const uint8_t *payload,
         memcpy(blob + 1, payload, len);
         // Reverse direction: src_idx=1, dir=1 (wire→target)
         chain_->push_packet(blob, 1 + len, 1, 1);
-    } else {
-        // No chain — write directly to target
-        auto it = targets_.find(conn_id);
-        if (it != targets_.end()) {
-            int ret = it->second.writer.write(it->second.fd, payload, len);
-            if (ret > 0 && !it->second.writer.registered)
-                register_target_epollout(conn_id, it->second.fd);
-        } else {
-            log_debug("session %llx: data for unknown conn_id %u",
-                      (unsigned long long)session_id_, conn_id);
-        }
     }
 }
 
@@ -620,11 +584,6 @@ void Session::register_data_connection_reader(size_t idx) {
                 last_wire_activity_ = std::chrono::steady_clock::now();
                 heartbeating_ = false;
                 dc.read_buf.insert(dc.read_buf.end(), tmp, tmp + n);
-                if (!dc.paused_data.empty()) {
-                    dc.read_buf.insert(dc.read_buf.begin() + dc.read_offset,
-                                       dc.paused_data.begin(), dc.paused_data.end());
-                    dc.paused_data.clear();
-                }
                 size_t &off = dc.read_offset;
                 auto &buf = dc.read_buf;
                 while (true) {
@@ -692,12 +651,7 @@ void Session::register_data_connection_reader(size_t idx) {
                         break;
                     }
                     uint8_t conn_id = ptr[pos + 1];
-                    if (dc.paused && conn_id != 255) {
-                        dc.paused_data.insert(dc.paused_data.end(),
-                                              ptr, ptr + pos + val);
-                    } else {
-                        dispatch_data_conn_packet(conn_id, ptr + pos + 2, val - 2);
-                    }
+                    dispatch_data_conn_packet(conn_id, ptr + pos + 2, val - 2);
                     off += pos + val;
                 }
                 if (off > 65536) {
@@ -909,66 +863,32 @@ bool Session::reconnect(int new_client_fd) {
                     ssize_t n = read(fd, rbuf, sizeof(rbuf));
                     if (n > 0) {
                         if (chain_ && state_ == RUNNING) {
-                            uint8_t *blob = (uint8_t*)malloc(1 + (size_t)n);
-                            if (!blob) return;
-                            blob[0] = conn_id;
-                            memcpy(blob + 1, rbuf, (size_t)n);
-                            chain_->push_packet(blob, 1 + (size_t)n, 0, 0);
-                        } else {
-                            auto framed = make_varint_packet_with_conn_id(conn_id, rbuf, (size_t)n);
-                            if (!data_connections_.empty() && data_connections_[0].fd >= 0) {
-                                int dc_fd = data_connections_[0].fd;
-                                auto &w = data_connections_[0].writer;
-                                int ret = w.write(dc_fd, framed.data(), framed.size());
-                                if (ret > 0 && !w.registered)
-                                    register_data_conn_epollout(0, dc_fd);
-                                if (w.size() >= w.high_water) {
-                                    for (auto &[cid, tgt] : targets_) {
-                                        if (!tgt.paused_by_backpressure) {
-                                            tgt.paused_by_backpressure = true;
-                                            kernel_->mod_fd_events(tgt.fd, 0, EPOLLIN);
-                                        }
-                                    }
-                                }
-                            }
-                        }
-                    } else if (n == 0) {
-                        handle_target_eof(conn_id);
-                    } else {
-                        if (errno != EAGAIN && errno != EWOULDBLOCK)
-                            handle_target_eof(conn_id);
-                    }
-                }
-            }
-            if (events & (EPOLLERR | EPOLLHUP)) {
-                while (true) {
-                    uint8_t tmp[65536];
-                    ssize_t n = read(fd, tmp, sizeof(tmp));
-                    if (n > 0) {
-                        if (chain_ && state_ == RUNNING) {
-                            uint8_t *blob = (uint8_t*)malloc(1 + (size_t)n);
-                            if (!blob) return;
-                            blob[0] = conn_id;
-                            memcpy(blob + 1, tmp, (size_t)n);
-                            chain_->push_packet(blob, 1 + (size_t)n, 0, 0);
-                        } else {
-                            auto framed = make_varint_packet_with_conn_id(conn_id, tmp, (size_t)n);
-                            if (!data_connections_.empty() && data_connections_[0].fd >= 0) {
-                                int dc_fd = data_connections_[0].fd;
-                                auto &w = data_connections_[0].writer;
-                                int ret = w.write(dc_fd, framed.data(), framed.size());
-                                if (ret > 0 && !w.registered)
-                                    register_data_conn_epollout(0, dc_fd);
-                                if (w.size() >= w.high_water) {
-                                    for (auto &[cid, tgt] : targets_) {
-                                        if (!tgt.paused_by_backpressure) {
-                                            tgt.paused_by_backpressure = true;
-                                            kernel_->mod_fd_events(tgt.fd, 0, EPOLLIN);
-                                        }
-                                    }
-                                }
-                            }
-                        }
+                             uint8_t *blob = (uint8_t*)malloc(1 + (size_t)n);
+                             if (!blob) return;
+                             blob[0] = conn_id;
+                             memcpy(blob + 1, rbuf, (size_t)n);
+                             chain_->push_packet(blob, 1 + (size_t)n, 0, 0);
+                         }
+                     } else if (n == 0) {
+                         handle_target_eof(conn_id);
+                     } else {
+                         if (errno != EAGAIN && errno != EWOULDBLOCK)
+                             handle_target_eof(conn_id);
+                     }
+                 }
+             }
+             if (events & (EPOLLERR | EPOLLHUP)) {
+                 while (true) {
+                     uint8_t tmp[65536];
+                     ssize_t n = read(fd, tmp, sizeof(tmp));
+                     if (n > 0) {
+                         if (chain_ && state_ == RUNNING) {
+                             uint8_t *blob = (uint8_t*)malloc(1 + (size_t)n);
+                             if (!blob) return;
+                             blob[0] = conn_id;
+                             memcpy(blob + 1, tmp, (size_t)n);
+                             chain_->push_packet(blob, 1 + (size_t)n, 0, 0);
+                         }
                     } else {
                         if (n == 0 || (errno != EAGAIN && errno != EWOULDBLOCK)) {
                             handle_target_eof(conn_id);

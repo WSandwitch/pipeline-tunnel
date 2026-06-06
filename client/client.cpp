@@ -238,38 +238,11 @@ void Client::dispatch_data_conn_packet(uint8_t conn_id, const uint8_t *payload, 
         log_debug("client: data for conn_id=%u before ready, dropped", conn_id);
         return;
     }
-    if (chain_) {
-        uint8_t *blob = (uint8_t*)malloc(1 + len);
-        if (!blob) { log_error("client: dispatch OOM"); return; }
-        blob[0] = conn_id;
-        memcpy(blob + 1, payload, len);
-        chain_->push_packet(blob, 1 + len, 1, 1);
-    } else {
-        // No chain — write directly to external fd
-        auto it = conns_.find(conn_id);
-        if (it == conns_.end()) {
-            log_debug("dispatch: conn_id=%u NOT FOUND in conns_, dropping %zu bytes", conn_id, len);
-            return;
-        }
-        int ret = it->second.writer.write(it->second.fd, payload, len);
-        if (ret < 0)
-            log_debug("dispatch: conn_id=%u write error %d", conn_id, errno);
-        else if (ret > 0 && conn_id == 0)
-            log_debug("dispatch: conn_id=0 buffered %zu bytes (buf=%zu)", len, it->second.writer.size());
-        if (ret > 0 && !it->second.writer.registered) {
-            it->second.writer.registered = true;
-            kernel_->add_fd_handler(it->second.fd, [this, conn_id](int fd, uint32_t events) {
-                if (events & EPOLLOUT) {
-                    auto cit = conns_.find(conn_id);
-                    if (cit == conns_.end()) return;
-                    if (cit->second.writer.flush(fd)) {
-                        kernel_->mod_fd_events(fd, 0, EPOLLOUT);
-                        cit->second.writer.registered = false;
-                    }
-                }
-            }, EPOLLOUT);
-        }
-    }
+    uint8_t *blob = (uint8_t*)malloc(1 + len);
+    if (!blob) { log_error("client: dispatch OOM"); return; }
+    blob[0] = conn_id;
+    memcpy(blob + 1, payload, len);
+    chain_->push_packet(blob, 1 + len, 1, 1);
 }
 
 void Client::register_data_conn_epollout(size_t idx, int fd) {
@@ -399,22 +372,11 @@ void Client::on_listener_accept(int cfd, const struct sockaddr_in &addr) {
 
 void Client::on_external_recv(uint8_t conn_id, const uint8_t *data, size_t len) {
     if (state_ < RUNNING) return;
-    if (chain_) {
-        uint8_t *blob = (uint8_t*)malloc(1 + len);
-        if (!blob) { log_error("client: on_external_recv OOM"); return; }
-        blob[0] = conn_id;
-        memcpy(blob + 1, data, len);
-        chain_->push_packet(blob, 1 + len, 0, 0);
-    } else {
-        // No chain — write directly to wire
-        auto framed = make_varint_packet_with_conn_id(conn_id, data, len);
-        if (!data_connections_.empty() && data_connections_[0].fd >= 0) {
-            int fd = data_connections_[0].fd;
-            int ret = data_connections_[0].writer.write(fd, framed.data(), framed.size());
-            if (ret > 0 && !data_connections_[0].writer.registered)
-                register_data_conn_epollout(0, fd);
-        }
-    }
+    uint8_t *blob = (uint8_t*)malloc(1 + len);
+    if (!blob) { log_error("client: on_external_recv OOM"); return; }
+    blob[0] = conn_id;
+    memcpy(blob + 1, data, len);
+    chain_->push_packet(blob, 1 + len, 0, 0);
 }
 
 void Client::on_external_disconnect(uint8_t conn_id) {
@@ -638,14 +600,8 @@ void Client::handle_auth2_challenge(const Packet &pkt) {
             self->register_external_epollout(conn_id, it->second.fd);
     };
 
-    // Create Chain
-    if (!modules_.empty()) {
-        chain_ = std::make_unique<Chain>(chain_config_, &chain_kapi_);
-        log_info("client: chain created with %zu module(s)", modules_.size());
-    } else {
-        chain_ = nullptr;
-        log_info("client: no modules, chain disabled");
-    }
+    // Create Chain (always — empty = pass-through)
+    chain_ = std::make_unique<Chain>(chain_config_, &chain_kapi_);
 
     // Setup data connection on wire fd
     send_packet(Protocol::make_msg(MSG_AUTH_OK, "\x01", 1));
@@ -910,6 +866,10 @@ void Client::check_heartbeat() {
 }
 
 bool Client::start() {
+    if (modules_.empty()) {
+        log_error("client: no modules configured — chain config is required (use ;module|params)");
+        return false;
+    }
     if (!connect_to_server()) return false;
     state_ = AWAIT_AUTH1_CHALLENGE;
 

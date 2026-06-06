@@ -34,9 +34,11 @@ static void print_usage(const char *prog) {
         "                         myhost:8080,mypass;compress|gzip:6;crypt|mykey\n"
         "\n"
         "Chain config syntax:\n"
-        "  server:port,password              - simple tunnel (no modules)\n"
         "  server:port,password;module|param - single module\n"
         "  server:port,password;mod1|p1;mod2|p2 - multi-module chain\n"
+        "  NOTE: at least one module is required. Use copy module for simple tunnel:\n"
+        "  server:port,password;copy\n"
+        "  Parameters format: key:value,key:value,... (no spaces allowed in config)\n"
         "\n",
         prog);
 }

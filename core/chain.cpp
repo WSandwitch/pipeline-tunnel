@@ -47,7 +47,10 @@ thread_local PushContext g_push_ctx;
 thread_local bool g_push_ctx_valid = false;
 
 void Chain::push_packet(const uint8_t *data, size_t len, int src_idx, int dir) {
-    if (_modules.empty()) return;
+    if (_modules.empty()) {
+        _kapi->wire_write(_kapi->ctx, dir == 0 ? 1 : 0, data, len);
+        return;
+    }
     if (_in_push) {
         log_error("chain: re-entrant push_packet detected, dropping packet");
         return;
