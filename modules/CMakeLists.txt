@@ -1,3 +1,4 @@
+add_subdirectory(copy)
 # deferred: compress split crypt base64 limit
 #add_subdirectory(compress)
 #add_subdirectory(split)

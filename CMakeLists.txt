@@ -10,7 +10,6 @@ add_subdirectory(core)
 add_subdirectory(server)
 add_subdirectory(client)
 add_subdirectory(modules)
-add_subdirectory(examples)
 
 option(BUILD_MODULE_TESTER "Build module_tester" OFF)
 if(BUILD_MODULE_TESTER)
