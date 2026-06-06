@@ -311,6 +311,10 @@ int process(void *ctx_ptr, int dir, int trigger_fd) {
         return process_merge(ctx, trigger_fd);
 }
 
+const char *moduleversion(void) {
+    return "1.0.0";
+}
+
 const char *modulename(void) {
     return "split";
 }

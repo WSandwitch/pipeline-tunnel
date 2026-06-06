@@ -176,6 +176,10 @@ int process(void *ctx_ptr, int dir, int trigger_fd) {
     return wr;
 }
 
+const char *moduleversion(void) {
+    return "1.0.0";
+}
+
 const char *modulename(void) {
     return "compress";
 }

@@ -48,7 +48,8 @@ thread_local bool g_push_ctx_valid = false;
 
 void Chain::push_packet(const uint8_t *data, size_t len, int src_idx, int dir) {
     if (_modules.empty()) {
-        _kapi->wire_write(_kapi->ctx, dir == 0 ? 1 : 0, data, len);
+        log_error("chain: push_packet with no modules — dropping packet");
+        free(const_cast<uint8_t*>(data));
         return;
     }
     if (_in_push) {

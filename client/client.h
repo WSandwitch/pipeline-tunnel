@@ -53,6 +53,7 @@ private:
         AWAIT_AUTH1_CHALLENGE,
         AWAIT_AUTH1_OK,
         AWAIT_AUTH2_OK,
+        AWAIT_MODULE_LIST_RES,
         AWAIT_CHAIN_READY,
         RUNNING,
     };
@@ -129,6 +130,7 @@ private:
     void handle_auth1_challenge(const Packet &pkt);
     void handle_auth1_ok(const Packet &pkt);
     void handle_auth2_challenge(const Packet &pkt);
+    void handle_module_list_res(const Packet &pkt);
     void handle_connect_ok(const Packet &pkt);
     void handle_connect_fail(const Packet &pkt);
     void handle_disconnect(const Packet &pkt);

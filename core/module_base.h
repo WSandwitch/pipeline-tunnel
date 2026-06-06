@@ -8,12 +8,15 @@
 
 struct ModuleBase {
     std::string name;
+    std::string version;
+    std::string mid;
     void *handle = nullptr;
     void *(*init_fn)(ModuleChain *, const char *config) = nullptr;
     int   (*process_fn)(void *, int dir, int trigger_idx) = nullptr;
     const char *(*name_fn)() = nullptr;
     const char *(*desc_fn)() = nullptr;
     const char *(*help_fn)() = nullptr;
+    const char *(*version_fn)() = nullptr;
 
     static std::unordered_map<std::string, ModuleBase> bases;
     static void load(const std::string &directory);

@@ -111,6 +111,7 @@ private:
     void handle_disconnect(const Packet &pkt);
     void handle_connect_pause(const Packet &pkt);
     void handle_connect_resume(const Packet &pkt);
+    void handle_module_list_req(const Packet &pkt);
     void handle_chain_create(const Packet &pkt);
     bool setup_tunnel_target(const std::string &target_addr, uint8_t conn_id);
     void handle_target_eof(uint8_t conn_id);

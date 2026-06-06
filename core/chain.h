@@ -13,6 +13,7 @@ public:
     Chain(const ChainConfig &cfg, KernelAPI *kapi);
     ~Chain();
 
+    bool valid() const { return !_modules.empty(); }
     void push_packet(const uint8_t *data, size_t len, int src_idx, int dir);
 
     // ModuleChain callback targets — called with Module* as chain_ctx

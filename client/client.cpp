@@ -208,6 +208,9 @@ void Client::dispatch_data_conn_packet(uint8_t conn_id, const uint8_t *payload, 
         size_t consumed = proto_.try_parse(payload, len, pkt);
         if (consumed == 0) return;
         switch (pkt.type) {
+            case MSG_MODULE_LIST_RES:
+                handle_module_list_res(pkt);
+                break;
             case MSG_CONNECT_OK:
                 handle_connect_ok(pkt);
                 break;
@@ -600,8 +603,14 @@ void Client::handle_auth2_challenge(const Packet &pkt) {
             self->register_external_epollout(conn_id, it->second.fd);
     };
 
-    // Create Chain (always — empty = pass-through)
+    // Create Chain
     chain_ = std::make_unique<Chain>(chain_config_, &chain_kapi_);
+    if (!chain_ || !chain_->valid()) {
+        log_error("client: chain creation failed or empty");
+        state_ = DISCONNECTED;
+        Kernel::request_stop();
+        return;
+    }
 
     // Setup data connection on wire fd
     send_packet(Protocol::make_msg(MSG_AUTH_OK, "\x01", 1));
@@ -610,28 +619,31 @@ void Client::handle_auth2_challenge(const Packet &pkt) {
     chain_ref_.out_fds = {tcp_fd_};
     chain_ref_.out_writer = &data_connections_[0].writer;
     register_data_connection_reader(0);
-    state_ = AWAIT_CHAIN_READY;
 
     // Set heartbeat tick
     kernel_->set_tick_callback([this]() {
         check_heartbeat();
     });
 
-    // Send MSG_CHAIN_CREATE
-    // Serialize chain config: [count:u8][name_len:u8][name...][params_len:u16][params...]...
-    std::vector<uint8_t> cfg_bytes;
-    auto &mods = modules_;
-    cfg_bytes.push_back((uint8_t)mods.size());
-    for (auto &m : mods) {
-        cfg_bytes.push_back((uint8_t)m.name.size());
-        cfg_bytes.insert(cfg_bytes.end(), m.name.begin(), m.name.end());
-        uint16_t plen = (uint16_t)m.params.size();
-        cfg_bytes.push_back((uint8_t)(plen & 0xFF));
-        cfg_bytes.push_back((uint8_t)(plen >> 8));
-        cfg_bytes.insert(cfg_bytes.end(), m.params.begin(), m.params.end());
+    // Send MSG_MODULE_LIST_REQ with mids of all loaded modules
+    std::vector<uint8_t> mids;
+    mids.push_back((uint8_t)modules_.size());
+    for (auto &m : modules_) {
+        auto *base = ModuleBase::find(m.name);
+        if (!base) {
+            log_error("client: module '%s' not loaded, cannot send mid", m.name.c_str());
+            state_ = DISCONNECTED;
+            Kernel::request_stop();
+            return;
+        }
+        // Convert hex mid back to raw 32 bytes
+        for (size_t i = 0; i < 64; i += 2) {
+            char byte[3] = {base->mid[i], base->mid[i+1], 0};
+            mids.push_back((uint8_t)strtol(byte, nullptr, 16));
+        }
     }
-    Packet create_pkt = Protocol::make_msg(MSG_CHAIN_CREATE, cfg_bytes);
-    auto serialized = proto_.serialize(create_pkt);
+    Packet mid_req = Protocol::make_msg(MSG_MODULE_LIST_REQ, mids);
+    auto serialized = proto_.serialize(mid_req);
     auto framed = make_varint_packet_with_conn_id(255, serialized.data(), serialized.size());
     if (!data_connections_.empty() && data_connections_[0].fd >= 0) {
         int fd = data_connections_[0].fd;
@@ -639,7 +651,55 @@ void Client::handle_auth2_challenge(const Packet &pkt) {
         if (ret > 0 && !data_connections_[0].writer.registered)
             register_data_conn_epollout(0, fd);
     }
-    log_info("client: MSG_CHAIN_CREATE sent, waiting for MSG_CHAIN_READY");
+    state_ = AWAIT_MODULE_LIST_RES;
+    log_info("client: MSG_MODULE_LIST_REQ sent, waiting for MSG_MODULE_LIST_RES");
+}
+
+void Client::handle_module_list_res(const Packet &pkt) {
+    if (pkt.payload.empty()) return;
+    if (pkt.payload[0] == 0x01) {
+        log_info("client: server verified all modules");
+        // Send MSG_CHAIN_CREATE
+        std::vector<uint8_t> cfg_bytes;
+        auto &mods = modules_;
+        cfg_bytes.push_back((uint8_t)mods.size());
+        for (auto &m : mods) {
+            cfg_bytes.push_back((uint8_t)m.name.size());
+            cfg_bytes.insert(cfg_bytes.end(), m.name.begin(), m.name.end());
+            uint16_t plen = (uint16_t)m.params.size();
+            cfg_bytes.push_back((uint8_t)(plen & 0xFF));
+            cfg_bytes.push_back((uint8_t)(plen >> 8));
+            cfg_bytes.insert(cfg_bytes.end(), m.params.begin(), m.params.end());
+        }
+        Packet create_pkt = Protocol::make_msg(MSG_CHAIN_CREATE, cfg_bytes);
+        auto serialized = proto_.serialize(create_pkt);
+        auto framed = make_varint_packet_with_conn_id(255, serialized.data(), serialized.size());
+        if (!data_connections_.empty() && data_connections_[0].fd >= 0) {
+            int fd = data_connections_[0].fd;
+            int ret = data_connections_[0].writer.write(fd, framed.data(), framed.size());
+            if (ret > 0 && !data_connections_[0].writer.registered)
+                register_data_conn_epollout(0, fd);
+        }
+        state_ = AWAIT_CHAIN_READY;
+        log_info("client: MSG_CHAIN_CREATE sent, waiting for MSG_CHAIN_READY");
+    } else {
+        log_error("client: server rejected module list");
+        // Print missing module names if available
+        if (pkt.payload.size() >= 2) {
+            size_t pos = 2;
+            uint8_t mcount = pkt.payload[1];
+            for (uint8_t i = 0; i < mcount; i++) {
+                if (pos >= pkt.payload.size()) break;
+                uint8_t nlen = pkt.payload[pos++];
+                if (pos + nlen > pkt.payload.size()) break;
+                std::string name((const char*)pkt.payload.data() + pos, nlen);
+                log_error("client: missing module mid");
+                pos += nlen;
+            }
+        }
+        state_ = DISCONNECTED;
+        Kernel::request_stop();
+    }
 }
 
 void Client::handle_chain_ready(const Packet &pkt) {

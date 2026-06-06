@@ -19,6 +19,7 @@ typedef struct {
 
 void *init(ModuleChain *chain_api, const char *config);
 int process(void *ctx, int dir, int trigger_idx);
+const char *moduleversion(void);
 const char *modulename(void);
 const char *moduledesc(void);
 const char *modulehelp(void);

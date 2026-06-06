@@ -313,6 +313,60 @@ void Session::handle_auth2_response(const Packet &pkt) {
     }
 }
 
+void Session::handle_module_list_req(const Packet &pkt) {
+    // Parse: [count:u8][mid_32bytes]...
+    size_t pos = 0;
+    if (pkt.payload.size() < 1) return;
+    uint8_t count = pkt.payload[pos++];
+    if (pos + (size_t)count * 32 > pkt.payload.size()) return;
+
+    std::vector<std::string> missing;
+    for (uint8_t i = 0; i < count; i++) {
+        // Convert raw 32-byte mid to hex for comparison
+        char hex[65];
+        for (int j = 0; j < 32; j++)
+            sprintf(hex + j * 2, "%02x", pkt.payload[pos + j]);
+        hex[64] = 0;
+        std::string mid_hex(hex);
+        pos += 32;
+
+        // Check if any loaded module matches this mid
+        bool found = false;
+        for (auto &[name, base] : ModuleBase::bases) {
+            (void)name;
+            if (base.mid == mid_hex) {
+                found = true;
+                break;
+            }
+        }
+        if (!found) {
+            log_error("session %llx: missing module mid=%s",
+                      (unsigned long long)session_id_, mid_hex.c_str());
+            missing.push_back(mid_hex);
+        }
+    }
+
+    if (missing.empty()) {
+        Packet ok = Protocol::make_msg(MSG_MODULE_LIST_RES, "\x01", 1);
+        log_info("session %llx: all %u modules verified", (unsigned long long)session_id_, count);
+        send_control(ok);
+    } else {
+        // Build FAIL response: [\x00][count:u8][name_len:u8][name...]...
+        std::vector<uint8_t> resp;
+        resp.push_back(0x00);
+        resp.push_back((uint8_t)missing.size());
+        for (auto &m : missing) {
+            resp.push_back((uint8_t)m.size());
+            resp.insert(resp.end(), m.begin(), m.end());
+        }
+        Packet fail = Protocol::make_msg(MSG_MODULE_LIST_RES, resp);
+        send_control(fail);
+        log_error("session %llx: %zu module(s) missing, disconnecting",
+                  (unsigned long long)session_id_, missing.size());
+        state_ = DISCONNECTED;
+    }
+}
+
 void Session::handle_chain_create(const Packet &pkt) {
     // Deserialize: [count:u8][name_len:u8][name...][params_len:u16][params...]...
     std::vector<ModuleSpec> mods;
@@ -338,15 +392,15 @@ void Session::handle_chain_create(const Packet &pkt) {
     }
 
     chain_config_.modules = mods;
-    if (!mods.empty()) {
-        chain_ = std::make_unique<Chain>(chain_config_, &chain_kapi_);
-        log_info("session %llx: chain created with %zu module(s)",
-                 (unsigned long long)session_id_, mods.size());
-    } else {
-        chain_ = nullptr;
-        log_info("session %llx: empty chain config, chain disabled",
-                 (unsigned long long)session_id_);
+    chain_ = std::make_unique<Chain>(chain_config_, &chain_kapi_);
+    if (!chain_ || !chain_->valid()) {
+        log_error("session %llx: chain creation failed or empty, disconnecting",
+                  (unsigned long long)session_id_);
+        state_ = DISCONNECTED;
+        return;
     }
+    log_info("session %llx: chain created with %zu module(s)",
+             (unsigned long long)session_id_, mods.size());
 
     state_ = RUNNING;
 
@@ -523,6 +577,9 @@ void Session::dispatch_data_conn_packet(uint8_t conn_id, const uint8_t *payload,
                 break;
             case MSG_DISCONNECT:
                 handle_disconnect(pkt);
+                break;
+            case MSG_MODULE_LIST_REQ:
+                handle_module_list_req(pkt);
                 break;
             case MSG_CHAIN_CREATE:
                 handle_chain_create(pkt);
