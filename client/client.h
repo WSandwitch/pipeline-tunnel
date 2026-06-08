@@ -4,6 +4,7 @@
 #include <string>
 #include <memory>
 #include <vector>
+#include <deque>
 #include <cstdint>
 #include <functional>
 #include <netinet/in.h>
@@ -85,15 +86,19 @@ private:
     };
     std::unordered_map<uint8_t, ExternalConn> conns_;
 
-    // Pending ext fd waiting for conn_id from server
-    int pending_ext_fd_ = -1;
-    struct sockaddr_in pending_ext_addr_;
+    // Pending ext fds waiting for conn_id from server
+    struct PendingConn {
+        int fd;
+        struct sockaddr_in addr;
+    };
+    std::deque<PendingConn> pending_ext_;
 
     std::shared_ptr<Kernel> kernel_;
 
     struct DataConnection {
         int fd = -1;
         WriteBuffer writer;
+        std::vector<uint8_t> priority_buf; // control msgs sent before data
         std::vector<uint8_t> read_buf;
         size_t read_offset = 0;
         bool paused = false;

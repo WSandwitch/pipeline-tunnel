@@ -92,12 +92,12 @@ void Client::send_control(const Packet &pkt) {
     framed.push_back((uint8_t)(val & 0x7F));
     framed.push_back(WIRE_CONTROL);
     framed.insert(framed.end(), serialized.begin(), serialized.end());
-    if (!data_connections_.empty() && data_connections_[0].fd >= 0) {
-        int fd = data_connections_[0].fd;
-        int ret = data_connections_[0].writer.write(fd, framed.data(), framed.size());
-        if (ret > 0 && !data_connections_[0].writer.registered)
-            register_data_conn_epollout(0, fd);
-    }
+    if (data_connections_.empty() || data_connections_[0].fd < 0) return;
+    auto &dc = data_connections_[0];
+    // Always buffer in priority_buf to avoid interleaving with partial data frames
+    dc.priority_buf.insert(dc.priority_buf.end(), framed.data(), framed.data() + framed.size());
+    if (!dc.writer.registered)
+        register_data_conn_epollout(0, dc.fd);
 }
 
 void Client::register_data_connection_reader(size_t idx) {
@@ -108,12 +108,13 @@ void Client::register_data_connection_reader(size_t idx) {
         (void)ev_fd;
         if (events & EPOLLIN) {
             auto &dc = data_connections_[idx];
-            uint8_t tmp[65536];
-            ssize_t n = read(dc.fd, tmp, sizeof(tmp));
+            size_t old = dc.read_buf.size();
+            dc.read_buf.resize(old + MAX_PACKET_SIZE);
+            ssize_t n = read(dc.fd, dc.read_buf.data() + old, MAX_PACKET_SIZE);
             if (n > 0) {
                 last_wire_activity_ = std::chrono::steady_clock::now();
                 heartbeating_ = false;
-                dc.read_buf.insert(dc.read_buf.end(), tmp, tmp + n);
+                dc.read_buf.resize(old + (size_t)n);
                 size_t &off = dc.read_offset;
                 auto &buf = dc.read_buf;
                 while (true) {
@@ -200,8 +201,13 @@ void Client::register_data_connection_reader(size_t idx) {
                         continue;
                     }
                     if (type > WIRE_CONTROL) {
-                        // Critical error — disconnect
-                        log_error("client: wire protocol violation type=%u, disconnecting", type);
+                        char hexbuf[256] = {0};
+                        size_t dump_sz = buf.size() - off;
+                        if (dump_sz > 64) dump_sz = 64;
+                        for (size_t i = 0; i < dump_sz && i*3 < 255; i++)
+                            snprintf(hexbuf + i*3, 4, "%02x ", (unsigned char)buf.data()[off+i]);
+                        log_error("client: wire protocol violation type=%u off=%zu buf_sz=%zu avail=%zu val=%zu pos=%zu hex=%s, disconnecting",
+                                  type, off, buf.size(), avail, val, pos, hexbuf);
                         buf.clear(); off = 0;
                         Kernel::request_stop();
                         break;
@@ -217,7 +223,7 @@ void Client::register_data_connection_reader(size_t idx) {
                     }
                     off += pos + val;
                 }
-                if (off > 65536) {
+                if (off > MAX_PACKET_SIZE) {
                     buf.erase(buf.begin(), buf.begin() + off);
                     off = 0;
                 }
@@ -308,8 +314,37 @@ void Client::register_data_conn_epollout(size_t idx, int fd) {
         (void)ev_fd;
         if (events & EPOLLOUT) {
             if (idx >= data_connections_.size()) return;
-            bool drained = data_connections_[idx].writer.flush(data_connections_[idx].fd);
-            if (data_connections_[idx].writer.size() <= data_connections_[idx].writer.low_water) {
+            auto &dc = data_connections_[idx];
+
+            // Step 1: loop-flush writer until drained or EAGAIN
+            bool drained;
+            do {
+                size_t old_ro = dc.writer.read_offset;
+                drained = dc.writer.flush(dc.fd);
+                if (dc.writer.read_offset == old_ro) break;
+            } while (!drained);
+
+            // Step 2: flush priority_buf (only if writer fully drained)
+            if (drained) {
+                while (!dc.priority_buf.empty()) {
+                    ssize_t n = ::write(dc.fd, dc.priority_buf.data(), dc.priority_buf.size());
+                    if (n > 0) {
+                        if ((size_t)n >= dc.priority_buf.size())
+                            dc.priority_buf.clear();
+                        else
+                            dc.priority_buf.erase(dc.priority_buf.begin(),
+                                                  dc.priority_buf.begin() + (size_t)n);
+                    }
+                    if (n < 0 && (errno == EAGAIN || errno == EWOULDBLOCK)) break;
+                }
+            }
+
+            // Step 3: one-shot flush writer (data after priority_buf)
+            if (dc.priority_buf.empty())
+                dc.writer.flush(dc.fd);
+
+            // Step 4: resume paused ext connections if buffer drained below low_water
+            if (dc.writer.size() <= dc.writer.low_water) {
                 for (auto &[cid, ext] : conns_) {
                     if (ext.paused_by_backpressure) {
                         ext.paused_by_backpressure = false;
@@ -318,9 +353,11 @@ void Client::register_data_conn_epollout(size_t idx, int fd) {
                     }
                 }
             }
-            if (drained) {
-                data_connections_[idx].writer.registered = false;
-                kernel_->mod_fd_events(data_connections_[idx].fd, 0, EPOLLOUT);
+
+            // Step 5: deregister EPOLLOUT if everything flushed
+            if (dc.writer.empty() && dc.priority_buf.empty()) {
+                dc.writer.registered = false;
+                kernel_->mod_fd_events(dc.fd, 0, EPOLLOUT);
             }
         }
         if (events & (EPOLLERR | EPOLLHUP)) {
@@ -533,6 +570,7 @@ void Client::on_server_data(const uint8_t *data, size_t len) {
             default:
                 break;
         }
+        if (chain_) break;
     }
 }
 

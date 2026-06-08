@@ -69,6 +69,7 @@ private:
     struct DataConnection {
         int fd = -1;
         WriteBuffer writer;
+        std::vector<uint8_t> priority_buf; // control msgs sent before data
         std::vector<uint8_t> read_buf;
         size_t read_offset = 0;
     };
