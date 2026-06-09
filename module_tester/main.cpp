@@ -4,26 +4,30 @@
 #include <vector>
 #include <string>
 #include <memory>
-#include <mutex>
-#include <condition_variable>
 #include <random>
-#include <fcntl.h>
 #include <unistd.h>
-#include <sys/epoll.h>
 
-#include "core/kernel.h"
 #include "core/chain.h"
 #include "core/config.h"
-#include "core/module.h"
-#include "common/logger.h"
-#include "common/utils.h"
+#include "core/module_base.h"
+#include "core/kernel_api.h"
 
-struct TesterState {
-    std::vector<uint8_t> result;
-    std::mutex mtx;
-    std::condition_variable cv;
-    bool error = false;
+struct TesterKernel {
+    std::vector<uint8_t> captured;
+    int next_id = 0;
 };
+
+static int alloc_id(void *ctx) {
+    auto *tk = (TesterKernel *)ctx;
+    return tk->next_id++;
+}
+
+static int wire_write(void *ctx, int dst, const uint8_t *data, size_t len) {
+    (void)dst;
+    auto *tk = (TesterKernel *)ctx;
+    tk->captured.insert(tk->captured.end(), data, data + len);
+    return (int)len;
+}
 
 static void print_usage(const char *prog) {
     fprintf(stderr,
@@ -74,19 +78,21 @@ int main(int argc, char *argv[]) {
         return mod_dir.empty() ? 1 : 0;
     }
 
+    // Load all modules
+    ModuleBase::load(mod_dir);
+
     // Mode: list modules
     if (chain_str.empty()) {
-        auto paths = scan_modules(mod_dir);
         fprintf(stderr, "Modules in %s:\n", mod_dir.c_str());
-        for (auto &p : paths) {
-            Module m;
-            if (m.load(p))
-                fprintf(stderr, "  %-20s %s\n", m.name(), m.desc() ? m.desc() : "");
+        for (auto &kv : ModuleBase::bases) {
+            auto &b = kv.second;
+            fprintf(stderr, "  %-20s %s\n", b.name.c_str(),
+                    b.desc_fn ? b.desc_fn() : "");
         }
         return 0;
     }
 
-    // Mode: run test — parse chain config (host:port,password is optional)
+    // Parse chain config
     ChainConfig cfg;
     {
         std::vector<std::string> blocks;
@@ -101,7 +107,6 @@ int main(int argc, char *argv[]) {
             start = semicolon + 1;
         }
         size_t first = 0;
-        // Skip address block if present (host:port,password or host:port)
         if (!blocks.empty() && blocks[0].find('|') == std::string::npos) {
             bool has_colon = blocks[0].find(':') != std::string::npos;
             bool has_comma = blocks[0].find(',') != std::string::npos;
@@ -126,211 +131,79 @@ int main(int argc, char *argv[]) {
         return 1;
     }
 
-    auto resolver = [&](const std::string &name) -> std::string {
-        auto paths = scan_modules(mod_dir);
-        for (auto &p : paths) {
-            Module m;
-            if (m.load(p) && name == m.name())
-                return p;
-        }
-        return "";
-    };
+    // Create two chains with custom kernel API
+    TesterKernel tk_a{}, tk_b{};
+    KernelAPI kapi_a{&tk_a, alloc_id, wire_write};
+    KernelAPI kapi_b{&tk_b, alloc_id, wire_write};
 
-    // Build two chains
-    auto chain_a = std::make_shared<Chain>(1, cfg, resolver);
-    auto chain_b = std::make_shared<Chain>(2, cfg, resolver);
+    auto chain_a = std::make_shared<Chain>(cfg, &kapi_a);
+    auto chain_b = std::make_shared<Chain>(cfg, &kapi_b);
 
-    if (!chain_a->build() || !chain_b->build()) {
+    if (!chain_a->valid() || !chain_b->valid()) {
         fprintf(stderr, "Chain build failed\n");
         return 1;
     }
 
-    auto kernel = std::make_shared<Kernel>();
-    chain_a->set_kernel(kernel.get());
-    chain_b->set_kernel(kernel.get());
+    // Generate random test data (malloc'd — push_packet takes ownership)
+    uint8_t *test_data = (uint8_t *)malloc(data_size);
+    std::vector<uint8_t> original(data_size);
+    std::mt19937 rng(42);
+    for (size_t i = 0; i < data_size; i++) {
+        uint8_t v = (uint8_t)(rng() & 0xFF);
+        test_data[i] = v;
+        original[i] = v;
+    }
 
-    // Set non-blocking and increase buffer
-    for (int fd : chain_a->output_fds()) set_nonblock(fd);
-    set_nonblock(chain_a->input_fd());
-    fcntl(chain_a->input_fd(), F_SETPIPE_SZ, 1048576);
-    for (int fd : chain_b->output_fds()) set_nonblock(fd);
-    set_nonblock(chain_b->input_fd());
-    fcntl(chain_b->input_fd(), F_SETPIPE_SZ, 1048576);
+    // Encode: push through chain A (dir=1, trigger_idx=0)
+    chain_a->push_packet(test_data, data_size, 0, 1);
 
-    int A_in = chain_a->input_fd();
-    int B_in = chain_b->input_fd();
+    if (tk_a.captured.empty()) {
+        fprintf(stderr, "FAIL: chain A produced no output\n");
+        return 1;
+    }
 
-    // Register module fds with kernel
-    for (auto &mf : chain_a->module_fds())
-        kernel->add_fd(mf.first, chain_a, mf.second);
-    for (auto &mf : chain_b->module_fds())
-        kernel->add_fd(mf.first, chain_b, mf.second);
-
-    // Per-output-pair forward state
-    struct PairBuf { std::vector<uint8_t> buf; };
-    auto a_fds = chain_a->output_fds();
-    auto b_fds = chain_b->output_fds();
-    size_t n_pairs = std::min(a_fds.size(), b_fds.size());
-    auto pair_bufs = std::make_shared<std::vector<PairBuf>>(n_pairs);
-
-    fprintf(stderr, "[tester] A_in=%d A_out=[", chain_a->input_fd());
-    for (size_t i = 0; i < a_fds.size(); i++) fprintf(stderr, "%s%d", i?",":"", a_fds[i]);
-    fprintf(stderr, "] B_in=%d B_out=[", chain_b->input_fd());
-    for (size_t i = 0; i < b_fds.size(); i++) fprintf(stderr, "%s%d", i?",":"", b_fds[i]);
-    fprintf(stderr, "]\n");
-    fprintf(stderr, "[tester] chain_a module_fds: ");
-    for (auto &mf : chain_a->module_fds()) fprintf(stderr, "fd=%d(idx=%d) ", mf.first, mf.second);
-    fprintf(stderr, "\n[tester] chain_b module_fds: ");
-    for (auto &mf : chain_b->module_fds()) fprintf(stderr, "fd=%d(idx=%d) ", mf.first, mf.second);
+    fprintf(stderr, "[tester] chain A output: %zu bytes\n", tk_a.captured.size());
+    fprintf(stderr, "[tester] original hex: ");
+    for (size_t i = 0; i < original.size() && i < 64; i++)
+        fprintf(stderr, "%02x", original[i]);
+    fprintf(stderr, "\n[tester] encoded hex: ");
+    for (size_t i = 0; i < tk_a.captured.size() && i < 64; i++)
+        fprintf(stderr, "%02x", tk_a.captured[i]);
     fprintf(stderr, "\n");
 
-    // Forward handlers: each A_out[i] → B_out[i]
-    for (size_t i = 0; i < n_pairs; i++) {
-        int a_fd = a_fds[i];
-        int b_fd = b_fds[i];
+    // Decode: push through chain B (dir=0, trigger_idx=1)
+    // Must malloc for push_packet ownership
+    uint8_t *chain_a_out = (uint8_t *)malloc(tk_a.captured.size());
+    memcpy(chain_a_out, tk_a.captured.data(), tk_a.captured.size());
+    chain_b->push_packet(chain_a_out, tk_a.captured.size(), 1, 0);
 
-        kernel->add_fd_handler(a_fd, [kernel, pair_bufs, b_fd, i](int fd, uint32_t events) {
-            fprintf(stderr, "[tester pair=%zu a_fd=%d events=%u]\n", i, fd, events);
-            if (events & EPOLLIN) {
-                uint8_t buf[65536];
-                auto &pbuf = (*pair_bufs)[i].buf;
-                size_t before = pbuf.size();
-                for (;;) {
-                    ssize_t n = read(fd, buf, sizeof(buf));
-                    if (n <= 0) break;
-                    pbuf.insert(pbuf.end(), buf, buf + n);
-                }
-                fprintf(stderr, "[tester pair=%zu read %zu bytes, buf=%zu]\n", i, pbuf.size() - before, pbuf.size());
-                if (!pbuf.empty()) {
-                    ssize_t w = write(b_fd, pbuf.data(), pbuf.size());
-                    if (w > 0) {
-                        fprintf(stderr, "[tester pair=%zu wrote %zd/%zu]\n", i, w, pbuf.size());
-                        pbuf.erase(pbuf.begin(), pbuf.begin() + w);
-                    }
-                    if (w < 0) {
-                        fprintf(stderr, "[tester pair=%zu write errno=%d]\n", i, errno);
-                    }
-                    if (!pbuf.empty())
-                        kernel->mod_fd_events(b_fd, EPOLLOUT, 0);
+    fprintf(stderr, "[tester] chain B output: %zu bytes\n", tk_b.captured.size());
+    fprintf(stderr, "[tester] decoded hex: ");
+    for (size_t i = 0; i < tk_b.captured.size() && i < 64; i++)
+        fprintf(stderr, "%02x", tk_b.captured[i]);
+    fprintf(stderr, "\n");
+
+    // Compare (test_data was already freed by chain A's module — don't free it here)
+    bool ok = (tk_b.captured.size() == data_size &&
+               memcmp(tk_b.captured.data(), original.data(), data_size) == 0);
+    if (!ok) {
+        fprintf(stderr, "FAIL: data mismatch (%zu bytes expected, %zu got)\n",
+                data_size, tk_b.captured.size());
+        if (data_size == tk_b.captured.size()) {
+            size_t mismatches = 0;
+            for (size_t i = 0; i < data_size; i++) {
+                if (original[i] != tk_b.captured[i]) {
+                    if (mismatches < 10)
+                        fprintf(stderr, "  byte %zu: expected 0x%02x got 0x%02x\n",
+                                i, original[i], tk_b.captured[i]);
+                    mismatches++;
                 }
             }
-        });
-
-        kernel->add_fd_handler(b_fd, [kernel, pair_bufs, i](int fd, uint32_t events) {
-            fprintf(stderr, "[tester pair=%zu b_fd=%d events=%u]\n", i, fd, events);
-            if (events & EPOLLOUT) {
-                auto &pbuf = (*pair_bufs)[i].buf;
-                if (!pbuf.empty()) {
-                    ssize_t w = write(fd, pbuf.data(), pbuf.size());
-                    if (w > 0) {
-                        fprintf(stderr, "[tester pair=%zu b wrote %zd/%zu]\n", i, w, pbuf.size());
-                        pbuf.erase(pbuf.begin(), pbuf.begin() + w);
-                    }
-                }
-                if (pbuf.empty())
-                    kernel->mod_fd_events(fd, 0, EPOLLOUT);
-            }
-        }, EPOLLIN | EPOLLOUT);
+            fprintf(stderr, "  total mismatches: %zu\n", mismatches);
+        }
+        return 1;
     }
 
-    auto state = std::make_shared<TesterState>();
-
-    // Result handler: read from B_in, accumulate data
-    kernel->add_fd_handler(B_in, [state](int fd, uint32_t events) {
-        if (events & EPOLLIN) {
-            uint8_t buf[65536];
-            ssize_t n = read(fd, buf, sizeof(buf));
-            if (n > 0) {
-                std::lock_guard<std::mutex> lock(state->mtx);
-                state->result.insert(state->result.end(), buf, buf + n);
-                state->cv.notify_one();
-            }
-        }
-        if (events & EPOLLHUP) {
-            std::lock_guard<std::mutex> lock(state->mtx);
-            state->error = true;
-            state->cv.notify_one();
-        }
-    });
-
-    kernel->start(4);
-
-    // Generate test data
-    std::vector<uint8_t> test_data(data_size);
-    std::mt19937 rng(42);
-    for (auto &b : test_data)
-        b = (uint8_t)(rng() & 0xFF);
-
-    // Frame as varint packet
-    auto framed = make_varint_packet(test_data.data(), test_data.size());
-
-    // Write to chain A input (retry loop for partial writes / EAGAIN)
-    {
-        size_t written_total = 0;
-        const uint8_t *p = framed.data();
-        size_t remain = framed.size();
-        while (remain > 0) {
-            ssize_t n = write(A_in, p, remain);
-            if (n < 0) {
-                if (errno == EAGAIN || errno == EWOULDBLOCK) {
-                    usleep(1000);
-                    continue;
-                }
-                fprintf(stderr, "Write to chain A input failed: %s\n", strerror(errno));
-                kernel->stop();
-                return 1;
-            }
-            p += n;
-            remain -= (size_t)n;
-            written_total += (size_t)n;
-        }
-        fprintf(stderr, "[tester] wrote %zu bytes to chain A\n", written_total);
-    }
-
-    // Wait for result — poll until a complete varint packet is available
-    bool ok = false;
-    {
-        auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(30);
-        std::unique_lock<std::mutex> lock(state->mtx);
-        for (;;) {
-            // Try to parse a complete varint packet
-            auto &res = state->result;
-            size_t pos = 0;
-            size_t val = 0;
-            int shift = 0;
-            while (pos < res.size()) {
-                uint8_t byte = res[pos++];
-                val |= (size_t)(byte & 0x7F) << shift;
-                if (!(byte & 0x80)) break;
-                shift += 7;
-            }
-            if (pos > 0 && pos <= res.size() && pos + val <= res.size()) {
-                // Complete packet
-                std::vector<uint8_t> decoded(res.begin() + pos, res.begin() + pos + val);
-                ok = (decoded == test_data);
-                if (!ok)
-                    fprintf(stderr, "FAIL: data mismatch (%zu bytes expected, %zu got)\n",
-                            test_data.size(), decoded.size());
-                break;
-            }
-            if (state->error) {
-                fprintf(stderr, "FAIL: handler reported error\n");
-                break;
-            }
-            if (std::chrono::steady_clock::now() >= deadline) {
-                fprintf(stderr, "FAIL: timeout waiting for result (%zu bytes accumulated)\n",
-                        res.size());
-                break;
-            }
-            state->cv.wait_for(lock, std::chrono::milliseconds(100));
-        }
-    }
-
-    kernel->stop();
-
-    if (ok) {
-        fprintf(stderr, "PASS: %zu bytes round-trip OK\n", test_data.size());
-        return 0;
-    }
-    return 1;
+    fprintf(stderr, "PASS: %zu bytes round-trip OK\n", data_size);
+    return 0;
 }

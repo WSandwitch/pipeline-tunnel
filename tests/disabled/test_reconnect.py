@@ -5,7 +5,7 @@ import socket, struct, hashlib, subprocess, time, os, sys, random
 HOST, PORT = "127.0.0.1", 18080
 PASS = "testpass"
 APP = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
-SERVER = os.path.join(APP, "build", "server", "modtunnel-server")
+SERVER = os.path.join(APP, "build", "server", "ppltunnel-server")
 
 def write_varint(val):
     buf = b""
@@ -77,7 +77,7 @@ def do_send_recv(sock, data, label="data"):
         print(f"[!] FAIL {label}: {len(got)} vs {len(data)}")
         sys.exit(1)
 
-subprocess.run(["killall", "-9", "modtunnel-server"], capture_output=True)
+subprocess.run(["killall", "-9", "ppltunnel-server"], capture_output=True)
 time.sleep(0.5)
 
 with open("/tmp/srv_reconnect.log", "w") as log:

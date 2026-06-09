@@ -446,14 +446,7 @@ void Client::on_listener_accept(int cfd, const struct sockaddr_in &addr) {
     int bufsz = 1048576;
     setsockopt(cfd, SOL_SOCKET, SO_SNDBUF, &bufsz, sizeof(bufsz));
 
-    if (pending_ext_fd_ >= 0) {
-        log_error("client: already waiting for conn_id, rejecting connection");
-        close(cfd);
-        return;
-    }
-
-    pending_ext_fd_ = cfd;
-    pending_ext_addr_ = addr;
+    pending_ext_.push_back({cfd, addr});
 
     std::vector<uint8_t> payload;
     payload.push_back((uint8_t)target_addr_.size());
@@ -898,18 +891,18 @@ void Client::handle_connect_ok(const Packet &pkt) {
     uint8_t conn_id = pkt.payload[0];
     log_info("client: MSG_CONNECT_OK conn_id=%u", conn_id);
 
-    if (pending_ext_fd_ < 0) {
+    if (pending_ext_.empty()) {
         log_error("client: MSG_CONNECT_OK with no pending external fd");
         Packet pkt2 = Protocol::make_msg(MSG_DISCONNECT, &conn_id, 1);
         send_control(pkt2);
         return;
     }
 
-    int cfd = pending_ext_fd_;
-    pending_ext_fd_ = -1;
+    auto pc = pending_ext_.front();
+    pending_ext_.pop_front();
+    int cfd = pc.fd;
 
-    // Register external connection
-    conns_.emplace(conn_id, ExternalConn{cfd, pending_ext_addr_, true});
+    conns_.emplace(conn_id, ExternalConn{cfd, pc.addr, true});
     chain_ref_.in_fd[conn_id] = cfd;
     chain_ref_.in_writer[conn_id] = &conns_[conn_id].writer;
     chain_ref_.in_paused[conn_id] = false;
@@ -958,10 +951,10 @@ void Client::handle_connect_fail(const Packet &pkt) {
     uint8_t conn_id = pkt.payload[0];
     log_error("client: MSG_CONNECT_FAIL conn_id=%u", conn_id);
     // Cleanup pending fd
-    if (pending_ext_fd_ >= 0) {
-        close(pending_ext_fd_);
-        pending_ext_fd_ = -1;
+    for (auto &pc : pending_ext_) {
+        close(pc.fd);
     }
+    pending_ext_.clear();
 }
 
 void Client::handle_disconnect(const Packet &pkt) {

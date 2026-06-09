@@ -5,7 +5,7 @@ import socket, struct, hashlib, subprocess, time, os, sys
 HOST, PORT = "127.0.0.1", 18084
 PASS = "testpass"
 APP = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
-SERVER = os.path.join(APP, "build", "server", "modtunnel-server")
+SERVER = os.path.join(APP, "build", "server", "ppltunnel-server")
 
 def msg(t, p=b""):
     return struct.pack(">HB", len(p), t) + p
@@ -13,7 +13,7 @@ def msg(t, p=b""):
 def sha256(s):
     return hashlib.sha256(s.encode()).hexdigest()
 
-subprocess.run(["killall", "-9", "modtunnel-server"], capture_output=True)
+subprocess.run(["killall", "-9", "ppltunnel-server"], capture_output=True)
 time.sleep(0.5)
 
 svr = subprocess.Popen([SERVER, f"-l{HOST}:{PORT}", f"-A{PASS}", "-vvv"],

@@ -5,9 +5,9 @@ Tests for module_tester: list modules, round-trip each module individually.
 import subprocess, os, sys, time
 
 APP = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
-BUILD = os.path.join(os.path.dirname(APP), "build")
-TESTER = os.path.join(BUILD, "module_tester", "modtunnel-tester")
-MOD_DIR = os.path.join(APP, "test_modules")
+BUILD = "/tmp/ppltunnel_build"
+TESTER = os.path.join(BUILD, "module_tester", "ppltunnel-tester")
+MOD_DIR = os.path.join(BUILD, "tests", "test_modules")
 
 # Module params for round-trip test (dir=1 encodes, connecting to chain B which decodes)
 MODULE_PARAMS = {

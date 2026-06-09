@@ -11,8 +11,8 @@ HOST = "127.0.0.1"
 PASS = "testpass"
 APP = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 BUILD = os.path.join(os.path.dirname(APP), "build")
-SERVER = os.path.join(BUILD, "server", "modtunnel-server")
-CLIENT = os.path.join(BUILD, "client", "modtunnel-client")
+SERVER = os.path.join(BUILD, "server", "ppltunnel-server")
+CLIENT = os.path.join(BUILD, "client", "ppltunnel-client")
 MPATH = os.path.join(APP, "tests", "test_modules")
 
 SHORT_COUNT = int(os.environ.get("INTEGRATION_SHORT", "50"))
@@ -44,7 +44,7 @@ def _kill(proc):
 
 def killall():
     """Kill all tunnel processes. No sleep."""
-    subprocess.run(["killall", "-9", "modtunnel-server", "modtunnel-client"],
+    subprocess.run(["killall", "-9", "ppltunnel-server", "ppltunnel-client"],
                    capture_output=True, timeout=5)
 
 def _wait_port_listen(port, timeout=5):

@@ -7,7 +7,7 @@ import socket, struct, hashlib, subprocess, time, os, sys, random, threading, si
 HOST = "127.0.0.1"
 PASS = "testpass"
 APP = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
-SERVER = os.path.join(APP, "build", "server", "modtunnel-server")
+SERVER = os.path.join(APP, "build", "server", "ppltunnel-server")
 
 def write_varint(val):
     buf = b""
@@ -49,7 +49,7 @@ def sha256(s):
     return hashlib.sha256(s.encode()).hexdigest()
 
 def killall():
-    subprocess.run(["killall", "-9", "modtunnel-server"], capture_output=True)
+    subprocess.run(["killall", "-9", "ppltunnel-server"], capture_output=True)
     time.sleep(0.8)
 
 def auth_and_modlist(sock):

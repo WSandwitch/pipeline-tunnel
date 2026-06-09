@@ -38,7 +38,7 @@ tests/
 
 ## test_module_tester.py
 
-Изолированное тестирование `.so` модулей через `modtunnel-tester`.
+Изолированное тестирование `.so` модулей через `ppltunnel-tester`.
 Запуск: `python3 tests/test_module_tester.py`.
 
 - `test_module_list` — список модулей

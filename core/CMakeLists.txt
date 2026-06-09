@@ -4,6 +4,7 @@ add_library(core STATIC
     module_base.cpp
     chain.cpp
     kernel.cpp
+    thread_pool.cpp
 )
 target_include_directories(core PUBLIC
     ${CMAKE_CURRENT_SOURCE_DIR}
