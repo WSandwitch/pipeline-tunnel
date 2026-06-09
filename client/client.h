@@ -7,6 +7,7 @@
 #include <deque>
 #include <cstdint>
 #include <functional>
+#include <mutex>
 #include <netinet/in.h>
 #include <unordered_map>
 #include <chrono>
@@ -25,7 +26,8 @@ public:
            const std::string &listen_addr, uint16_t listen_port,
            const std::string &target_addr,
            const std::vector<ModuleSpec> &modules,
-           const std::string &mod_dir = "");
+           const std::string &mod_dir = "",
+           int thread_count = 1);
     ~Client();
 
     bool start();
@@ -94,6 +96,13 @@ private:
     std::deque<PendingConn> pending_ext_;
 
     std::shared_ptr<Kernel> kernel_;
+    std::shared_ptr<void> chain_guard_;
+
+    std::mutex data_mtx_;
+    std::vector<std::function<void()>> pending_io_;
+    void process_pending_io();
+
+    std::vector<uint8_t> pending_disconnect_ids_;
 
     struct DataConnection {
         int fd = -1;

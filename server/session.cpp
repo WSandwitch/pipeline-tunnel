@@ -29,6 +29,10 @@ Session::Session(int client_fd, const std::string &password,
 }
 
 Session::~Session() {
+    if (chain_) {
+        chain_->cancel();
+        chain_->wait_drain();
+    }
     g_session_registry.erase(session_id_);
     g_paused_sessions.erase(session_id_);
     close_all_targets();
@@ -199,7 +203,7 @@ void Session::handle_auth2_response(const Packet &pkt) {
 
         // Setup kernel_wire_write lambda
         chain_kapi_.ctx = this;
-        chain_kapi_.alloc_module_id = [](void*) -> int { static int n; return n++; };
+        chain_kapi_.alloc_module_id = [](void*) -> int { static std::atomic<int> n{0}; return n++; };
         chain_kapi_.wire_write = [](void *ctx, int dst, const uint8_t *data, size_t len) -> int {
             auto *self = (Session*)ctx;
             auto *ref = &self->chain_ref_;
@@ -212,25 +216,29 @@ void Session::handle_auth2_response(const Packet &pkt) {
                     return -1;
                 }
                 uint8_t conn_id = data[0];
-                auto it = ref->in_fd.find(conn_id);
-                if (it == ref->in_fd.end()) {
-                    log_error("session %llx: wire_write dst=0 unknown conn_id %u",
-                              (unsigned long long)self->session_id_, conn_id);
-                    free(const_cast<uint8_t*>(data));
-                    return -1;
-                }
                 auto tit = self->targets_.find(conn_id);
                 if (tit == self->targets_.end()) { free(const_cast<uint8_t*>(data)); return -1; }
-                WriteBuffer *w = &tit->second.writer;
-                int ret = w->write(it->second, data + 1, len - 1);
-                if (ret > 0 && ref->register_in_epollout)
-                    ref->register_in_epollout(ref->cb_ctx, conn_id);
-            if (w->size() >= w->high_water && !ref->in_paused[conn_id]) {
-                ref->in_paused[conn_id] = true;
-                tit->second.pause_sent = true;
-                if (ref->send_pause)
-                    ref->send_pause(ref->cb_ctx, conn_id);
-            }
+                auto &w = tit->second.writer;
+                int ret = w.write(tit->second.fd, data + 1, len - 1);
+                if (ret > 0) {
+                    std::lock_guard<std::mutex> lock(self->data_mtx_);
+                    self->pending_io_.push_back([self, conn_id]() {
+                        auto it = self->targets_.find(conn_id);
+                        if (it != self->targets_.end() && self->chain_ref_.register_in_epollout)
+                            self->chain_ref_.register_in_epollout(self->chain_ref_.cb_ctx, conn_id);
+                    });
+                }
+                if (w.size() >= w.high_water && !ref->in_paused[conn_id]) {
+                    ref->in_paused[conn_id] = true;
+                    std::lock_guard<std::mutex> lock(self->data_mtx_);
+                    self->pending_io_.push_back([self, conn_id]() {
+                        auto it = self->targets_.find(conn_id);
+                        if (it != self->targets_.end() && !it->second.pause_sent) {
+                            it->second.pause_sent = true;
+                            self->send_pause(conn_id);
+                        }
+                    });
+                }
                 free(const_cast<uint8_t*>(data));
                 return ret;
             }
@@ -249,39 +257,44 @@ void Session::handle_auth2_response(const Packet &pkt) {
                 total >>= 7;
             }
             varint_buf[varint_len++] = (uint8_t)(total & 0x7F);
-            static uint8_t *fb = nullptr;
-            static size_t fb_cap = 0;
-            size_t need = varint_len + 1 + len;
-            if (need > fb_cap) {
-                uint8_t *tmp = (uint8_t*)realloc(fb, need);
-                if (!tmp) { free(fb); fb_cap = 0; free(const_cast<uint8_t*>(data)); return -1; }
-                fb = tmp;
-                fb_cap = need;
+            // Assemble full frame in one buffer to avoid partial-frame flush
+            std::vector<uint8_t> frame;
+            frame.reserve(varint_len + 1 + len);
+            frame.insert(frame.end(), varint_buf, varint_buf + varint_len);
+            frame.push_back(0); // type=0
+            frame.insert(frame.end(), data, data + len);
+            int ret = ref->out_writer->write(fd, frame.data(), frame.size());
+            if (ret > 0) {
+                std::lock_guard<std::mutex> lock(self->data_mtx_);
+                self->pending_io_.push_back([self]() {
+                    if (!self->data_connections_.empty() && self->data_connections_[0].fd >= 0)
+                        self->register_data_conn_epollout(0, self->data_connections_[0].fd);
+                });
             }
-            memcpy(fb, varint_buf, varint_len);
-            fb[varint_len] = 0; // type=0
-            memcpy(fb + varint_len + 1, data, len);
-            int ret = ref->out_writer->write(fd, fb, need);
-            if (ret > 0 && ref->register_out_epollout)
-                ref->register_out_epollout(ref->cb_ctx);
             if (ref->out_writer->size() >= ref->out_writer->high_water) {
-                for (auto &[cid, tgt] : self->targets_) {
-                    if (!tgt.paused_by_backpressure) {
-                        tgt.paused_by_backpressure = true;
-                        self->kernel_->mod_fd_events(tgt.fd, 0, EPOLLIN);
-                        log_debug("session %llx: BW pause target conn_id=%u",
-                                  (unsigned long long)self->session_id_, cid);
+                std::lock_guard<std::mutex> lock(self->data_mtx_);
+                self->pending_io_.push_back([self]() {
+                    for (auto &[cid, tgt] : self->targets_) {
+                        if (!tgt.paused_by_backpressure) {
+                            tgt.paused_by_backpressure = true;
+                            self->kernel_->mod_fd_events(tgt.fd, 0, EPOLLIN);
+                            log_debug("session %llx: BW pause target conn_id=%u",
+                                      (unsigned long long)self->session_id_, cid);
+                        }
                     }
-                }
+                });
             } else if (ref->out_writer->size() <= ref->out_writer->low_water) {
-                for (auto &[cid, tgt] : self->targets_) {
-                    if (tgt.paused_by_backpressure) {
-                        tgt.paused_by_backpressure = false;
-                        self->kernel_->mod_fd_events(tgt.fd, EPOLLIN, 0);
-                        log_debug("session %llx: BW resume target conn_id=%u",
-                                  (unsigned long long)self->session_id_, cid);
+                std::lock_guard<std::mutex> lock(self->data_mtx_);
+                self->pending_io_.push_back([self]() {
+                    for (auto &[cid, tgt] : self->targets_) {
+                        if (tgt.paused_by_backpressure) {
+                            tgt.paused_by_backpressure = false;
+                            self->kernel_->mod_fd_events(tgt.fd, EPOLLIN, 0);
+                            log_debug("session %llx: BW resume target conn_id=%u",
+                                      (unsigned long long)self->session_id_, cid);
+                        }
                     }
-                }
+                });
             }
             free(const_cast<uint8_t*>(data));
             return ret;
@@ -321,11 +334,6 @@ void Session::handle_auth2_response(const Packet &pkt) {
             recv_buf_.clear();
         }
         state_ = AWAIT_CHAIN_CREATE;
-
-        // Set heartbeat tick
-        kernel_->set_tick_callback([this]() {
-            check_heartbeat();
-        });
     } else {
         log_error("session %llx: auth2 failed", (unsigned long long)session_id_);
         state_ = DISCONNECTED;
@@ -413,7 +421,8 @@ void Session::handle_chain_create(const Packet &pkt) {
     }
 
     chain_config_.modules = mods;
-    chain_ = std::make_unique<Chain>(chain_config_, &chain_kapi_);
+    chain_ = std::make_unique<Chain>(chain_config_, &chain_kapi_,
+                                     &kernel_->pool(), shared_from_this());
     if (!chain_ || !chain_->valid()) {
         log_error("session %llx: chain creation failed or empty, disconnecting",
                   (unsigned long long)session_id_);
@@ -559,10 +568,13 @@ void Session::handle_connect_req(const Packet &pkt) {
 void Session::handle_disconnect(const Packet &pkt) {
     if (pkt.payload.size() < 1) return;
     uint8_t conn_id = pkt.payload[0];
+    log_debug("session %llx: handle_disconnect conn_id=%u",
+              (unsigned long long)session_id_, conn_id);
     chain_ref_.in_fd.erase(conn_id);
     chain_ref_.in_writer.erase(conn_id);
     chain_ref_.in_paused.erase(conn_id);
-    close_target(conn_id);
+    // Defer close — let chain workers finish writing first
+    pending_disconnect_targets_.push_back(conn_id);
 }
 
 void Session::add_data_connection(uint8_t output_idx, int fd) {
@@ -979,9 +991,12 @@ bool Session::setup_tunnel_target(const std::string &target_addr, uint8_t conn_i
     return true;
 }
 
-void Session::handle_target_eof(uint8_t conn_id) {
+void Session::send_disconnect_now(uint8_t conn_id) {
     auto it = targets_.find(conn_id);
     if (it == targets_.end()) return;
+    // Flush response data to wire before sending disconnect
+    if (!data_connections_.empty() && data_connections_[0].fd >= 0)
+        data_connections_[0].writer.flush(data_connections_[0].fd);
     if (it->second.shutdown_wr_sent) {
         if (!data_connections_.empty() && data_connections_[0].fd >= 0) {
             uint8_t ack[3] = {2, WIRE_SHUTDOWN_WR_ACK, conn_id};
@@ -996,6 +1011,25 @@ void Session::handle_target_eof(uint8_t conn_id) {
         Packet d = Protocol::make_msg(MSG_DISCONNECT, p);
         send_control(d);
     }
+}
+
+void Session::send_pending_disconnects() {
+    if (disconnect_ids_.empty()) return;
+    for (uint8_t cid : disconnect_ids_)
+        send_disconnect_now(cid);
+    disconnect_ids_.clear();
+    disconnect_pending_ = false;
+}
+
+void Session::handle_target_eof(uint8_t conn_id) {
+    auto it = targets_.find(conn_id);
+    if (it == targets_.end()) return;
+    if (chain_ && !chain_->is_drained()) {
+        disconnect_pending_ = true;
+        disconnect_ids_.push_back(conn_id);
+        return;
+    }
+    send_disconnect_now(conn_id);
 }
 
 void Session::close_target(uint8_t conn_id) {
@@ -1172,6 +1206,29 @@ void Session::send_pause(uint8_t conn_id) {
 void Session::send_resume(uint8_t conn_id) {
     Packet pkt = Protocol::make_msg(MSG_CONNECT_RESUME, &conn_id, 1);
     send_control(pkt);
+}
+
+void Session::process_pending_io() {
+    std::vector<std::function<void()>> batch;
+    {
+        std::lock_guard<std::mutex> lock(data_mtx_);
+        batch.swap(pending_io_);
+    }
+    for (auto &fn : batch)
+        fn();
+    if (disconnect_pending_) {
+        if (!chain_ || chain_->is_drained()) {
+            send_pending_disconnects();
+        }
+    }
+    // Handle client-initiated disconnects (just close target, no msg back)
+    if (!pending_disconnect_targets_.empty()) {
+        if (!chain_ || chain_->is_drained()) {
+            for (uint8_t cid : pending_disconnect_targets_)
+                close_target(cid);
+            pending_disconnect_targets_.clear();
+        }
+    }
 }
 
 void Session::check_heartbeat() {

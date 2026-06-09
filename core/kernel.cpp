@@ -73,6 +73,10 @@ void Kernel::del_fd(int fd) {
     fd_to_handler_.erase(fd);
 }
 
+void Kernel::start_workers(size_t count) {
+    pool_.start(count);
+}
+
 void Kernel::request_stop() {
     stop_requested_.store(true);
 }
@@ -85,6 +89,7 @@ void Kernel::start() {
 void Kernel::stop() {
     running_.store(false);
     stop_requested_.store(true);
+    pool_.stop();
 }
 
 void Kernel::event_loop() {

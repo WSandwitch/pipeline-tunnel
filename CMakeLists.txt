@@ -15,7 +15,7 @@ add_subdirectory(server)
 add_subdirectory(client)
 add_subdirectory(modules)
 
-option(BUILD_MODULE_TESTER "Build module_tester" ON)
+option(BUILD_MODULE_TESTER "Build module_tester" OFF)
 if(BUILD_MODULE_TESTER)
     add_subdirectory(module_tester)
 endif()

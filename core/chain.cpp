@@ -1,8 +1,10 @@
 #include "chain.h"
+#include "thread_pool.h"
 #include "common/logger.h"
 
-Chain::Chain(const ChainConfig &cfg, KernelAPI *kapi)
-    : _kapi(kapi)
+Chain::Chain(const ChainConfig &cfg, KernelAPI *kapi,
+             ThreadPool *pool, std::shared_ptr<void> owner_guard)
+    : _kapi(kapi), _pool(pool), _owner(owner_guard)
 {
     for (auto &spec : cfg.modules) {
         auto base = ModuleBase::find(spec.name);
@@ -35,7 +37,10 @@ Chain::Chain(const ChainConfig &cfg, KernelAPI *kapi)
     }
 }
 
-Chain::~Chain() = default;
+Chain::~Chain() {
+    cancel();
+    wait_drain();
+}
 
 struct PushContext {
     const uint8_t *data = nullptr;
@@ -47,31 +52,47 @@ thread_local PushContext g_push_ctx;
 thread_local bool g_push_ctx_valid = false;
 
 void Chain::push_packet(const uint8_t *data, size_t len, int src_idx, int dir) {
-    if (_modules.empty()) {
-        log_error("chain: push_packet with no modules — dropping packet");
+    if (_modules.empty() || _cancelled.load()) {
         free(const_cast<uint8_t*>(data));
         return;
     }
-    if (_in_push) {
-        log_error("chain: re-entrant push_packet detected, dropping packet");
+    auto owner = _owner.lock();
+    if (!owner) {
+        free(const_cast<uint8_t*>(data));
         return;
     }
-    _in_push = true;
+    _inflight.fetch_add(1);
+    _pool->enqueue([this, data, len, src_idx, dir, owner]() {
+        if (_cancelled.load()) {
+            free(const_cast<uint8_t*>(data));
+            task_done();
+            return;
+        }
+        PushContext old_ctx = g_push_ctx;
+        bool old_valid = g_push_ctx_valid;
+        g_push_ctx = PushContext{data, len, src_idx};
+        g_push_ctx_valid = true;
+        auto &mod = *_modules[0];
+        int ret = mod.base->process_fn(mod.ctx, dir, src_idx);
+        if (ret < 0) {
+            log_debug("chain: module process_fn returned %d, dropping packet", ret);
+        }
+        g_push_ctx = old_ctx;
+        g_push_ctx_valid = old_valid;
+        task_done();
+    });
+}
 
-    PushContext old_ctx = g_push_ctx;
-    bool old_valid = g_push_ctx_valid;
-    g_push_ctx = PushContext{data, len, src_idx};
-    g_push_ctx_valid = true;
-
-    auto &mod = *_modules[0];
-    int ret = mod.base->process_fn(mod.ctx, dir, src_idx);
-    if (ret < 0) {
-        log_debug("chain: module process_fn returned %d, dropping packet", ret);
+void Chain::task_done() {
+    if (_inflight.fetch_sub(1) == 1) {
+        std::lock_guard<std::mutex> lock(_drain_mtx);
+        _drain_cv.notify_all();
     }
+}
 
-    g_push_ctx = old_ctx;
-    g_push_ctx_valid = old_valid;
-    _in_push = false;
+void Chain::wait_drain() {
+    std::unique_lock<std::mutex> lock(_drain_mtx);
+    _drain_cv.wait(lock, [this] { return _inflight.load() == 0; });
 }
 
 void *Chain::get_packet_static(void *chain_ctx, int idx, int *out_size) {

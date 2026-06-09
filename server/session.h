@@ -7,6 +7,7 @@
 #include <string>
 #include <atomic>
 #include <mutex>
+#include <functional>
 #include <unordered_map>
 #include <chrono>
 #include "core/kernel.h"
@@ -123,7 +124,24 @@ private:
     // Heartbeat
     std::chrono::steady_clock::time_point last_wire_activity_;
     bool heartbeating_ = false;
+
+    std::mutex data_mtx_;
+    std::vector<std::function<void()>> pending_io_;
+
+    // Deferred disconnect: MSG_DISCONNECT sent after chain drains
+    bool disconnect_pending_ = false;
+    std::vector<uint8_t> disconnect_ids_;
+
+    // Client-initiated disconnect: just close target, no message sent back
+    std::vector<uint8_t> pending_disconnect_targets_;
+
+public:
+    void process_pending_io();
     void check_heartbeat();
+
+private:
+    void send_disconnect_now(uint8_t conn_id);
+    void send_pending_disconnects();
 };
 
 #endif

@@ -8,6 +8,7 @@
 #include <unordered_map>
 #include <sys/epoll.h>
 #include "protocol.h"
+#include "thread_pool.h"
 
 class Kernel {
 public:
@@ -28,6 +29,9 @@ public:
 
     void set_tick_callback(std::function<void()> cb) { tick_cb_ = std::move(cb); }
 
+    void start_workers(size_t count);
+    ThreadPool &pool() { return pool_; }
+
 private:
     int epoll_fd_ = -1;
     std::atomic<bool> running_{false};
@@ -43,6 +47,7 @@ private:
     std::unordered_map<int, FdState> fd_to_handler_;
 
     std::function<void()> tick_cb_;
+    ThreadPool pool_;
 
     void event_loop();
 };

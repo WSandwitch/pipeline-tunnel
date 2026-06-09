@@ -161,7 +161,7 @@ int main(int argc, char *argv[]) {
         ModuleBase::load(mod_dir);
     }
 
-    Server server(listen_addr, listen_port, password);
+    Server server(listen_addr, listen_port, password, thread_count);
     if (!server.start()) {
         log_error("server failed to start");
         return 1;

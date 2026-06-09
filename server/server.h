@@ -10,7 +10,7 @@
 class Server {
 public:
     Server(const std::string &listen_addr, uint16_t listen_port,
-           const std::string &password);
+           const std::string &password, int thread_count = 1);
     ~Server();
 
     bool start();
@@ -23,6 +23,7 @@ private:
     std::shared_ptr<Kernel> kernel_;
 
     int listen_fd_ = -1;
+    int thread_count_;
 };
 
 #endif

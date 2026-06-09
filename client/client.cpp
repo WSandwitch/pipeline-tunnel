@@ -7,6 +7,7 @@
 #include <arpa/inet.h>
 #include <unistd.h>
 #include <cstring>
+#include <cerrno>
 #include <vector>
 #include <algorithm>
 #include <fcntl.h>
@@ -33,7 +34,8 @@ Client::Client(const std::string &server_host, uint16_t server_port,
                const std::string &listen_addr, uint16_t listen_port,
                const std::string &target_addr,
                const std::vector<ModuleSpec> &modules,
-               const std::string &mod_dir)
+                const std::string &mod_dir,
+                int thread_count)
     : server_host_(server_host), server_port_(server_port),
       password_(password),
       listen_addr_(listen_addr), listen_port_(listen_port),
@@ -41,6 +43,7 @@ Client::Client(const std::string &server_host, uint16_t server_port,
       modules_(modules),
       mod_dir_(mod_dir) {
     kernel_ = std::make_shared<Kernel>();
+    kernel_->start_workers(thread_count);
     chain_config_.modules = modules_;
     last_wire_activity_ = std::chrono::steady_clock::now();
 }
@@ -391,6 +394,10 @@ void Client::stop() {
         }
     }
     data_connections_.clear();
+    if (chain_) {
+        chain_->cancel();
+        chain_->wait_drain();
+    }
     if (kernel_)
         kernel_->stop();
     if (tcp_fd_ >= 0) {
@@ -607,9 +614,10 @@ void Client::handle_auth2_challenge(const Packet &pkt) {
 
     // Setup kernel_wire_write lambda
     chain_kapi_.ctx = &chain_ref_;
-    chain_kapi_.alloc_module_id = [](void*) -> int { static int n; return n++; };
+    chain_kapi_.alloc_module_id = [](void*) -> int { static std::atomic<int> n{0}; return n++; };
     chain_kapi_.wire_write = [](void *ctx, int dst, const uint8_t *data, size_t len) -> int {
         auto *ref = (ChainRef*)ctx;
+        auto *self = (Client*)ref->cb_ctx;
         if (dst == 0) {
             if (len < 1 || data[0] == 255) {
                 log_error("client: wire_write dst=0 invalid data[0]=%u", len<1?0:data[0]);
@@ -617,7 +625,6 @@ void Client::handle_auth2_challenge(const Packet &pkt) {
                 return -1;
             }
             uint8_t conn_id = data[0];
-            auto *self = (Client*)ref->cb_ctx;
             self->send_raw_to_external(conn_id, data + 1, len - 1);
             free(const_cast<uint8_t*>(data));
             return 0;
@@ -637,42 +644,45 @@ void Client::handle_auth2_challenge(const Packet &pkt) {
             total >>= 7;
         }
         varint_buf[varint_len++] = (uint8_t)(total & 0x7F);
-        static uint8_t *fb = nullptr;
-        static size_t fb_cap = 0;
-        size_t need = varint_len + 1 + len;
-        if (need > fb_cap) {
-            uint8_t *tmp = (uint8_t*)realloc(fb, need);
-            if (!tmp) { free(fb); fb_cap = 0; free(const_cast<uint8_t*>(data)); return -1; }
-            fb = tmp;
-            fb_cap = need;
+        // Assemble full frame in one buffer to avoid partial-frame flush
+        std::vector<uint8_t> frame;
+        frame.reserve(varint_len + 1 + len);
+        frame.insert(frame.end(), varint_buf, varint_buf + varint_len);
+        frame.push_back(0); // type=0
+        frame.insert(frame.end(), data, data + len);
+        ref->out_writer->write(fd, frame.data(), frame.size());
+        {
+            std::lock_guard<std::mutex> lock(self->data_mtx_);
+            self->pending_io_.push_back([self]() {
+                int ffd = self->chain_ref_.out_fds.empty() ? -1 : self->chain_ref_.out_fds[0];
+                if (ffd >= 0) self->register_data_conn_epollout(0, ffd);
+            });
         }
-        memcpy(fb, varint_buf, varint_len);
-        fb[varint_len] = 0; // type=0 (data)
-        memcpy(fb + varint_len + 1, data, len);
-        int ret = ref->out_writer->write(fd, fb, need);
-        if (ret > 0 && ref->register_out_epollout)
-            ref->register_out_epollout(ref->cb_ctx);
         if (ref->out_writer->size() >= ref->out_writer->high_water) {
-            auto *self = (Client*)ref->cb_ctx;
-            for (auto &[cid, ext] : self->conns_) {
-                if (!ext.paused_by_backpressure) {
-                    ext.paused_by_backpressure = true;
-                    self->kernel_->mod_fd_events(ext.fd, 0, EPOLLIN);
-                    log_debug("client: BW pause ext conn_id=%u", cid);
+            std::lock_guard<std::mutex> lock(self->data_mtx_);
+            self->pending_io_.push_back([self]() {
+                for (auto &[cid, ext] : self->conns_) {
+                    if (!ext.paused_by_backpressure) {
+                        ext.paused_by_backpressure = true;
+                        self->kernel_->mod_fd_events(ext.fd, 0, EPOLLIN);
+                        log_debug("client: BW pause ext conn_id=%u", cid);
+                    }
                 }
-            }
+            });
         } else if (ref->out_writer->size() <= ref->out_writer->low_water) {
-            auto *self = (Client*)ref->cb_ctx;
-            for (auto &[cid, ext] : self->conns_) {
-                if (ext.paused_by_backpressure) {
-                    ext.paused_by_backpressure = false;
-                    self->kernel_->mod_fd_events(ext.fd, EPOLLIN, 0);
-                    log_debug("client: BW resume ext conn_id=%u", cid);
+            std::lock_guard<std::mutex> lock(self->data_mtx_);
+            self->pending_io_.push_back([self]() {
+                for (auto &[cid, ext] : self->conns_) {
+                    if (ext.paused_by_backpressure) {
+                        ext.paused_by_backpressure = false;
+                        self->kernel_->mod_fd_events(ext.fd, EPOLLIN, 0);
+                        log_debug("client: BW resume ext conn_id=%u", cid);
+                    }
                 }
-            }
+            });
         }
         free(const_cast<uint8_t*>(data));
-        return ret;
+        return 0;
     };
 
     // Setup pause/resume and epollout callbacks
@@ -698,7 +708,9 @@ void Client::handle_auth2_challenge(const Packet &pkt) {
     };
 
     // Create Chain
-    chain_ = std::make_unique<Chain>(chain_config_, &chain_kapi_);
+    chain_guard_ = std::make_shared<bool>(true);
+    chain_ = std::make_unique<Chain>(chain_config_, &chain_kapi_,
+                                     &kernel_->pool(), chain_guard_);
     if (!chain_ || !chain_->valid()) {
         log_error("client: chain creation failed or empty");
         state_ = DISCONNECTED;
@@ -722,6 +734,7 @@ void Client::handle_auth2_challenge(const Packet &pkt) {
     // Set heartbeat tick
     kernel_->set_tick_callback([this]() {
         check_heartbeat();
+        process_pending_io();
     });
 
     // Send MSG_MODULE_LIST_REQ with mids of all loaded modules
@@ -816,7 +829,12 @@ void Client::register_external_epollout(uint8_t conn_id, int fd) {
             uint8_t resume_cid = 0;
             auto it2 = conns_.find(conn_id);
             if (it2 == conns_.end()) return;
-            it2->second.writer.flush(it2->second.fd);
+            bool drained;
+            do {
+                size_t old_ro = it2->second.writer.read_offset;
+                drained = it2->second.writer.flush(it2->second.fd);
+                if (it2->second.writer.read_offset == old_ro) break;
+            } while (!drained);
             if (it2->second.writer.empty()) {
                 it2->second.writer.registered = false;
                 kernel_->mod_fd_events(it2->second.fd, 0, EPOLLOUT);
@@ -963,30 +981,12 @@ void Client::handle_disconnect(const Packet &pkt) {
     log_info("client: server disconnected conn_id=%u", conn_id);
     auto it = conns_.find(conn_id);
     if (it == conns_.end()) return;
-    int fd = it->second.fd;
-    if (it->second.writer.empty()) {
-        conns_.erase(it);
-    } else {
-        it->second.disconnecting = true;
-        if (!it->second.writer.registered) {
-            it->second.writer.registered = true;
-            kernel_->add_fd_handler(fd, [this, conn_id](int, uint32_t events) {
-                if (events & EPOLLOUT)
-                    finish_disconnect(conn_id);
-                if (events & (EPOLLERR | EPOLLHUP))
-                    conns_.erase(conn_id);
-            }, EPOLLOUT);
-        }
-        return;
-    }
-    if (fd >= 0) {
-        kernel_->del_fd(fd);
-        shutdown(fd, SHUT_RDWR);
-        close(fd);
-    }
+    it->second.disconnecting = true;
     chain_ref_.in_fd.erase(conn_id);
     chain_ref_.in_writer.erase(conn_id);
     chain_ref_.in_paused.erase(conn_id);
+    // Defer actual close — let chain workers finish first
+    pending_disconnect_ids_.push_back(conn_id);
 }
 
 void Client::check_heartbeat() {
@@ -1010,6 +1010,62 @@ void Client::check_heartbeat() {
             data_connections_[0].writer.write(data_connections_[0].fd, hb, 2);
             if (!data_connections_[0].writer.registered && data_connections_[0].writer.size() > 0)
                 register_data_conn_epollout(0, data_connections_[0].fd);
+        }
+    }
+}
+
+void Client::process_pending_io() {
+    std::vector<std::function<void()>> batch;
+    {
+        std::lock_guard<std::mutex> lock(data_mtx_);
+        batch.swap(pending_io_);
+    }
+    for (auto &fn : batch)
+        fn();
+
+    // Clean up disconnected connections once chain is drained
+    if (!pending_disconnect_ids_.empty()) {
+        if (!chain_ || chain_->is_drained()) {
+            for (auto it = pending_disconnect_ids_.begin(); it != pending_disconnect_ids_.end(); ) {
+                uint8_t cid = *it;
+                auto cit = conns_.find(cid);
+                if (cit == conns_.end()) {
+                    it = pending_disconnect_ids_.erase(it);
+                    continue;
+                }
+                cit->second.writer.flush(cit->second.fd);
+                if (cit->second.writer.empty()) {
+                    int fd = cit->second.fd;
+                    conns_.erase(cit);
+                    if (fd >= 0) {
+                        kernel_->del_fd(fd);
+                        shutdown(fd, SHUT_RDWR);
+                        close(fd);
+                    }
+                    it = pending_disconnect_ids_.erase(it);
+                } else {
+                    // Need epollout to finish draining
+                    if (!cit->second.writer.registered) {
+                        cit->second.writer.registered = true;
+                        int fd = cit->second.fd;
+                        kernel_->add_fd_handler(fd,
+                            [this, cid](int, uint32_t events) {
+                                if (events & EPOLLOUT) {
+                                    auto it2 = conns_.find(cid);
+                                    if (it2 == conns_.end()) return;
+                                    it2->second.writer.flush(it2->second.fd);
+                                    if (it2->second.writer.empty()) {
+                                        it2->second.writer.registered = false;
+                                        kernel_->mod_fd_events(it2->second.fd, 0, EPOLLOUT);
+                                    }
+                                }
+                                if (events & (EPOLLERR | EPOLLHUP))
+                                    conns_.erase(cid);
+                            }, EPOLLOUT);
+                    }
+                    ++it;
+                }
+            }
         }
     }
 }
@@ -1041,5 +1097,9 @@ bool Client::start() {
     }, EPOLLIN);
 
     kernel_->start();
+    if (chain_) {
+        chain_->cancel();
+        chain_->wait_drain();
+    }
     return setup_ok_;
 }

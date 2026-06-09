@@ -14,8 +14,9 @@ extern std::unordered_map<uint64_t, std::weak_ptr<Session>> g_session_registry;
 extern std::unordered_map<uint64_t, std::shared_ptr<Session>> g_paused_sessions;
 
 Server::Server(const std::string &addr, uint16_t port,
-               const std::string &password)
-    : listen_addr_(addr), listen_port_(port), password_(password) {}
+               const std::string &password, int thread_count)
+    : listen_addr_(addr), listen_port_(port), password_(password),
+      thread_count_(thread_count) {}
 
 Server::~Server() {
     stop();
@@ -23,6 +24,7 @@ Server::~Server() {
 
 bool Server::start() {
     kernel_ = std::make_shared<Kernel>();
+    kernel_->start_workers(thread_count_);
 
     listen_fd_ = socket(AF_INET, SOCK_STREAM, 0);
     if (listen_fd_ < 0) {
@@ -156,6 +158,7 @@ bool Server::start() {
                 while ((n = read(session->client_fd(), buf, sizeof(buf))) > 0) {
                     session->on_data(buf, (size_t)n);
                     if (session->client_fd() < 0) break;
+                    if (session->state() >= Session::AUTH_DONE) break;
                 }
                 if (n == 0) {
                     k->del_fd(ev_fd);
@@ -169,6 +172,18 @@ bool Server::start() {
             });
         }
     }, EPOLLIN);
+
+    // Tick callback to process pending I/O for all sessions
+    kernel_->set_tick_callback([]() {
+        for (auto &[sid, wptr] : g_session_registry) {
+            (void)sid;
+            auto sess = wptr.lock();
+            if (sess) {
+                sess->process_pending_io();
+                sess->check_heartbeat();
+            }
+        }
+    });
 
     log_info("server started on %s:%d", listen_addr_.c_str(), listen_port_);
     kernel_->start();
