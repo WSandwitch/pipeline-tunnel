@@ -95,12 +95,19 @@ void Client::send_control(const Packet &pkt) {
     framed.push_back((uint8_t)(val & 0x7F));
     framed.push_back(WIRE_CONTROL);
     framed.insert(framed.end(), serialized.begin(), serialized.end());
-    if (data_connections_.empty() || data_connections_[0].fd < 0) return;
-    auto &dc = data_connections_[0];
-    // Always buffer in priority_buf to avoid interleaving with partial data frames
-    dc.priority_buf.insert(dc.priority_buf.end(), framed.data(), framed.data() + framed.size());
-    if (!dc.writer.registered)
-        register_data_conn_epollout(0, dc.fd);
+    if (data_connections_.empty()) return;
+    // Round-robin across all connections
+    size_t n = data_connections_.size();
+    int start = control_rr_counter_.fetch_add(1) % (int)n;
+    for (size_t i = 0; i < n; i++) {
+        size_t idx = (size_t)((start + i) % (int)n);
+        if (data_connections_[idx].fd < 0) continue;
+        auto &dc = data_connections_[idx];
+        dc.priority_buf.insert(dc.priority_buf.end(), framed.data(), framed.data() + framed.size());
+        if (!dc.writer.registered)
+            register_data_conn_epollout(idx, dc.fd);
+        return;
+    }
 }
 
 void Client::register_data_connection_reader(size_t idx) {
@@ -195,6 +202,9 @@ void Client::register_data_connection_reader(size_t idx) {
                                 case MSG_CHAIN_READY:
                                     handle_chain_ready(pkt);
                                     break;
+                                case MSG_TRANSMIT_READY:
+                                    handle_transmit_ready(pkt);
+                                    break;
                                 default:
                                     log_debug("client: unexpected control msg %d", (int)pkt.type);
                                     break;
@@ -216,9 +226,10 @@ void Client::register_data_connection_reader(size_t idx) {
                         break;
                     }
 
-                    // type == 0: data — payload includes conn_id at [0], pass as-is to Chain
+                    // type == 0: data — src_idx = idx+1 (1-based output port)
+                    if (val < 1) { off += pos + val; continue; }
                     try {
-                        dispatch_data_conn_packet(ptr + pos + 1, val - 1);
+                        dispatch_data_conn_packet(ptr + pos + 1, val - 1, (int)(idx + 1));
                     } catch (const std::exception &e) {
                         log_error("client: dispatch exception: %s (val=%zu, buf_sz=%zu)", e.what(), val, buf.size());
                         buf.clear(); off = 0;
@@ -238,14 +249,8 @@ void Client::register_data_connection_reader(size_t idx) {
     }, EPOLLIN);
 }
 
-void Client::dispatch_data_conn_packet(const uint8_t *payload, size_t len) {
-    // Data packet — payload already includes conn_id at [0]
+void Client::dispatch_data_conn_packet(const uint8_t *payload, size_t len, int src_idx) {
     if (len < 1) return;
-    if (payload[0] == 255) {
-        log_error("client: conn_id=255 in data packet, disconnecting");
-        Kernel::request_stop();
-        return;
-    }
     if (state_ < RUNNING) {
         log_debug("client: data for conn_id=%u before ready, dropped", payload[0]);
         return;
@@ -253,7 +258,7 @@ void Client::dispatch_data_conn_packet(const uint8_t *payload, size_t len) {
     uint8_t *blob = (uint8_t*)malloc(len);
     if (!blob) { log_error("client: dispatch OOM"); return; }
     memcpy(blob, payload, len);
-    chain_->push_packet(blob, len, 1, 1);
+    chain_->push_packet(blob, len, src_idx, 1);
 }
 
 void Client::process_wire_buffer(const uint8_t *data, size_t len) {
@@ -297,13 +302,17 @@ void Client::process_wire_buffer(const uint8_t *data, size_t len) {
                     case MSG_CHAIN_READY:
                         handle_chain_ready(pkt);
                         break;
+                    case MSG_TRANSMIT_READY:
+                        handle_transmit_ready(pkt);
+                        break;
                     default:
                         log_debug("client: unexpected control msg %d", (int)pkt.type);
                         break;
                 }
             }
         } else if (type == 0) {
-            dispatch_data_conn_packet(data + pos + 1, val - 1);
+            if (val < 1) { pos += val; continue; }
+            dispatch_data_conn_packet(data + pos + 1, val - 1, 1);
         }
         pos += val;
     }
@@ -589,7 +598,13 @@ void Client::handle_auth1_ok(const Packet &pkt) {
         Kernel::request_stop();
         return;
     }
-    log_info("client: auth1 OK");
+    // Extract session_id from payload[1..8]
+    if (pkt.payload.size() >= 9) {
+        memcpy(&session_id_, &pkt.payload[1], 8);
+        log_info("client: auth1 OK, session_id=%llx", (unsigned long long)session_id_);
+    } else {
+        log_info("client: auth1 OK");
+    }
     client_challenge_ = std::to_string(rand()) + std::to_string(time(nullptr));
     Packet chal = Protocol::make_msg(MSG_AUTH_CHALLENGE, client_challenge_.data(), client_challenge_.size());
     send_packet(chal);
@@ -621,7 +636,6 @@ void Client::handle_auth2_challenge(const Packet &pkt) {
         if (dst == 0) {
             if (len < 1 || data[0] == 255) {
                 log_error("client: wire_write dst=0 invalid data[0]=%u", len<1?0:data[0]);
-                free(const_cast<uint8_t*>(data));
                 return -1;
             }
             uint8_t conn_id = data[0];
@@ -635,16 +649,17 @@ void Client::handle_auth2_challenge(const Packet &pkt) {
             free(const_cast<uint8_t*>(data));
             return 0;
         }
-        // dst == 1: forward to wire with varint+type=0
-        if (ref->out_fds.empty() || !ref->out_writer) {
-            log_error("client: wire_write dst=1 no wire fd");
-            free(const_cast<uint8_t*>(data));
+        // dst >= 1: forward to correct wire connection with varint+type=0
+        if (dst < 1 || (size_t)dst > self->data_connections_.size() ||
+            self->data_connections_[dst-1].fd < 0) {
+            log_error("client: wire_write dst=%d no data connection", dst);
             return -1;
         }
-        int fd = ref->out_fds[0];
+        int fd = self->data_connections_[dst-1].fd;
+        int dc_idx = dst - 1;
         uint8_t varint_buf[10];
         size_t varint_len = 0;
-        uint64_t total = 1 + len; // type + data
+        uint64_t total = 1 + len; // type + data (no sub-stream)
         while (total > 0x7F) {
             varint_buf[varint_len++] = (uint8_t)((total & 0x7F) | 0x80);
             total >>= 7;
@@ -654,35 +669,42 @@ void Client::handle_auth2_challenge(const Packet &pkt) {
         std::vector<uint8_t> frame;
         frame.reserve(varint_len + 1 + len);
         frame.insert(frame.end(), varint_buf, varint_buf + varint_len);
-        frame.push_back(0); // type=0
+        frame.push_back(0); // type=0 (WIRE_DATA)
         frame.insert(frame.end(), data, data + len);
-        int wret = ref->out_writer->write(fd, frame.data(), frame.size());
+        int wret = self->data_connections_[dc_idx].writer.write(fd, frame.data(), frame.size());
         {
             std::lock_guard<std::mutex> lock(self->data_mtx_);
-            self->pending_io_.push_back([self]() {
-                int ffd = self->chain_ref_.out_fds.empty() ? -1 : self->chain_ref_.out_fds[0];
-                if (ffd >= 0) self->register_data_conn_epollout(0, ffd);
+            self->pending_io_.push_back([self, dc_idx]() {
+                if ((size_t)dc_idx < self->data_connections_.size() &&
+                    self->data_connections_[dc_idx].fd >= 0)
+                    self->register_data_conn_epollout(dc_idx, self->data_connections_[dc_idx].fd);
             });
         }
         if (wret > 0) {
             std::lock_guard<std::mutex> lock(self->data_mtx_);
-            self->pending_io_.push_back([self]() {
-                for (auto &[cid, ext] : self->conns_) {
-                    if (!ext.paused_by_backpressure) {
-                        ext.paused_by_backpressure = true;
-                        self->kernel_->mod_fd_events(ext.fd, 0, EPOLLIN);
-                        log_debug("client: BW pause ext conn_id=%u", cid);
+            self->pending_io_.push_back([self, dc_idx]() {
+                auto &w = self->data_connections_[dc_idx].writer;
+                if (w.size() > w.high_water) {
+                    for (auto &[cid, ext] : self->conns_) {
+                        if (!ext.paused_by_backpressure) {
+                            ext.paused_by_backpressure = true;
+                            self->kernel_->mod_fd_events(ext.fd, 0, EPOLLIN);
+                            log_debug("client: BW pause ext conn_id=%u", cid);
+                        }
                     }
                 }
             });
-        } else if (ref->out_writer->size() <= ref->out_writer->low_water) {
+        } else {
             std::lock_guard<std::mutex> lock(self->data_mtx_);
-            self->pending_io_.push_back([self]() {
-                for (auto &[cid, ext] : self->conns_) {
-                    if (ext.paused_by_backpressure) {
-                        ext.paused_by_backpressure = false;
-                        self->kernel_->mod_fd_events(ext.fd, EPOLLIN, 0);
-                        log_debug("client: BW resume ext conn_id=%u", cid);
+            self->pending_io_.push_back([self, dc_idx]() {
+                auto &w = self->data_connections_[dc_idx].writer;
+                if (w.size() <= w.low_water) {
+                    for (auto &[cid, ext] : self->conns_) {
+                        if (ext.paused_by_backpressure) {
+                            ext.paused_by_backpressure = false;
+                            self->kernel_->mod_fd_events(ext.fd, EPOLLIN, 0);
+                            log_debug("client: BW resume ext conn_id=%u", cid);
+                        }
                     }
                 }
             });
@@ -808,14 +830,93 @@ void Client::handle_module_list_res(const Packet &pkt) {
 
 void Client::handle_chain_ready(const Packet &pkt) {
     (void)pkt;
+    if (state_ != AWAIT_CHAIN_READY) {
+        log_info("client: MSG_CHAIN_READY ignored (state=%d)", (int)state_);
+        return;
+    }
     log_info("client: MSG_CHAIN_READY received, chain is ready");
-    state_ = RUNNING;
-    setup_ok_ = true;
 
-    if (listen_port_ > 0) {
-        log_info("client: starting listener on %s:%d",
-                 listen_addr_.c_str(), listen_port_);
-        start_listener();
+    // Calculate total extra outputs from modules
+    total_extra_outputs_ = chain_ ? chain_->total_extra_outputs() : 0;
+
+    if (total_extra_outputs_ > 0) {
+        state_ = AWAIT_TRANSMIT_READY;
+        // Open secondary connections for split outputs
+        open_secondary_connections();
+    } else {
+        // No extra outputs — already ready
+        state_ = RUNNING;
+        setup_ok_ = true;
+        if (listen_port_ > 0) {
+            log_info("client: starting listener on %s:%d",
+                     listen_addr_.c_str(), listen_port_);
+            start_listener();
+        }
+    }
+}
+
+void Client::open_secondary_connections() {
+    if (secondary_conns_established_) {
+        log_info("client: secondary connections already established, skipping");
+        return;
+    }
+    log_info("client: opening %d secondary connections", total_extra_outputs_);
+    secondary_conns_established_ = 1;
+    for (int i = 1; i <= total_extra_outputs_; i++) {
+        int fd = socket(AF_INET, SOCK_STREAM, 0);
+        if (fd < 0) {
+            log_error("client: secondary socket %d: %s", i, strerror(errno));
+            continue;
+        }
+        struct sockaddr_in addr;
+        memset(&addr, 0, sizeof(addr));
+        addr.sin_family = AF_INET;
+        addr.sin_port = htons(server_port_);
+        inet_pton(AF_INET, server_host_.c_str(), &addr.sin_addr);
+        if (connect(fd, (struct sockaddr *)&addr, sizeof(addr)) < 0) {
+            log_error("client: secondary connect %d: %s", i, strerror(errno));
+            close(fd);
+            continue;
+        }
+        set_nonblock(fd);
+        int bufsz = 1048576;
+        setsockopt(fd, SOL_SOCKET, SO_SNDBUF, &bufsz, sizeof(bufsz));
+        setsockopt(fd, SOL_SOCKET, SO_RCVBUF, &bufsz, sizeof(bufsz));
+
+        // Send 9-byte handshake: [session_id:8][output_idx:1]
+        uint8_t handshake[9];
+        memcpy(handshake, &session_id_, 8);
+        handshake[8] = (uint8_t)i;
+        ssize_t nw = write(fd, handshake, 9);
+        if (nw != 9) {
+            log_error("client: secondary %d handshake write failed", i);
+            close(fd);
+            continue;
+        }
+
+        // Add to data_connections_
+        if ((size_t)(i) >= data_connections_.size())
+            data_connections_.resize(i + 1);
+        data_connections_[i].fd = fd;
+        register_data_connection_reader(i);
+        log_info("client: secondary connection %d established (fd=%d)", i, fd);
+    }
+}
+
+void Client::handle_transmit_ready(const Packet &pkt) {
+    (void)pkt;
+    log_info("client: MSG_TRANSMIT_READY received, all connections ready");
+
+    if (state_ == AWAIT_TRANSMIT_READY) {
+        state_ = RUNNING;
+        setup_ok_ = true;
+        if (listen_port_ > 0) {
+            log_info("client: starting listener on %s:%d",
+                     listen_addr_.c_str(), listen_port_);
+            start_listener();
+        }
+    } else {
+        log_info("client: already running (listener started earlier)");
     }
 }
 
@@ -1009,13 +1110,14 @@ void Client::check_heartbeat() {
     }
 
     if (idle_ms > 30000 && !heartbeating_) {
-        // 30 seconds idle — send heartbeat
+        // 30 seconds idle — send heartbeat on all connections
         heartbeating_ = true;
-        uint8_t hb[2] = {1, 1}; // varint(1), type=1
-        if (!data_connections_.empty() && data_connections_[0].fd >= 0) {
-            data_connections_[0].writer.write(data_connections_[0].fd, hb, 2);
-            if (!data_connections_[0].writer.registered && data_connections_[0].writer.size() > 0)
-                register_data_conn_epollout(0, data_connections_[0].fd);
+        uint8_t hb[2] = {1, WIRE_HEARTBEAT_PING}; // varint(1), type=WIRE_HEARTBEAT_PING
+        for (size_t i = 0; i < data_connections_.size(); i++) {
+            if (data_connections_[i].fd < 0) continue;
+            data_connections_[i].writer.write(data_connections_[i].fd, hb, 2);
+            if (!data_connections_[i].writer.registered && data_connections_[i].writer.size() > 0)
+                register_data_conn_epollout(i, data_connections_[i].fd);
         }
     }
 }
@@ -1078,8 +1180,7 @@ void Client::process_pending_io() {
 
 bool Client::start() {
     if (modules_.empty()) {
-        log_error("client: no modules configured — chain config is required (use ;module|params)");
-        return false;
+        log_info("client: no modules — tunnel-only mode");
     }
     if (!connect_to_server()) return false;
     state_ = AWAIT_AUTH1_CHALLENGE;

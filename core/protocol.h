@@ -14,6 +14,7 @@ enum MessageType : uint8_t {
     MSG_MODULE_LIST_RES = 0x11,
     MSG_CHAIN_CREATE    = 0x20,
     MSG_CHAIN_READY     = 0x21,
+    MSG_TRANSMIT_READY  = 0x22,
     MSG_CONNECT_REQ     = 0x30,
     MSG_CONNECT_OK      = 0x31,
     MSG_CONNECT_FAIL    = 0x32,

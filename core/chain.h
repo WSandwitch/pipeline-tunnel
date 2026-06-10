@@ -19,22 +19,29 @@ public:
           ThreadPool *pool, std::shared_ptr<void> owner_guard);
     ~Chain();
 
-    bool valid() const { return !_modules.empty(); }
+    bool valid() const { return true; }
     bool is_drained() const { return _inflight.load() == 0; }
     void push_packet(const uint8_t *data, size_t len, int src_idx, int dir);
     void wait_drain();
     void cancel() { _cancelled.store(true); }
+    int total_extra_outputs() const;
 
     static void *get_packet_static(void *chain_ctx, int idx, int *out_size);
     static int   write_packet_static(void *chain_ctx, int dst, const uint8_t *data, size_t len);
     static int   get_node_id_static(void *chain_ctx);
+    static int   request_outputs_static(void *chain_ctx, int count);
+    static int   get_output_fd_static(void *chain_ctx, int idx);
 
     void *get_packet_impl(Module *mod, int idx, int *out_size);
     int   write_packet_impl(Module *mod, int dst, const uint8_t *data, size_t len);
+    int   request_outputs_impl(Module *mod, int count);
+    int   get_output_fd_impl(Module *mod, int idx);
 
 private:
     KernelAPI *_kapi = nullptr;
     std::vector<std::unique_ptr<Module>> _modules;
+    std::vector<std::unique_ptr<Module>> _clone_modules;
+    ChainConfig _cfg;
 
     ThreadPool *_pool = nullptr;
     std::weak_ptr<void> _owner;
@@ -42,6 +49,7 @@ private:
     std::atomic<int> _inflight{0};
     std::mutex _drain_mtx;
     std::condition_variable _drain_cv;
+    std::unordered_map<Module*, int> _requested_outputs;
 
     void task_done();
 };

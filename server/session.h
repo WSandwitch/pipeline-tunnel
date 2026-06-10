@@ -66,7 +66,7 @@ private:
     std::unique_ptr<Chain> chain_;
     ChainConfig chain_config_;
 
-    // Single data connection (tunnel wire)
+    // Data connections for split outputs (index 0 = primary)
     struct DataConnection {
         int fd = -1;
         WriteBuffer writer;
@@ -84,7 +84,7 @@ private:
     void send_control(const Packet &pkt);
 
     void register_data_connection_reader(size_t idx);
-    void dispatch_data_conn_packet(const uint8_t *payload, size_t len);
+    void dispatch_data_conn_packet(const uint8_t *payload, size_t len, int src_idx);
     void process_wire_buffer(const uint8_t *data, size_t len);
 
     // Target connections
@@ -121,6 +121,15 @@ private:
     void handle_target_eof(uint8_t conn_id);
     void close_target(uint8_t conn_id);
     void close_all_targets();
+
+    // Pending data connections that arrived before chain create (9-byte handshake)
+    std::vector<std::pair<uint8_t, int>> pending_data_conns_;
+    void process_pending_data_conns();
+
+    // Total extra outputs needed (from _requested_outputs)
+    int total_extra_outputs_ = 0;
+    // RR counter for send_control
+    std::atomic<int> control_rr_counter_{0};
 
     // Heartbeat
     std::chrono::steady_clock::time_point last_wire_activity_;

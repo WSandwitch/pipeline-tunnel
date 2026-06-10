@@ -84,59 +84,48 @@ bool Server::start() {
             uint8_t header[9];
             ssize_t nread = read(cfd, header, 9);
 
-            if (nread == 9) {
+            {
                 uint64_t sid;
-                memcpy(&sid, header, 8);
-                uint8_t output_idx = header[8];
-                auto it = g_session_registry.find(sid);
-                if (it != g_session_registry.end()) {
-                    auto session = it->second.lock();
-                    if (session) {
-                        log_info("data connection for session %llx output %u (fd=%d)",
-                                 (unsigned long long)sid, output_idx, cfd);
-                        session->add_data_connection(output_idx, cfd);
-                        continue;
+                uint8_t output_idx;
+                bool is_data_conn = false;
+
+                if (nread == 9) {
+                    memcpy(&sid, header, 8);
+                    output_idx = header[8];
+                    is_data_conn = true;
+                } else if (nread < 0 && errno == EAGAIN) {
+                    struct pollfd pfd = {cfd, POLLIN, 0};
+                    int pret = poll(&pfd, 1, 200);
+                    if (pret > 0 && (pfd.revents & POLLIN)) {
+                        nread = read(cfd, header, 9);
+                        if (nread == 9) {
+                            memcpy(&sid, header, 8);
+                            output_idx = header[8];
+                            is_data_conn = true;
+                        }
                     }
                 }
-                log_error("data connection handshake for unknown session %llx, closing",
-                          (unsigned long long)sid);
-                close(cfd);
-                continue;
-            }
 
-            if (nread > 0 && nread < 9) {
-                close(cfd);
-                continue;
-            }
-
-            if (nread < 0 && errno == EAGAIN) {
-                struct pollfd pfd = {cfd, POLLIN, 0};
-                int pret = poll(&pfd, 1, 200);
-                if (pret > 0 && (pfd.revents & POLLIN)) {
-                    nread = read(cfd, header, 9);
-                    if (nread == 9) {
-                        uint64_t sid;
-                        memcpy(&sid, header, 8);
-                        uint8_t output_idx = header[8];
-                        auto it = g_session_registry.find(sid);
-                        if (it != g_session_registry.end()) {
-                            auto session = it->second.lock();
-                            if (session) {
-                                log_info("data connection for session %llx output %u (fd=%d) (deferred)",
-                                         (unsigned long long)sid, output_idx, cfd);
-                                session->add_data_connection(output_idx, cfd);
-                                continue;
-                            }
+                if (is_data_conn) {
+                    auto it = g_session_registry.find(sid);
+                    if (it != g_session_registry.end()) {
+                        auto session = it->second.lock();
+                        if (session) {
+                            log_info("data connection for session %llx output %u (fd=%d)",
+                                     (unsigned long long)sid, output_idx, cfd);
+                            session->add_data_connection(output_idx, cfd);
+                            continue;
                         }
-                        log_error("data connection handshake for unknown session %llx (deferred), closing",
-                                  (unsigned long long)sid);
-                        close(cfd);
-                        continue;
                     }
-                    if (nread > 0 && nread < 9) {
-                        close(cfd);
-                        continue;
-                    }
+                    log_error("data connection handshake for unknown session %llx, closing",
+                              (unsigned long long)sid);
+                    close(cfd);
+                    continue;
+                }
+
+                if (nread > 0 && nread < 9) {
+                    close(cfd);
+                    continue;
                 }
             }
 

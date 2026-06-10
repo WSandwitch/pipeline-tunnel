@@ -11,6 +11,7 @@
 #include "core/config.h"
 #include "core/module_base.h"
 #include "core/kernel_api.h"
+#include "core/thread_pool.h"
 
 struct TesterKernel {
     std::vector<uint8_t> captured;
@@ -135,9 +136,19 @@ int main(int argc, char *argv[]) {
     TesterKernel tk_a{}, tk_b{};
     KernelAPI kapi_a{&tk_a, alloc_id, wire_write};
     KernelAPI kapi_b{&tk_b, alloc_id, wire_write};
+    ThreadPool pool;
+    pool.start(1);
 
-    auto chain_a = std::make_shared<Chain>(cfg, &kapi_a);
-    auto chain_b = std::make_shared<Chain>(cfg, &kapi_b);
+    auto guard_a = std::make_shared<int>(0);
+    auto guard_b = std::make_shared<int>(0);
+    auto chain_a = std::make_shared<Chain>(cfg, &kapi_a, &pool, guard_a);
+
+    // Chain B: reverse module order for decode
+    ChainConfig cfg_b;
+    for (auto it = cfg.modules.rbegin(); it != cfg.modules.rend(); ++it)
+        cfg_b.modules.push_back(*it);
+    cfg_b.valid = true;
+    auto chain_b = std::make_shared<Chain>(cfg_b, &kapi_b, &pool, guard_b);
 
     if (!chain_a->valid() || !chain_b->valid()) {
         fprintf(stderr, "Chain build failed\n");
@@ -154,8 +165,9 @@ int main(int argc, char *argv[]) {
         original[i] = v;
     }
 
-    // Encode: push through chain A (dir=1, trigger_idx=0)
-    chain_a->push_packet(test_data, data_size, 0, 1);
+    // Encode: push through chain A (dir=0=split, trigger_idx=0)
+    chain_a->push_packet(test_data, data_size, 0, 0);
+    chain_a->wait_drain();
 
     if (tk_a.captured.empty()) {
         fprintf(stderr, "FAIL: chain A produced no output\n");
@@ -171,11 +183,12 @@ int main(int argc, char *argv[]) {
         fprintf(stderr, "%02x", tk_a.captured[i]);
     fprintf(stderr, "\n");
 
-    // Decode: push through chain B (dir=0, trigger_idx=1)
+    // Decode: push through chain B (dir=1=merge, trigger_idx=1)
     // Must malloc for push_packet ownership
     uint8_t *chain_a_out = (uint8_t *)malloc(tk_a.captured.size());
     memcpy(chain_a_out, tk_a.captured.data(), tk_a.captured.size());
-    chain_b->push_packet(chain_a_out, tk_a.captured.size(), 1, 0);
+    chain_b->push_packet(chain_a_out, tk_a.captured.size(), 1, 1);
+    chain_b->wait_drain();
 
     fprintf(stderr, "[tester] chain B output: %zu bytes\n", tk_b.captured.size());
     fprintf(stderr, "[tester] decoded hex: ");

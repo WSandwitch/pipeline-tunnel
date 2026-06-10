@@ -58,6 +58,7 @@ private:
         AWAIT_AUTH2_OK,
         AWAIT_MODULE_LIST_RES,
         AWAIT_CHAIN_READY,
+        AWAIT_TRANSMIT_READY,
         RUNNING,
     };
     State state_ = DISCONNECTED;
@@ -114,6 +115,12 @@ private:
     };
     std::vector<DataConnection> data_connections_;
 
+    // Secondary connections for split outputs
+    int total_extra_outputs_ = 0;
+    int secondary_conns_established_ = 0;
+    // RR counter for send_control
+    std::atomic<int> control_rr_counter_{0};
+
     // Heartbeat
     std::chrono::steady_clock::time_point last_wire_activity_;
     bool heartbeating_ = false;  // true after idle_timeout, waiting for response
@@ -135,7 +142,7 @@ private:
     void register_external_epollout(uint8_t conn_id, int fd);
 
     void register_data_connection_reader(size_t idx);
-    void dispatch_data_conn_packet(const uint8_t *payload, size_t len);
+    void dispatch_data_conn_packet(const uint8_t *payload, size_t len, int src_idx);
     void process_wire_buffer(const uint8_t *data, size_t len);
 
     void send_pause(uint8_t conn_id);
@@ -152,6 +159,8 @@ private:
     void handle_connect_pause(const Packet &pkt);
     void handle_connect_resume(const Packet &pkt);
     void handle_chain_ready(const Packet &pkt);
+    void handle_transmit_ready(const Packet &pkt);
+    void open_secondary_connections();
 
     // Heartbeat check — called from kernel tick
     void check_heartbeat();

@@ -11,10 +11,10 @@ class Tester:
         self.workers = workers or [1]
 
     def _build_configs(self):
-        """Build config list: ref (raw TCP) + tunnel + all module configs."""
+        """Build config list: ref (raw TCP) + tunnel + all module configs + combined chains."""
         import test_integration as ti
         mods = ti.discover_modules()
-        configs = ["ref", None]
+        configs = ["ref"]
         for m in mods:
             cfgs = ti.read_module_configs(m)
             if cfgs:
@@ -22,6 +22,9 @@ class Tester:
                     configs.append(f"{m}|{c}")
             else:
                 configs.append(m)
+        # Combined chains from chains.cfg.list
+        chain_cfgs = ti.read_module_configs("chains")
+        configs.extend(chain_cfgs)
         return configs
 
     def run(self):

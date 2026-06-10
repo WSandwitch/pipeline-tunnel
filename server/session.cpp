@@ -184,7 +184,11 @@ void Session::handle_auth_challenge_response(const Packet &pkt) {
         return;
     }
     log_info("session %llx: auth1 OK", (unsigned long long)session_id_);
-    Packet ok = Protocol::make_msg(MSG_AUTH_OK, "\x01", 1);
+    // Include session_id in AUTH_OK: [0x01][session_id:8]
+    std::vector<uint8_t> ok_payload(9, 0);
+    ok_payload[0] = 0x01;
+    memcpy(&ok_payload[1], &session_id_, 8);
+    Packet ok = Protocol::make_msg(MSG_AUTH_OK, ok_payload.data(), ok_payload.size());
     send_packet(ok);
     state_ = AWAIT_AUTH1_OK;
 }
@@ -212,7 +216,6 @@ void Session::handle_auth2_response(const Packet &pkt) {
                     if (len >= 1)
                         log_error("session %llx: wire_write dst=0 conn_id=255 invalid",
                                   (unsigned long long)self->session_id_);
-                    free(const_cast<uint8_t*>(data));
                     return -1;
                 }
                 uint8_t conn_id = data[0];
@@ -222,7 +225,7 @@ void Session::handle_auth2_response(const Packet &pkt) {
                 {
                     std::lock_guard<std::mutex> lock(self->targets_mtx_);
                     auto tit = self->targets_.find(conn_id);
-                    if (tit == self->targets_.end()) { free(const_cast<uint8_t*>(data)); return -1; }
+                    if (tit == self->targets_.end()) { return -1; }
                     ret = tit->second.writer.write(tit->second.fd, data + 1, len - 1);
                     if (ret > 0) need_epollout = true;
                     if (ret > 0 && !ref->in_paused[conn_id]) {
@@ -251,16 +254,17 @@ void Session::handle_auth2_response(const Packet &pkt) {
                 free(const_cast<uint8_t*>(data));
                 return ret;
             }
-            if (ref->out_fds.empty() || !ref->out_writer) {
-                log_error("session %llx: wire_write dst=1 no wire fd",
-                          (unsigned long long)self->session_id_);
-                free(const_cast<uint8_t*>(data));
+            if (dst < 1 || (size_t)dst > self->data_connections_.size() ||
+                self->data_connections_[dst-1].fd < 0) {
+                log_error("session %llx: wire_write dst=%zu no data connection",
+                          (unsigned long long)self->session_id_, (size_t)dst);
                 return -1;
             }
-            int fd = ref->out_fds[0];
+            int fd = self->data_connections_[dst-1].fd;
+            int dc_idx = dst - 1;
             uint8_t varint_buf[10];
             size_t varint_len = 0;
-            uint64_t total = 1 + len;
+            uint64_t total = 1 + len; // type + data (no sub-stream)
             while (total > 0x7F) {
                 varint_buf[varint_len++] = (uint8_t)((total & 0x7F) | 0x80);
                 total >>= 7;
@@ -270,14 +274,15 @@ void Session::handle_auth2_response(const Packet &pkt) {
             std::vector<uint8_t> frame;
             frame.reserve(varint_len + 1 + len);
             frame.insert(frame.end(), varint_buf, varint_buf + varint_len);
-            frame.push_back(0); // type=0
+            frame.push_back(0); // type=0 (WIRE_DATA)
             frame.insert(frame.end(), data, data + len);
-            int ret = ref->out_writer->write(fd, frame.data(), frame.size());
+            int ret = self->data_connections_[dc_idx].writer.write(fd, frame.data(), frame.size());
             if (ret > 0) {
                 std::lock_guard<std::mutex> lock(self->data_mtx_);
-                self->pending_io_.push_back([self]() {
-                    if (!self->data_connections_.empty() && self->data_connections_[0].fd >= 0)
-                        self->register_data_conn_epollout(0, self->data_connections_[0].fd);
+                self->pending_io_.push_back([self, dc_idx, fd]() {
+                    if ((size_t)dc_idx < self->data_connections_.size() &&
+                        self->data_connections_[dc_idx].fd >= 0)
+                        self->register_data_conn_epollout(dc_idx, fd);
                 });
             }
             if (ret > 0) {
@@ -321,8 +326,12 @@ void Session::handle_auth2_response(const Packet &pkt) {
         };
         chain_ref_.register_out_epollout = [](void *ctx) {
             auto *self = (Session*)ctx;
-            if (!self->data_connections_.empty() && self->data_connections_[0].fd >= 0)
-                self->register_data_conn_epollout(0, self->data_connections_[0].fd);
+            for (size_t i = 0; i < self->data_connections_.size(); i++) {
+                if (self->data_connections_[i].fd < 0) continue;
+                if (!self->data_connections_[i].writer.registered &&
+                    self->data_connections_[i].writer.size() > 0)
+                    self->register_data_conn_epollout(i, self->data_connections_[i].fd);
+            }
         };
         chain_ref_.register_in_epollout = [](void *ctx, uint8_t conn_id) {
             auto *self = (Session*)ctx;
@@ -443,10 +452,29 @@ void Session::handle_chain_create(const Packet &pkt) {
 
     state_ = RUNNING;
 
+    // Resize data_connections_ for split outputs
+    total_extra_outputs_ = chain_->total_extra_outputs();
+    if ((size_t)(1 + total_extra_outputs_) > data_connections_.size()) {
+        data_connections_.resize(1 + total_extra_outputs_);
+        log_info("session %llx: data_connections resized to %zu",
+                 (unsigned long long)session_id_, data_connections_.size());
+    }
+
+    // Process any pending data connections that arrived before chain create
+    process_pending_data_conns();
+
     // Send MSG_CHAIN_READY
     Packet ready = Protocol::make_msg(MSG_CHAIN_READY);
     send_control(ready);
     log_info("session %llx: MSG_CHAIN_READY sent", (unsigned long long)session_id_);
+
+    // If no extra outputs, send TRANSMIT_READY immediately
+    if (total_extra_outputs_ == 0) {
+        Packet trefdy = Protocol::make_msg(MSG_TRANSMIT_READY);
+        send_control(trefdy);
+        log_info("session %llx: MSG_TRANSMIT_READY sent (no extra outputs)",
+                 (unsigned long long)session_id_);
+    }
 }
 
 void Session::handle_reconnect(const Packet &pkt) {
@@ -588,17 +616,58 @@ void Session::handle_disconnect(const Packet &pkt) {
 
 void Session::add_data_connection(uint8_t output_idx, int fd) {
     if (output_idx >= data_connections_.size()) {
-        close(fd);
+        // Not resized yet — buffer for later processing
+        pending_data_conns_.push_back({output_idx, fd});
+        log_info("session %llx: data connection %u buffered (fd=%d, size=%zu)",
+                 (unsigned long long)session_id_, output_idx, fd, data_connections_.size());
         return;
     }
+    // Replace existing fd (handles reconnect)
     if (data_connections_[output_idx].fd >= 0) {
-        close(fd);
-        return;
+        kernel_->del_fd(data_connections_[output_idx].fd);
+        close(data_connections_[output_idx].fd);
+        data_connections_[output_idx] = DataConnection{};
     }
     data_connections_[output_idx].fd = fd;
     register_data_connection_reader(output_idx);
     log_info("session %llx: data connection %u added (fd=%d)",
              (unsigned long long)session_id_, output_idx, fd);
+
+    // Check if all connections are ready
+    bool all_ready = true;
+    for (auto &dc : data_connections_) {
+        if (dc.fd < 0) { all_ready = false; break; }
+    }
+    if (all_ready && state_ == RUNNING) {
+        Packet ready = Protocol::make_msg(MSG_TRANSMIT_READY);
+        send_control(ready);
+        log_info("session %llx: MSG_TRANSMIT_READY sent", (unsigned long long)session_id_);
+    }
+}
+
+void Session::process_pending_data_conns() {
+    for (auto &[output_idx, fd] : pending_data_conns_) {
+        if (output_idx < data_connections_.size() && data_connections_[output_idx].fd < 0) {
+            data_connections_[output_idx].fd = fd;
+            register_data_connection_reader(output_idx);
+            log_info("session %llx: pending data connection %u added (fd=%d)",
+                     (unsigned long long)session_id_, output_idx, fd);
+        } else {
+            close(fd);
+        }
+    }
+    pending_data_conns_.clear();
+
+    // Check if all ready
+    bool all_ready = true;
+    for (auto &dc : data_connections_) {
+        if (dc.fd < 0) { all_ready = false; break; }
+    }
+    if (all_ready && state_ == RUNNING) {
+        Packet ready = Protocol::make_msg(MSG_TRANSMIT_READY);
+        send_control(ready);
+        log_info("session %llx: MSG_TRANSMIT_READY sent", (unsigned long long)session_id_);
+    }
 }
 
 void Session::send_control(const Packet &pkt) {
@@ -613,12 +682,19 @@ void Session::send_control(const Packet &pkt) {
     framed.push_back((uint8_t)(val & 0x7F));
     framed.push_back(WIRE_CONTROL);
     framed.insert(framed.end(), serialized.begin(), serialized.end());
-    if (data_connections_.empty() || data_connections_[0].fd < 0) return;
-    auto &dc = data_connections_[0];
-    // Always buffer in priority_buf to avoid interleaving with partial data frames
-    dc.priority_buf.insert(dc.priority_buf.end(), framed.data(), framed.data() + framed.size());
-    if (!dc.writer.registered)
-        register_data_conn_epollout(0, dc.fd);
+    if (data_connections_.empty()) return;
+    // Round-robin across all connections
+    size_t n = data_connections_.size();
+    int start = control_rr_counter_.fetch_add(1) % (int)n;
+    for (size_t i = 0; i < n; i++) {
+        size_t idx = (size_t)((start + i) % (int)n);
+        if (data_connections_[idx].fd < 0) continue;
+        auto &dc = data_connections_[idx];
+        dc.priority_buf.insert(dc.priority_buf.end(), framed.data(), framed.data() + framed.size());
+        if (!dc.writer.registered)
+            register_data_conn_epollout(idx, dc.fd);
+        return;
+    }
 }
 
 void Session::process_wire_buffer(const uint8_t *data, size_t len) {
@@ -707,26 +783,20 @@ void Session::process_wire_buffer(const uint8_t *data, size_t len) {
                 }
             }
         } else if (type == 0) {
-            dispatch_data_conn_packet(data + pos + 1, val - 1);
+            if (val < 1) { pos += val; continue; }
+            dispatch_data_conn_packet(data + pos + 1, val - 1, 1);
         }
         pos += val;
     }
 }
 
-void Session::dispatch_data_conn_packet(const uint8_t *payload, size_t len) {
-    // Data packet — payload already includes conn_id at [0]
+void Session::dispatch_data_conn_packet(const uint8_t *payload, size_t len, int src_idx) {
     if (len < 1) return;
-    if (payload[0] == 255) {
-        log_error("session %llx: conn_id=255 in data packet, disconnecting",
-                  (unsigned long long)session_id_);
-        return;
-    }
     if (chain_ && state_ == RUNNING) {
         uint8_t *blob = (uint8_t*)malloc(len);
         if (!blob) return;
         memcpy(blob, payload, len);
-        // Reverse direction: src_idx=1, dir=1 (wire→target)
-        chain_->push_packet(blob, len, 1, 1);
+        chain_->push_packet(blob, len, src_idx, 1);
     }
 }
 
@@ -862,8 +932,9 @@ void Session::register_data_connection_reader(size_t idx) {
                         break;
                     }
 
-                    // type == 0: data — payload includes conn_id at [0], pass as-is
-                    dispatch_data_conn_packet(ptr + pos + 1, val - 1);
+                    // type == 0: data — src_idx = idx+1 (1-based output port)
+                    if (val < 1) { off += pos + val; continue; }
+                    dispatch_data_conn_packet(ptr + pos + 1, val - 1, (int)(idx + 1));
                     off += pos + val;
                 }
                 if (off > MAX_PACKET_SIZE) {
@@ -1255,10 +1326,12 @@ void Session::check_heartbeat() {
     if (idle_ms > 30000 && !heartbeating_) {
         heartbeating_ = true;
         uint8_t hb[2] = {1, 1};
-        if (!data_connections_.empty() && data_connections_[0].fd >= 0) {
-            data_connections_[0].writer.write(data_connections_[0].fd, hb, 2);
-            if (!data_connections_[0].writer.registered && data_connections_[0].writer.size() > 0)
-                register_data_conn_epollout(0, data_connections_[0].fd);
+        // Send heartbeat on all data connections
+        for (size_t i = 0; i < data_connections_.size(); i++) {
+            if (data_connections_[i].fd < 0) continue;
+            data_connections_[i].writer.write(data_connections_[i].fd, hb, 2);
+            if (!data_connections_[i].writer.registered && data_connections_[i].writer.size() > 0)
+                register_data_conn_epollout(i, data_connections_[i].fd);
         }
     }
 }

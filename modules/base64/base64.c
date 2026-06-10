@@ -26,7 +26,9 @@ int process(void *ctx_ptr, int dir, int trigger_idx) {
 
     int sz = 0;
     uint8_t *pkt = (uint8_t *)ctx->api->get_packet(ctx->api->ctx, 0, &sz);
-    if (!pkt || sz <= 0) return -1;
+    if (!pkt || sz <= 0) {
+        return -1;
+    }
 
     int write_dst = (trigger_idx == 0) ? 1 : 0;
     int ret;
