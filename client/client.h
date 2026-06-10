@@ -27,7 +27,8 @@ public:
            const std::string &target_addr,
            const std::vector<ModuleSpec> &modules,
            const std::string &mod_dir = "",
-           int thread_count = 1);
+           int thread_count = 1,
+           int heartbeat_interval_ms = 30000);
     ~Client();
 
     bool start();
@@ -127,6 +128,7 @@ private:
     // Heartbeat
     std::chrono::steady_clock::time_point last_wire_activity_;
     bool heartbeating_ = false;  // true after idle_timeout, waiting for response
+    int heartbeat_interval_ms_ = 30000;
 
     bool connect_to_server();
     void start_listener();

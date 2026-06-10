@@ -20,7 +20,8 @@
 
 class Session : public std::enable_shared_from_this<Session> {
 public:
-    Session(int client_fd, const std::string &password, std::shared_ptr<Kernel> kernel);
+    Session(int client_fd, const std::string &password, std::shared_ptr<Kernel> kernel,
+            int heartbeat_interval_ms = 30000);
     ~Session();
 
     int client_fd() const { return client_fd_; }
@@ -137,6 +138,7 @@ private:
     // Heartbeat
     std::chrono::steady_clock::time_point last_wire_activity_;
     bool heartbeating_ = false;
+    int heartbeat_interval_ms_;
 
     std::mutex data_mtx_;
     std::vector<std::function<void()>> pending_io_;

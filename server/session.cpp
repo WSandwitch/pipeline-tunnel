@@ -22,9 +22,11 @@ static uint64_t generate_id() {
 }
 
 Session::Session(int client_fd, const std::string &password,
-                 std::shared_ptr<Kernel> kernel)
+                 std::shared_ptr<Kernel> kernel,
+                 int heartbeat_interval_ms)
     : client_fd_(client_fd), password_(password),
-      kernel_(std::move(kernel)), session_id_(generate_id()) {
+      kernel_(std::move(kernel)), session_id_(generate_id()),
+      heartbeat_interval_ms_(heartbeat_interval_ms) {
     last_wire_activity_ = std::chrono::steady_clock::now();
 }
 
@@ -1381,16 +1383,15 @@ void Session::check_heartbeat() {
     auto idle_ms = std::chrono::duration_cast<std::chrono::milliseconds>(
         now - last_wire_activity_).count();
 
-    if (idle_ms > 60000) {
+    if (idle_ms > heartbeat_interval_ms_ * 2) {
         log_error("session %llx: heartbeat timeout", (unsigned long long)session_id_);
         state_ = DISCONNECTED;
         return;
     }
 
-    if (idle_ms > 30000 && !heartbeating_) {
+    if (idle_ms > heartbeat_interval_ms_ && !heartbeating_) {
         heartbeating_ = true;
-        uint8_t hb[2] = {1, 1};
-        // Send heartbeat on all data connections
+        uint8_t hb[2] = {1, WIRE_HEARTBEAT_PING};
         for (size_t i = 0; i < data_connections_.size(); i++) {
             if (data_connections_[i].fd < 0) continue;
             data_connections_[i].writer.write(data_connections_[i].fd, hb, 2);
@@ -1398,4 +1399,6 @@ void Session::check_heartbeat() {
                 register_data_conn_epollout(i, data_connections_[i].fd);
         }
     }
+
+    if (chain_) chain_->check_module_heartbeats(heartbeat_interval_ms_);
 }

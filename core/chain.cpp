@@ -29,6 +29,7 @@ Chain::Chain(const ChainConfig &cfg, KernelAPI *kapi,
         mod->api.get_node_id = &Chain::get_node_id_static;
         mod->api.get_packet = &Chain::get_packet_static;
         mod->api.write_packet = &Chain::write_packet_static;
+        mod->api.request_heartbeat = &Chain::request_heartbeat_static;
 
         mod->ctx = base->init_fn(&mod->api, spec.params.c_str());
         if (!mod->ctx) {
@@ -36,6 +37,7 @@ Chain::Chain(const ChainConfig &cfg, KernelAPI *kapi,
             return;
         }
 
+        mod->last_activity = std::chrono::steady_clock::now();
         log_debug("chain: module '%s' initialized (id=%d)", spec.name.c_str(), mod->id);
         _modules.push_back(std::move(mod));
     }
@@ -94,7 +96,9 @@ Chain::Chain(const ChainConfig &cfg, KernelAPI *kapi,
                 clone->api.get_node_id = &Chain::get_node_id_static;
                 clone->api.get_packet = &Chain::get_packet_static;
                 clone->api.write_packet = &Chain::write_packet_static;
+                clone->api.request_heartbeat = &Chain::request_heartbeat_static;
                 clone->ctx = base->init_fn(&clone->api, spec.params.c_str());
+                clone->last_activity = std::chrono::steady_clock::now();
 
                 if (n_cloned == 0)
                     prev_mod->outputs[k] = clone.get();
@@ -178,6 +182,10 @@ void Chain::push_packet(const uint8_t *data, size_t len, int src_idx, int dir) {
             g_ctx.next_mod = nullptr;
             g_ctx.data = cur_data;
             g_ctx.len = cur_len;
+            {
+                std::lock_guard<std::mutex> lock(mod->hb_mutex);
+                mod->last_activity = std::chrono::steady_clock::now();
+            }
             std::lock_guard<std::mutex> lock(mod->dir_mutex[dir]);
             int ret = mod->base->process_fn(mod->ctx, dir, cur_src);
             if (ret < 0) {
@@ -258,6 +266,74 @@ void *Chain::get_packet_impl(Module *mod, int idx, int *out_size) {
     return const_cast<uint8_t*>(g_ctx.data);
 }
 
+int Chain::request_heartbeat_static(void *chain_ctx, int interval_sec) {
+    auto *mod = (Module *)chain_ctx;
+    return mod->chain->request_heartbeat_impl(mod, interval_sec);
+}
+
+int Chain::request_heartbeat_impl(Module *mod, int interval_sec) {
+    std::lock_guard<std::mutex> lock(mod->hb_mutex);
+    if (interval_sec > 0) {
+        mod->heartbeat_interval_sec = interval_sec;
+    } else if (interval_sec == 0) {
+        mod->heartbeat_interval_sec = -1; // use system interval
+    } else {
+        mod->heartbeat_interval_sec = 0;  // cancel
+    }
+    return 0;
+}
+
+void Chain::check_module_heartbeats(int system_interval_ms) {
+    auto now = std::chrono::steady_clock::now();
+    for (auto &mod : _modules) {
+        int interval_sec = mod->heartbeat_interval_sec;
+        if (interval_sec == 0) continue;
+
+        int eff_interval_ms = (interval_sec < 0) ? system_interval_ms
+                                                  : interval_sec * 1000;
+        if (eff_interval_ms < 1000) eff_interval_ms = 1000;
+
+        bool should_tick = false;
+        {
+            std::lock_guard<std::mutex> lock(mod->hb_mutex);
+            auto idle_ms = std::chrono::duration_cast<std::chrono::milliseconds>(
+                now - mod->last_activity).count();
+            if (idle_ms >= eff_interval_ms) {
+                mod->last_activity = now;
+                should_tick = true;
+            }
+        }
+        if (should_tick) {
+            std::lock_guard<std::mutex> dirlock(mod->dir_mutex[0]);
+            mod->base->process_fn(mod->ctx, -1, 0);
+        }
+    }
+
+    for (auto &mod : _clone_modules) {
+        int interval_sec = mod->heartbeat_interval_sec;
+        if (interval_sec == 0) continue;
+
+        int eff_interval_ms = (interval_sec < 0) ? system_interval_ms
+                                                  : interval_sec * 1000;
+        if (eff_interval_ms < 1000) eff_interval_ms = 1000;
+
+        bool should_tick = false;
+        {
+            std::lock_guard<std::mutex> lock(mod->hb_mutex);
+            auto idle_ms = std::chrono::duration_cast<std::chrono::milliseconds>(
+                now - mod->last_activity).count();
+            if (idle_ms >= eff_interval_ms) {
+                mod->last_activity = now;
+                should_tick = true;
+            }
+        }
+        if (should_tick) {
+            std::lock_guard<std::mutex> dirlock(mod->dir_mutex[0]);
+            mod->base->process_fn(mod->ctx, -1, 0);
+        }
+    }
+}
+
 int Chain::write_packet_impl(Module *mod, int dst, const uint8_t *data, size_t len) {
     if (_requested_outputs.count(mod)) {
         // Set output_port for all split module outputs (even port 0, even with null/empty next)
@@ -296,6 +372,10 @@ int Chain::write_packet_impl(Module *mod, int dst, const uint8_t *data, size_t l
                 g_ctx.next_mod = nullptr;
                 g_ctx.data = data;
                 g_ctx.len = len;
+                {
+                    std::lock_guard<std::mutex> lock(m->hb_mutex);
+                    m->last_activity = std::chrono::steady_clock::now();
+                }
                 {
                     std::lock_guard<std::mutex> lock(m->dir_mutex[g_ctx.dir]);
                     int ret = m->base->process_fn(m->ctx, g_ctx.dir, g_ctx.src_idx);

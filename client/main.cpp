@@ -22,6 +22,7 @@ static void print_usage(const char *prog) {
         "                         -L 127.0.0.1:8080:10.0.0.1:3000\n"
         "  -M <modpath>         Path to directory with .so modules (for --module-*)\n"
         "  -t[<N>]              Worker threads (default 1, auto-detect cores when no value)\n"
+        "  -H, --heartbeat <s>  Heartbeat idle interval in seconds (default 30)\n"
         "  -h                   Show this help\n"
         "  -v, -vv, -vvv        Verbosity level\n"
         "  --module-help <name> Show help for a module\n"
@@ -55,6 +56,7 @@ int main(int argc, char *argv[]) {
     std::string module_help_name;
     std::string mod_dir;
     std::string chain_str;
+    int heartbeat_sec = 30;
 
     for (int i = 1; i < argc; i++) {
         if (argv[i][0] == '-' && argv[i][1] == '-' && strcmp(argv[i], "--module-help") == 0) {
@@ -116,10 +118,22 @@ int main(int argc, char *argv[]) {
                     if (thread_count < 1) thread_count = 1;
                     break;
                 }
+                case 'H': {
+                    const char *val = argv[i] + 2;
+                    if (!val[0] && i + 1 < argc) val = argv[++i];
+                    if (val[0]) heartbeat_sec = atoi(val);
+                    if (heartbeat_sec < 1) heartbeat_sec = 1;
+                    break;
+                }
                 case 'h':
                     show_help = true;
                     break;
             }
+        } else if (argv[i][0] == '-' && argv[i][1] == '-' && strncmp(argv[i] + 2, "heartbeat", 9) == 0) {
+            const char *val = argv[i] + 11;
+            if (!val[0] && i + 1 < argc) val = argv[++i];
+            if (val[0]) heartbeat_sec = atoi(val);
+            if (heartbeat_sec < 1) heartbeat_sec = 1;
         } else {
             chain_str = argv[i];
         }
@@ -183,7 +197,8 @@ int main(int argc, char *argv[]) {
                   target_addr,
                   cfg.modules,
                   mod_dir,
-                  thread_count);
+                  thread_count,
+                  heartbeat_sec * 1000);
 
     if (!client.start()) {
         log_error("client: tunnel setup failed");

@@ -4,3 +4,4 @@ build/
 test_modules/
 tests/test_modules/
 out/
+build_asan/

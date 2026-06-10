@@ -10,7 +10,8 @@
 class Server {
 public:
     Server(const std::string &listen_addr, uint16_t listen_port,
-           const std::string &password, int thread_count = 1);
+           const std::string &password, int thread_count = 1,
+           int heartbeat_interval_ms = 30000);
     ~Server();
 
     bool start();
@@ -24,6 +25,7 @@ private:
 
     int listen_fd_ = -1;
     int thread_count_;
+    int heartbeat_interval_ms_;
 };
 
 #endif

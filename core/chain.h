@@ -31,11 +31,15 @@ public:
     static int   get_node_id_static(void *chain_ctx);
     static int   request_outputs_static(void *chain_ctx, int count);
     static int   get_output_fd_static(void *chain_ctx, int idx);
+    static int   request_heartbeat_static(void *chain_ctx, int interval_sec);
 
     void *get_packet_impl(Module *mod, int idx, int *out_size);
     int   write_packet_impl(Module *mod, int dst, const uint8_t *data, size_t len);
     int   request_outputs_impl(Module *mod, int count);
     int   get_output_fd_impl(Module *mod, int idx);
+    int   request_heartbeat_impl(Module *mod, int interval_sec);
+
+    void check_module_heartbeats(int system_interval_ms);
 
 private:
     KernelAPI *_kapi = nullptr;

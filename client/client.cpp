@@ -35,13 +35,15 @@ Client::Client(const std::string &server_host, uint16_t server_port,
                const std::string &target_addr,
                const std::vector<ModuleSpec> &modules,
                 const std::string &mod_dir,
-                int thread_count)
+                int thread_count,
+                int heartbeat_interval_ms)
     : server_host_(server_host), server_port_(server_port),
       password_(password),
       listen_addr_(listen_addr), listen_port_(listen_port),
       target_addr_(target_addr),
       modules_(modules),
-      mod_dir_(mod_dir) {
+      mod_dir_(mod_dir),
+      heartbeat_interval_ms_(heartbeat_interval_ms) {
     kernel_ = std::make_shared<Kernel>();
     kernel_->start_workers(thread_count);
     chain_config_.modules = modules_;
@@ -1145,17 +1147,15 @@ void Client::check_heartbeat() {
     auto idle_ms = std::chrono::duration_cast<std::chrono::milliseconds>(
         now - last_wire_activity_).count();
 
-    if (idle_ms > 60000) {
-        // 60 seconds without any data — wire dead
+    if (idle_ms > heartbeat_interval_ms_ * 2) {
         log_error("client: heartbeat timeout, reconnecting");
         Kernel::request_stop();
         return;
     }
 
-    if (idle_ms > 30000 && !heartbeating_) {
-        // 30 seconds idle — send heartbeat on all connections
+    if (idle_ms > heartbeat_interval_ms_ && !heartbeating_) {
         heartbeating_ = true;
-        uint8_t hb[2] = {1, WIRE_HEARTBEAT_PING}; // varint(1), type=WIRE_HEARTBEAT_PING
+        uint8_t hb[2] = {1, WIRE_HEARTBEAT_PING};
         for (size_t i = 0; i < data_connections_.size(); i++) {
             if (data_connections_[i].fd < 0) continue;
             data_connections_[i].writer.write(data_connections_[i].fd, hb, 2);
@@ -1163,6 +1163,8 @@ void Client::check_heartbeat() {
                 register_data_conn_epollout(i, data_connections_[i].fd);
         }
     }
+
+    if (chain_) chain_->check_module_heartbeats(heartbeat_interval_ms_);
 }
 
 void Client::process_pending_io() {

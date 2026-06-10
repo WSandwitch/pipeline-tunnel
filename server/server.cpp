@@ -14,9 +14,11 @@ extern std::unordered_map<uint64_t, std::weak_ptr<Session>> g_session_registry;
 extern std::unordered_map<uint64_t, std::shared_ptr<Session>> g_paused_sessions;
 
 Server::Server(const std::string &addr, uint16_t port,
-               const std::string &password, int thread_count)
+               const std::string &password, int thread_count,
+               int heartbeat_interval_ms)
     : listen_addr_(addr), listen_port_(port), password_(password),
-      thread_count_(thread_count) {}
+      thread_count_(thread_count),
+      heartbeat_interval_ms_(heartbeat_interval_ms) {}
 
 Server::~Server() {
     stop();
@@ -138,7 +140,7 @@ bool Server::start() {
 
             log_info("client connected: %s:%d", client_ip, ntohs(client_addr.sin_port));
 
-            auto session = std::make_shared<Session>(cfd, password_, kernel_);
+            auto session = std::make_shared<Session>(cfd, password_, kernel_, heartbeat_interval_ms_);
             g_session_registry[session->session_id()] = session;
 
             std::string challenge = std::to_string(rand()) + std::to_string(time(nullptr));

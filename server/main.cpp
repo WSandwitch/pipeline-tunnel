@@ -27,6 +27,7 @@ static void print_usage(const char *prog) {
         "  -A <password>        Authentication password\n"
         "  -M <modpath>         Path to directory with .so modules\n"
         "  -t [<N>]             Worker threads (default: 1, auto-detect cores when no value)\n"
+        "  -H, --heartbeat <s>  Heartbeat idle interval in seconds (default 30)\n"
         "  -h                   Show this help\n"
         "  -v, -vv, -vvv        Verbosity level (v=info, vv=debug, vvv=trace)\n"
         "  --module-help <name>  Show help for a module\n"
@@ -52,6 +53,7 @@ int main(int argc, char *argv[]) {
     int thread_count = 1;
 
     int verbosity = 0;
+    int heartbeat_sec = 30;
 
     for (int i = 1; i < argc; i++) {
         if (argv[i][0] == '-' && argv[i][1] == '-' && strcmp(argv[i], "--module-help") == 0) {
@@ -60,6 +62,13 @@ int main(int argc, char *argv[]) {
         }
         if (argv[i][0] == '-' && argv[i][1] == '-' && strcmp(argv[i], "--module-list") == 0) {
             show_module_list = true;
+            continue;
+        }
+        if (argv[i][0] == '-' && argv[i][1] == '-' && strcmp(argv[i], "--heartbeat") == 0) {
+            const char *val = argv[i] + 11;
+            if (!val[0] && i + 1 < argc) val = argv[++i];
+            if (val[0]) heartbeat_sec = atoi(val);
+            if (heartbeat_sec < 1) heartbeat_sec = 1;
             continue;
         }
         if (argv[i][0] == '-') {
@@ -89,6 +98,13 @@ int main(int argc, char *argv[]) {
                 case 'v':
                     verbosity = strlen(argv[i]) - 1;
                     break;
+                case 'H': {
+                    const char *val = argv[i] + 2;
+                    if (!val[0] && i + 1 < argc) val = argv[++i];
+                    if (val[0]) heartbeat_sec = atoi(val);
+                    if (heartbeat_sec < 1) heartbeat_sec = 1;
+                    break;
+                }
                 case 'h':
                     show_help = true;
                     break;
@@ -161,7 +177,7 @@ int main(int argc, char *argv[]) {
         ModuleBase::load(mod_dir);
     }
 
-    Server server(listen_addr, listen_port, password, thread_count);
+    Server server(listen_addr, listen_port, password, thread_count, heartbeat_sec * 1000);
     if (!server.start()) {
         log_error("server failed to start");
         return 1;
