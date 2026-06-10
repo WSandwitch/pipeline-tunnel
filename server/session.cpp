@@ -300,18 +300,27 @@ void Session::handle_auth2_response(const Packet &pkt) {
                         }
                     }
                 });
-            } else if (self->data_connections_[dc_idx].writer.size() <= self->data_connections_[dc_idx].writer.low_water) {
-                std::lock_guard<std::mutex> lock(self->data_mtx_);
-                self->pending_io_.push_back([self]() {
-                    for (auto &[cid, tgt] : self->targets_) {
-                        if (tgt.paused_by_backpressure) {
-                            tgt.paused_by_backpressure = false;
-                            self->kernel_->mod_fd_events(tgt.fd, EPOLLIN, 0);
-                            log_debug("session %llx: BW resume target conn_id=%u",
-                                      (unsigned long long)self->session_id_, cid);
-                        }
+            } else {
+                bool all_below = true;
+                for (auto &check_dc : self->data_connections_) {
+                    if (check_dc.fd >= 0 && check_dc.writer.size() > check_dc.writer.low_water) {
+                        all_below = false;
+                        break;
                     }
-                });
+                }
+                if (all_below) {
+                    std::lock_guard<std::mutex> lock(self->data_mtx_);
+                    self->pending_io_.push_back([self]() {
+                        for (auto &[cid, tgt] : self->targets_) {
+                            if (tgt.paused_by_backpressure) {
+                                tgt.paused_by_backpressure = false;
+                                self->kernel_->mod_fd_events(tgt.fd, EPOLLIN, 0);
+                                log_debug("session %llx: BW resume target conn_id=%u",
+                                          (unsigned long long)self->session_id_, cid);
+                            }
+                        }
+                    });
+                }
             }
             free(const_cast<uint8_t*>(data));
             return ret;
@@ -1017,14 +1026,23 @@ void Session::register_data_conn_epollout(size_t idx, int fd) {
                 if (dc.priority_buf.empty())
                     dc.writer.flush(dc.fd);
 
-                // Step 4: resume paused targets if buffer drained below low_water
+                // Step 4: resume paused targets if ALL dc buffers drained below low_water
                 if (dc.writer.size() <= dc.writer.low_water) {
-                    for (auto &[cid, tgt] : targets_) {
-                        if (tgt.paused_by_backpressure) {
-                            tgt.paused_by_backpressure = false;
-                            kernel_->mod_fd_events(tgt.fd, EPOLLIN, 0);
-                            log_debug("session %llx: BW resume target conn_id=%u (flush)",
-                                      (unsigned long long)session_id_, cid);
+                    bool all_below = true;
+                    for (auto &check_dc : data_connections_) {
+                        if (check_dc.fd >= 0 && check_dc.writer.size() > check_dc.writer.low_water) {
+                            all_below = false;
+                            break;
+                        }
+                    }
+                    if (all_below) {
+                        for (auto &[cid, tgt] : targets_) {
+                            if (tgt.paused_by_backpressure) {
+                                tgt.paused_by_backpressure = false;
+                                kernel_->mod_fd_events(tgt.fd, EPOLLIN, 0);
+                                log_debug("session %llx: BW resume target conn_id=%u (flush)",
+                                          (unsigned long long)session_id_, cid);
+                            }
                         }
                     }
                 }
