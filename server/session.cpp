@@ -211,11 +211,14 @@ void Session::handle_auth2_response(const Packet &pkt) {
         chain_kapi_.wire_write = [](void *ctx, int dst, const uint8_t *data, size_t len) -> int {
             auto *self = (Session*)ctx;
             auto *ref = &self->chain_ref_;
+            log_debug("session %llx: wire_write dst=%d len=%zu data[0]=%u",
+                      (unsigned long long)self->session_id_, dst, len, len>0?data[0]:0);
             if (dst == 0) {
                 if (len < 1 || data[0] == 255) {
                     if (len >= 1)
                         log_error("session %llx: wire_write dst=0 conn_id=255 invalid",
                                   (unsigned long long)self->session_id_);
+                    free(const_cast<uint8_t*>(data));
                     return -1;
                 }
                 uint8_t conn_id = data[0];
@@ -225,7 +228,7 @@ void Session::handle_auth2_response(const Packet &pkt) {
                 {
                     std::lock_guard<std::mutex> lock(self->targets_mtx_);
                     auto tit = self->targets_.find(conn_id);
-                    if (tit == self->targets_.end()) { return -1; }
+                    if (tit == self->targets_.end()) { free(const_cast<uint8_t*>(data)); return -1; }
                     ret = tit->second.writer.write(tit->second.fd, data + 1, len - 1);
                     if (ret > 0) need_epollout = true;
                     if (ret > 0 && !ref->in_paused[conn_id]) {
@@ -463,6 +466,21 @@ void Session::handle_chain_create(const Packet &pkt) {
     // Process any pending data connections that arrived before chain create
     process_pending_data_conns();
 
+    // If pending connections made all data connections ready, send TRANSMIT_READY
+    if (total_extra_outputs_ > 0) {
+        bool all_ready = true;
+        for (auto &dc : data_connections_) {
+            if (dc.fd < 0) { all_ready = false; break; }
+        }
+        if (all_ready && state_ == RUNNING) {
+            process_pending_reconnect_targets();
+            Packet trefdy = Protocol::make_msg(MSG_TRANSMIT_READY);
+            send_control(trefdy);
+            log_info("session %llx: MSG_TRANSMIT_READY sent (from pending data conns)",
+                     (unsigned long long)session_id_);
+        }
+    }
+
     // Send MSG_CHAIN_READY
     Packet ready = Protocol::make_msg(MSG_CHAIN_READY);
     send_control(ready);
@@ -470,6 +488,7 @@ void Session::handle_chain_create(const Packet &pkt) {
 
     // If no extra outputs, send TRANSMIT_READY immediately
     if (total_extra_outputs_ == 0) {
+        process_pending_reconnect_targets();
         Packet trefdy = Protocol::make_msg(MSG_TRANSMIT_READY);
         send_control(trefdy);
         log_info("session %llx: MSG_TRANSMIT_READY sent (no extra outputs)",
@@ -639,6 +658,7 @@ void Session::add_data_connection(uint8_t output_idx, int fd) {
         if (dc.fd < 0) { all_ready = false; break; }
     }
     if (all_ready && state_ == RUNNING) {
+        process_pending_reconnect_targets();
         Packet ready = Protocol::make_msg(MSG_TRANSMIT_READY);
         send_control(ready);
         log_info("session %llx: MSG_TRANSMIT_READY sent", (unsigned long long)session_id_);
@@ -664,6 +684,7 @@ void Session::process_pending_data_conns() {
         if (dc.fd < 0) { all_ready = false; break; }
     }
     if (all_ready && state_ == RUNNING) {
+        process_pending_reconnect_targets();
         Packet ready = Protocol::make_msg(MSG_TRANSMIT_READY);
         send_control(ready);
         log_info("session %llx: MSG_TRANSMIT_READY sent", (unsigned long long)session_id_);
@@ -690,7 +711,9 @@ void Session::send_control(const Packet &pkt) {
         size_t idx = (size_t)((start + i) % (int)n);
         if (data_connections_[idx].fd < 0) continue;
         auto &dc = data_connections_[idx];
-        dc.priority_buf.insert(dc.priority_buf.end(), framed.data(), framed.data() + framed.size());
+        // Write control message to regular writer buffer (not priority_buf)
+        // to ensure ordering with data — control messages go after data on the wire
+        dc.writer.write(dc.fd, framed.data(), framed.size());
         if (!dc.writer.registered)
             register_data_conn_epollout(idx, dc.fd);
         return;
@@ -1087,9 +1110,19 @@ void Session::send_disconnect_now(uint8_t conn_id) {
         close_target(conn_id);
     } else {
         close_target(conn_id);
-        std::vector<uint8_t> p = {conn_id};
-        Packet d = Protocol::make_msg(MSG_DISCONNECT, p);
-        send_control(d);
+        if (chain_) {
+            // Send disconnect as in-band chain control frame
+            // guaranteeing ordering with data via seqnum in split/merge
+            uint8_t *ctrl = (uint8_t*)malloc(3);
+            ctrl[0] = 255;
+            ctrl[1] = CHAIN_CTRL_DISCONNECT;
+            ctrl[2] = conn_id;
+            chain_->push_packet(ctrl, 3, 0, 0);
+        } else {
+            std::vector<uint8_t> p = {conn_id};
+            Packet d = Protocol::make_msg(MSG_DISCONNECT, p);
+            send_control(d);
+        }
     }
 }
 
@@ -1180,9 +1213,30 @@ bool Session::reconnect(int new_client_fd) {
     chain_ref_.out_writer = &data_connections_[0].writer;
     register_data_connection_reader(0);
 
-    for (auto &saved : saved_targets_) {
+    // Defer target reconnect until all data connections are ready
+    // (secondary connections must be re-established first)
+    pending_reconnect_targets_ = std::move(saved_targets_);
+
+    paused_ = false;
+
+    log_info("session %llx: resumed after reconnect", (unsigned long long)session_id_);
+    return true;
+}
+
+void Session::process_pending_reconnect_targets() {
+    if (pending_reconnect_targets_.empty()) return;
+    log_info("session %llx: reconnecting %zu pending target(s)",
+             (unsigned long long)session_id_, pending_reconnect_targets_.size());
+    auto targets = std::move(pending_reconnect_targets_);
+    auto self = shared_from_this();
+    for (auto &saved : targets) {
         uint8_t conn_id = saved.first;
         std::string addr = saved.second;
+        if (targets_.count(conn_id)) {
+            log_debug("session %llx: target conn_id=%u already exists, skipping",
+                      (unsigned long long)session_id_, conn_id);
+            continue;
+        }
         if (!setup_tunnel_target(addr, conn_id)) {
             log_error("session %llx: reconnect: target %s conn_id=%u failed",
                       (unsigned long long)session_id_, addr.c_str(), conn_id);
@@ -1191,7 +1245,6 @@ bool Session::reconnect(int new_client_fd) {
         chain_ref_.in_fd[conn_id] = targets_[conn_id].fd;
         chain_ref_.in_writer[conn_id] = &targets_[conn_id].writer;
         int tfd = targets_[conn_id].fd;
-        auto self = shared_from_this();
         kernel_->add_fd_handler(tfd, [this, self, conn_id](int fd, uint32_t events) {
             if (events & EPOLLIN) {
                 {
@@ -1239,13 +1292,6 @@ bool Session::reconnect(int new_client_fd) {
             }
         });
     }
-    saved_targets_.clear();
-
-    paused_ = false;
-    state_ = RUNNING;
-
-    log_info("session %llx: resumed after reconnect", (unsigned long long)session_id_);
-    return true;
 }
 
 void Session::register_target_epollout(uint8_t conn_id, int tfd) {

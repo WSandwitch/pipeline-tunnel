@@ -105,6 +105,8 @@ private:
     uint8_t alloc_conn_id();
 
     std::vector<std::pair<uint8_t, std::string>> saved_targets_;
+    // Targets to reconnect after all data connections are ready
+    std::vector<std::pair<uint8_t, std::string>> pending_reconnect_targets_;
     std::atomic<bool> paused_{false};
 
     void handle_auth_challenge_response(const Packet &pkt);
@@ -125,6 +127,7 @@ private:
     // Pending data connections that arrived before chain create (9-byte handshake)
     std::vector<std::pair<uint8_t, int>> pending_data_conns_;
     void process_pending_data_conns();
+    void process_pending_reconnect_targets();
 
     // Total extra outputs needed (from _requested_outputs)
     int total_extra_outputs_ = 0;

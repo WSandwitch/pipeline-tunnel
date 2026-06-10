@@ -9,7 +9,7 @@
 #define CLAMP(x,lo,hi) ((x) < (lo) ? (lo) : (x) > (hi) ? (hi) : (x))
 
 #define MAX_SEQ_WINDOW 65536
-#define DEF_CHUNK_SIZE 4096
+#define DEF_CHUNK_SIZE 16384
 #define MIN_CHUNK 64
 #define MAX_CHUNK 65536
 
@@ -146,7 +146,6 @@ static int process_split(struct split_ctx *ctx, int trigger_idx) {
 
         int ret = ctx->api->write_packet(ctx->api->ctx, out_idx, out_buf, (size_t)chunk_len + 3);
         if (ret < 0) {
-            fprintf(stderr, "[split ERR] split write_packet out_idx=%d ret=%d\n", out_idx, ret);
             free(out_buf);
             free(in_buf);
             return ret;
@@ -242,9 +241,17 @@ static int process_merge(struct split_ctx *ctx, int trigger_idx) {
     int write_output = (trigger_idx == 0) ? 1 : 0;
 
     uint16_t scan = ctx->merge.next_seq;
+    int gap_detected = 0;
     while (1) {
         struct seq_entry *se = &ctx->merge.buf[scan % MAX_SEQ_WINDOW];
-        if (!se->used || se->seq != scan) break;
+        if (!se->used || se->seq != scan) {
+            if (!gap_detected) {
+                fprintf(stderr, "[split dbg] merge gap: next_seq=%u scan=%u used=%d seq=%u ctx_seq=%u\n",
+                        ctx->merge.next_seq, scan, se->used, se->seq, seq);
+                gap_detected = 1;
+            }
+            break;
+        }
         if (!se->more) {
             merge_flush_packet(ctx, scan, write_output);
             scan = ctx->merge.next_seq;
@@ -281,5 +288,5 @@ const char *modulehelp(void) {
            "Config: \"n:N\" for N extra streams (default 1).\n"
            "        \"s:SIZE\" fixed chunk size, \"s:MIN-MAX\" random range (suffix K).\n"
            "        \"trace\" enables debug output.\n"
-           "Default chunk size: 4096, min 64, max 65536. 2-byte seqnum, more flag.";
+           "Default chunk size: 16384, min 64, max 65536. 2-byte seqnum, more flag.";
 }

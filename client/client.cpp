@@ -252,7 +252,10 @@ void Client::register_data_connection_reader(size_t idx) {
 void Client::dispatch_data_conn_packet(const uint8_t *payload, size_t len, int src_idx) {
     if (len < 1) return;
     if (state_ < RUNNING) {
-        log_debug("client: data for conn_id=%u before ready, dropped", payload[0]);
+        std::vector<uint8_t> buf(payload, payload + len);
+        pending_data_frames_.emplace_back(std::move(buf), src_idx);
+        log_debug("client: data for conn_id=%u before ready, buffered (%zu pending)",
+                  payload[0], pending_data_frames_.size());
         return;
     }
     uint8_t *blob = (uint8_t*)malloc(len);
@@ -633,10 +636,33 @@ void Client::handle_auth2_challenge(const Packet &pkt) {
     chain_kapi_.wire_write = [](void *ctx, int dst, const uint8_t *data, size_t len) -> int {
         auto *ref = (ChainRef*)ctx;
         auto *self = (Client*)ref->cb_ctx;
+        log_debug("client: wire_write dst=%d len=%zu data[0]=%u", dst, len, len>0?data[0]:0);
         if (dst == 0) {
-            if (len < 1 || data[0] == 255) {
-                log_error("client: wire_write dst=0 invalid data[0]=%u", len<1?0:data[0]);
+            if (len < 1) {
+                free(const_cast<uint8_t*>(data));
                 return -1;
+            }
+            if (data[0] == 255) {
+                if (len < 3 || data[1] != CHAIN_CTRL_DISCONNECT) {
+                    log_error("client: wire_write dst=0 unknown chain ctrl type=%u",
+                              len>=2?data[1]:0);
+                    free(const_cast<uint8_t*>(data));
+                    return -1;
+                }
+                uint8_t conn_id = data[2];
+                free(const_cast<uint8_t*>(data));
+                std::lock_guard<std::mutex> lock(self->data_mtx_);
+                self->pending_io_.push_back([self, conn_id]() {
+                    log_info("client: chain ctrl disconnect conn_id=%u", conn_id);
+                    auto it = self->conns_.find(conn_id);
+                    if (it == self->conns_.end()) return;
+                    it->second.disconnecting = true;
+                    self->chain_ref_.in_fd.erase(conn_id);
+                    self->chain_ref_.in_writer.erase(conn_id);
+                    self->chain_ref_.in_paused.erase(conn_id);
+                    self->pending_disconnect_ids_.push_back(conn_id);
+                });
+                return 0;
             }
             uint8_t conn_id = data[0];
             std::vector<uint8_t> payload(data + 1, data + len);
@@ -910,6 +936,23 @@ void Client::handle_transmit_ready(const Packet &pkt) {
     if (state_ == AWAIT_TRANSMIT_READY) {
         state_ = RUNNING;
         setup_ok_ = true;
+
+        // Drain any data frames buffered before RUNNING
+        if (!pending_data_frames_.empty()) {
+            log_info("client: processing %zu buffered data frame(s)",
+                     pending_data_frames_.size());
+            for (auto &frame : pending_data_frames_) {
+                auto &buf = frame.first;
+                int src_idx = frame.second;
+                uint8_t *blob = (uint8_t*)malloc(buf.size());
+                if (blob) {
+                    memcpy(blob, buf.data(), buf.size());
+                    chain_->push_packet(blob, buf.size(), src_idx, 1);
+                }
+            }
+            pending_data_frames_.clear();
+        }
+
         if (listen_port_ > 0) {
             log_info("client: starting listener on %s:%d",
                      listen_addr_.c_str(), listen_port_);

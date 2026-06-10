@@ -49,4 +49,8 @@ const uint8_t WIRE_SHUTDOWN_WR = 3;
 const uint8_t WIRE_SHUTDOWN_WR_ACK = 4;
 const uint8_t WIRE_CONTROL = 5;
 
+// In-band chain control types (used with data[0] = 255 marker)
+// These travel through the chain pipeline like data, ensuring ordering via seqnum.
+const uint8_t CHAIN_CTRL_DISCONNECT = 0x51;
+
 #endif

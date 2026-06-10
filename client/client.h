@@ -105,6 +105,9 @@ private:
 
     std::vector<uint8_t> pending_disconnect_ids_;
 
+    // Data frames that arrived before state_ == RUNNING (buf by secondary connections)
+    std::vector<std::pair<std::vector<uint8_t>, int>> pending_data_frames_;
+
     struct DataConnection {
         int fd = -1;
         WriteBuffer writer;

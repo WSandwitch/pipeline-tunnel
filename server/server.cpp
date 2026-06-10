@@ -85,8 +85,8 @@ bool Server::start() {
             ssize_t nread = read(cfd, header, 9);
 
             {
-                uint64_t sid;
-                uint8_t output_idx;
+                uint64_t sid = 0;
+                uint8_t output_idx = 0;
                 bool is_data_conn = false;
 
                 if (nread == 9) {
@@ -104,6 +104,18 @@ bool Server::start() {
                             is_data_conn = true;
                         }
                     }
+                } else if (nread > 0 && nread < 9) {
+                    // Partial read: temporarily switch to blocking to get remaining bytes
+                    int fl = fcntl(cfd, F_GETFL, 0);
+                    if (fl >= 0) fcntl(cfd, F_SETFL, fl & ~O_NONBLOCK);
+                    ssize_t n2 = read(cfd, header + nread, 9 - (size_t)nread);
+                    if (fl >= 0) fcntl(cfd, F_SETFL, fl | O_NONBLOCK);
+                    if (n2 == 9 - nread) {
+                        nread = 9;
+                        memcpy(&sid, header, 8);
+                        output_idx = header[8];
+                        is_data_conn = true;
+                    }
                 }
 
                 if (is_data_conn) {
@@ -119,11 +131,6 @@ bool Server::start() {
                     }
                     log_error("data connection handshake for unknown session %llx, closing",
                               (unsigned long long)sid);
-                    close(cfd);
-                    continue;
-                }
-
-                if (nread > 0 && nread < 9) {
                     close(cfd);
                     continue;
                 }
