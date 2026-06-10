@@ -300,7 +300,7 @@ void Session::handle_auth2_response(const Packet &pkt) {
                         }
                     }
                 });
-            } else if (ref->out_writer->size() <= ref->out_writer->low_water) {
+            } else if (self->data_connections_[dc_idx].writer.size() <= self->data_connections_[dc_idx].writer.low_water) {
                 std::lock_guard<std::mutex> lock(self->data_mtx_);
                 self->pending_io_.push_back([self]() {
                     for (auto &[cid, tgt] : self->targets_) {

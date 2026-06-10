@@ -182,7 +182,8 @@ int main(int argc, char *argv[]) {
                   listen_addr, listen_port,
                   target_addr,
                   cfg.modules,
-                  mod_dir);
+                  mod_dir,
+                  thread_count);
 
     if (!client.start()) {
         log_error("client: tunnel setup failed");
