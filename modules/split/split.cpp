@@ -7,6 +7,7 @@
 #include <vector>
 #include <unordered_map>
 
+
 #define CLAMP(x,lo,hi) ((x) < (lo) ? (lo) : (x) > (hi) ? (hi) : (x))
 
 #define DEF_CHUNK_SIZE 16384
@@ -71,10 +72,11 @@ static int process_split(SplitContext *ctx, int /*trigger_idx*/) {
         std::memcpy(out_buf, header, HEADER_SIZE);
         std::memcpy(out_buf + HEADER_SIZE, in_buf + offset, (size_t)chunk_len);
 
+        if (ctx->trace) std::fprintf(stderr, "[split] write chunk seq=%u more=%d idx=%d len=%d\n",
+                ctx->seqnum, more, out_idx, chunk_len);
         int ret = ctx->api->write_packet(ctx->api->ctx, out_idx,
                                          out_buf, (size_t)(chunk_len + HEADER_SIZE));
         if (ret < 0) {
-            std::free(out_buf);
             std::free(in_buf);
             return ret;
         }
@@ -108,17 +110,9 @@ static int process_merge(SplitContext *ctx, int trigger_idx) {
     int write_output = (trigger_idx == 0) ? 1 : 0;
 
     uint32_t scan = ctx->merge_next_seq;
-    int gap_detected = 0;
     while (true) {
         auto it = ctx->merge_buf.find(scan);
         if (it == ctx->merge_buf.end()) {
-            if (!gap_detected) {
-                auto it2 = ctx->merge_buf.find(seq);
-                uint32_t latest_seq = (it2 != ctx->merge_buf.end()) ? it2->first : 0;
-                std::fprintf(stderr, "[split dbg] merge gap: next_seq=%u scan=%u ctx_seq=%u\n",
-                        ctx->merge_next_seq, scan, seq);
-                gap_detected = 1;
-            }
             break;
         }
         if (!ctx->merge_more[scan]) {
@@ -143,7 +137,7 @@ static int process_merge(SplitContext *ctx, int trigger_idx) {
 
             int wr = ctx->api->write_packet(ctx->api->ctx, write_output, out_buf, out.size());
             if (wr < 0) {
-                std::free(out_buf);
+                // out_buf ownership already transferred — do NOT free it
                 std::fprintf(stderr, "[split ERR] merge write_packet output=%d ret=%d\n",
                         write_output, wr);
                 return wr;
@@ -222,7 +216,7 @@ int process(void *ctx_ptr, int dir, int trigger_idx) {
 }
 
 const char *moduleversion(void) {
-    return "1.0.1";
+    return "1.0.2";
 }
 
 const char *modulename(void) {
