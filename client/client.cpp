@@ -774,6 +774,33 @@ void Client::handle_auth2_challenge(const Packet &pkt) {
         return;
     }
 
+    // Register backpressure callbacks
+    chain_->set_pause_callback(0, [this](bool pause) {
+        std::lock_guard<std::mutex> lock(data_mtx_);
+        pending_io_.push_back([this, pause]() {
+            for (auto &[id, conn] : conns_) {
+                (void)id;
+                if (conn.fd >= 0) {
+                    if (pause)
+                        kernel_->mod_fd_events(conn.fd, 0, EPOLLIN);
+                    else
+                        kernel_->mod_fd_events(conn.fd, EPOLLIN, 0);
+                }
+            }
+        });
+    });
+    chain_->set_pause_callback(1, [this](bool pause) {
+        std::lock_guard<std::mutex> lock(data_mtx_);
+        pending_io_.push_back([this, pause]() {
+            if (tcp_fd_ >= 0) {
+                if (pause)
+                    kernel_->mod_fd_events(tcp_fd_, 0, EPOLLIN);
+                else
+                    kernel_->mod_fd_events(tcp_fd_, EPOLLIN, 0);
+            }
+        });
+    });
+
     // Setup data connection on wire fd
     send_packet(Protocol::make_msg(MSG_AUTH_OK, "\x01", 1));
     data_connections_.resize(1);

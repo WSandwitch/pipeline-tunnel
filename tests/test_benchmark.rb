@@ -28,7 +28,7 @@ op = OptionParser.new do |o|
   o.on('-M', '--module-dir DIR', 'Path to .so modules dir') { |v| options[:mod_dir] = v }
   o.on('-C', '--config CONFIG', 'Chain config string') { |v| options[:config] = v }
   o.on('-t', '--threads N', Integer, 'Worker thread count (0=auto)') { |v| options[:threads] = v }
-  o.on('-d', '--duration N', Integer, 'Test duration in seconds') { |v| options[:duration] = v }
+  o.on('-d N', '--duration N', Integer, 'Test duration in seconds') { |v| options[:duration] = v }
   o.on('--direction DIR', %w[forward reverse bidir], "forward|reverse|bidir") { |v| options[:direction] = v }
   o.on('-P', '--parallel N', Integer, 'iperf3 parallel streams') { |v| options[:parallel] = v }
   o.on('-n', '--clients N', Integer, 'Concurrent iperf3 processes') { |v| options[:clients] = v }

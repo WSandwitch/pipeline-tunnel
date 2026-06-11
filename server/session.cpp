@@ -464,6 +464,35 @@ void Session::handle_chain_create(const Packet &pkt) {
     log_info("session %llx: chain created with %zu module(s)",
              (unsigned long long)session_id_, mods.size());
 
+    // Register backpressure callbacks (raw this is safe: chain's wait_drain in ~Session
+    // ensures no callback fires after Session is destroyed)
+    chain_->set_pause_callback(0, [this](bool pause) {
+        std::lock_guard<std::mutex> lock(data_mtx_);
+        pending_io_.push_back([this, pause]() {
+            std::lock_guard<std::mutex> tlock(targets_mtx_);
+            for (auto &[id, tgt] : targets_) {
+                (void)id;
+                if (tgt.fd >= 0) {
+                    if (pause)
+                        kernel_->mod_fd_events(tgt.fd, 0, EPOLLIN);
+                    else
+                        kernel_->mod_fd_events(tgt.fd, EPOLLIN, 0);
+                }
+            }
+        });
+    });
+    chain_->set_pause_callback(1, [this](bool pause) {
+        std::lock_guard<std::mutex> lock(data_mtx_);
+        pending_io_.push_back([this, pause]() {
+            if (client_fd_ >= 0) {
+                if (pause)
+                    kernel_->mod_fd_events(client_fd_, 0, EPOLLIN);
+                else
+                    kernel_->mod_fd_events(client_fd_, EPOLLIN, 0);
+            }
+        });
+    });
+
     state_ = RUNNING;
 
     // Resize data_connections_ for split outputs

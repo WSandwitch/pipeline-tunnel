@@ -129,14 +129,13 @@ Chain::~Chain() {
     wait_drain();
 }
 
-// Per-task chain state (thread-local, set once per task before chain starts)
 struct ChainContext {
     const uint8_t *data = nullptr;
     size_t len = 0;
     int src_idx = 0;
     int dir = 0;
-    int output_port = -1;        // split output port (-1 = not in split sub-chain)
-    Module *next_mod = nullptr;  // set by write_packet_impl when chaining
+    int output_port = -1;
+    Module *next_mod = nullptr;
 };
 
 thread_local ChainContext g_ctx;
@@ -147,9 +146,6 @@ void Chain::push_packet(const uint8_t *data, size_t len, int src_idx, int dir) {
         return;
     }
     if (_modules.empty()) {
-        // Tunnel-only mode: direct pass-through
-        // dir=0 (split): external → wire (server)
-        // dir=1 (merge): wire → external (client user)
         if (dir == 0) {
             _kapi->wire_write(_kapi->ctx, 1, data, len);
         } else {
@@ -162,22 +158,26 @@ void Chain::push_packet(const uint8_t *data, size_t len, int src_idx, int dir) {
         free(const_cast<uint8_t*>(data));
         return;
     }
+
     _inflight.fetch_add(1);
-    _pool->enqueue([this, data, len, src_idx, dir, owner]() {
+
+    _pool->enqueue([this, data, len, src_idx, dir, owner, om = &dir_order_mutex_[dir]]() {
         if (_cancelled.load()) {
+            om->unlock();
             free(const_cast<uint8_t*>(data));
             task_done();
             return;
         }
 
-        // Run entire chain inline within this single task
         const uint8_t *cur_data = data;
         size_t cur_len = len;
         int cur_src = src_idx;
         g_ctx = ChainContext{cur_data, cur_len, cur_src, dir, -1, nullptr};
-        // For merge direction (dir=1), process modules in reverse order (last → first)
+
         Module *mod = dir == 0 ? _modules[0].get()
                                : (_modules.empty() ? nullptr : _modules.back().get());
+        // Transitional unlock: release order_mutex after first dir_mutex acquisition
+        bool om_released = false;
         while (mod) {
             g_ctx.next_mod = nullptr;
             g_ctx.data = cur_data;
@@ -187,17 +187,21 @@ void Chain::push_packet(const uint8_t *data, size_t len, int src_idx, int dir) {
                 mod->last_activity = std::chrono::steady_clock::now();
             }
             std::lock_guard<std::mutex> lock(mod->dir_mutex[dir]);
+            if (!om_released) {
+                om->unlock();
+                om_released = true;
+            }
             int ret = mod->base->process_fn(mod->ctx, dir, cur_src);
             if (ret < 0) {
                 log_debug("chain: module process_fn returned %d, dropping packet", ret);
                 break;
             }
-            // write_packet_impl sets next_mod + updates data/len for next iteration
             mod = g_ctx.next_mod;
             cur_data = g_ctx.data;
             cur_len = g_ctx.len;
             cur_src = g_ctx.src_idx;
         }
+        if (!om_released) om->unlock();
         task_done();
     }, &dir_order_mutex_[dir]);
 }
@@ -336,12 +340,8 @@ void Chain::check_module_heartbeats(int system_interval_ms) {
 
 int Chain::write_packet_impl(Module *mod, int dst, const uint8_t *data, size_t len) {
     if (_requested_outputs.count(mod)) {
-        // Set output_port for all split module outputs (even port 0, even with null/empty next)
         g_ctx.output_port = dst;
-        // Do NOT change src_idx here - it's used as trigger_idx by downstream
-        // modules and must remain 0 for dir=0 (encode) to stay on encode path.
     }
-    // Reverse chaining for merge direction: chain to previous module
     if (g_ctx.dir == 1 && dst == 0) {
         Module *prev = nullptr;
         for (size_t i = 1; i < _modules.size(); i++) {
@@ -356,17 +356,12 @@ int Chain::write_packet_impl(Module *mod, int dst, const uint8_t *data, size_t l
             g_ctx.len = len;
             return 0;
         }
-        // First module in chain → wire_write(0) goes to external
         int ret = _kapi->wire_write(_kapi->ctx, 0, data, len);
         return ret;
     }
 
     if (dst >= 0 && (size_t)dst < mod->outputs.size()) {
         if (mod->outputs[dst]) {
-            // Process downstream chain inline (synchronously).
-            // This ensures split modules can emit multiple chunks; each chunk
-            // is fully processed by all downstream modules before the split
-            // module's loop continues (supporting multi-chunk split + chaining).
             Module *m = mod->outputs[dst];
             while (m) {
                 g_ctx.next_mod = nullptr;
@@ -379,9 +374,7 @@ int Chain::write_packet_impl(Module *mod, int dst, const uint8_t *data, size_t l
                 {
                     std::lock_guard<std::mutex> lock(m->dir_mutex[g_ctx.dir]);
                     int ret = m->base->process_fn(m->ctx, g_ctx.dir, g_ctx.src_idx);
-                    if (ret < 0) {
-                        return ret;
-                    }
+                    if (ret < 0) return ret;
                 }
                 m = g_ctx.next_mod;
                 data = g_ctx.data;
@@ -390,11 +383,7 @@ int Chain::write_packet_impl(Module *mod, int dst, const uint8_t *data, size_t l
             return 0;
         }
     }
-    // Last module — write to wire synchronously
-    // For split sub-chains on encode (dir=0), use output_port+1 as wire dst (sub-stream ID)
-    // On decode (dir=1), use dst unchanged (merge output goes to target)
     int wire_dst = (g_ctx.output_port >= 0 && g_ctx.dir == 0) ? (g_ctx.output_port + 1) : dst;
     int ret = _kapi->wire_write(_kapi->ctx, wire_dst, data, len);
     return ret;
 }
-

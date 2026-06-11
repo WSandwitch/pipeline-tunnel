@@ -34,9 +34,9 @@ public:
     }
 
     template<typename F>
-    void enqueue(F &&f, std::mutex *order_mutex) {
+    void enqueue(F &&f, std::mutex *om) {
         WorkTask task(std::forward<F>(f));
-        task.order_mutex = order_mutex;
+        task.order_mutex = om;
         {
             std::lock_guard<std::mutex> lock(mtx_);
             queue_.push_back(std::move(task));

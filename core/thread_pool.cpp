@@ -39,6 +39,9 @@ void ThreadPool::worker_loop() {
             if (shutdown_.load()) return;
             task = std::move(queue_.front());
             queue_.pop_front();
+            // Transitional lock: order_mutex acquired under queue lock to
+            // prevent FIFO reordering; released by fn() after it acquires
+            // its own dir_mutex.
             if (task.order_mutex) {
                 task.order_mutex->lock();
             }
@@ -46,8 +49,6 @@ void ThreadPool::worker_loop() {
         if (task.fn) {
             try { task.fn(); } catch (...) {}
         }
-        if (task.order_mutex) {
-            task.order_mutex->unlock();
-        }
+        // order_mutex is released by fn() — not here
     }
 }

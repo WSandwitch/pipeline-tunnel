@@ -17,6 +17,7 @@ struct Module {
     std::vector<Module *> outputs;  // outputs[dst] → next module, null = wire/kernel
     void *ctx = nullptr;
     std::mutex dir_mutex[2];        // per-direction serialization
+    std::atomic<int> pending[2]{0, 0}; // tasks queued + processing for this module, per direction
 
     // Heartbeat
     int heartbeat_interval_sec = 0; // 0=not requested, -1=system, >0=own

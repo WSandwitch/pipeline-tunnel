@@ -7,6 +7,7 @@
 #include <atomic>
 #include <mutex>
 #include <condition_variable>
+#include <functional>
 #include "config.h"
 #include "kernel_api.h"
 #include "module_instance.h"
@@ -21,6 +22,11 @@ public:
 
     bool valid() const { return true; }
     bool is_drained() const { return _inflight.load() == 0; }
+
+    // dir=0 (split/encode), dir=1 (merge/decode)
+    using PauseCallback = std::function<void(bool paused)>;
+    void set_pause_callback(int dir, PauseCallback cb) { _pause_cb[dir] = std::move(cb); }
+
     void push_packet(const uint8_t *data, size_t len, int src_idx, int dir);
     void wait_drain();
     void cancel() { _cancelled.store(true); }
@@ -41,6 +47,9 @@ public:
 
     void check_module_heartbeats(int system_interval_ms);
 
+    static constexpr int WATERMARK_HIGH = 4;
+    static constexpr int WATERMARK_LOW = 2;
+
 private:
     KernelAPI *_kapi = nullptr;
     std::vector<std::unique_ptr<Module>> _modules;
@@ -55,6 +64,8 @@ private:
     std::condition_variable _drain_cv;
     std::unordered_map<Module*, int> _requested_outputs;
     std::mutex dir_order_mutex_[2];
+
+    PauseCallback _pause_cb[2];  // pause/resume callbacks per direction
 
     void task_done();
 };
