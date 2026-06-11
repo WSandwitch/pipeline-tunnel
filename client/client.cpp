@@ -777,6 +777,8 @@ void Client::handle_auth2_challenge(const Packet &pkt) {
     // Setup data connection on wire fd
     send_packet(Protocol::make_msg(MSG_AUTH_OK, "\x01", 1));
     data_connections_.resize(1);
+    if (chain_)
+        data_connections_.reserve(1 + chain_->total_extra_outputs());
     data_connections_[0].fd = tcp_fd_;
     chain_ref_.out_fds = {tcp_fd_};
     chain_ref_.out_writer = &data_connections_[0].writer;

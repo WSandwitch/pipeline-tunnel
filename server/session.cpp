@@ -469,6 +469,10 @@ void Session::handle_chain_create(const Packet &pkt) {
     // Resize data_connections_ for split outputs
     total_extra_outputs_ = chain_->total_extra_outputs();
     if ((size_t)(1 + total_extra_outputs_) > data_connections_.size()) {
+        // Reserve before resize: data_connection_reader callback (running on
+        // the same stack) holds a reference into data_connections_; resize
+        // would reallocate and invalidate it, corrupting wire parsing.
+        data_connections_.reserve(1 + total_extra_outputs_);
         data_connections_.resize(1 + total_extra_outputs_);
         log_info("session %llx: data_connections resized to %zu",
                  (unsigned long long)session_id_, data_connections_.size());
@@ -884,9 +888,11 @@ void Session::register_data_connection_reader(size_t idx) {
                 last_wire_activity_ = std::chrono::steady_clock::now();
                 heartbeating_ = false;
                 dc.read_buf.resize(old + (size_t)n);
-                size_t &off = dc.read_offset;
-                auto &buf = dc.read_buf;
                 while (true) {
+                    auto &dc = data_connections_[idx];
+                    size_t &off = dc.read_offset;
+                    auto &buf = dc.read_buf;
+
                     size_t avail = buf.size() - off;
                     if (avail < 1) break;
                     const uint8_t *ptr = buf.data() + off;
@@ -984,18 +990,24 @@ void Session::register_data_connection_reader(size_t idx) {
                                     break;
                             }
                         }
-                        off += pos + val;
+                        {
+                            auto &dc = data_connections_[idx];
+                            dc.read_offset += pos + val;
+                        }
                         continue;
                     }
                     if (type > WIRE_CONTROL) {
                         char hexbuf[256] = {0};
-                        size_t dump_sz = buf.size() - off;
-                        if (dump_sz > 64) dump_sz = 64;
-                        for (size_t i = 0; i < dump_sz && i*3 < 255; i++)
-                            snprintf(hexbuf + i*3, 4, "%02x ", (unsigned char)buf.data()[off+i]);
+                        {
+                            auto &dc = data_connections_[idx];
+                            size_t dump_sz = dc.read_buf.size() - dc.read_offset;
+                            if (dump_sz > 64) dump_sz = 64;
+                            for (size_t i = 0; i < dump_sz && i*3 < 255; i++)
+                                snprintf(hexbuf + i*3, 4, "%02x ", (unsigned char)dc.read_buf.data()[dc.read_offset+i]);
+                        }
                         log_error("session %llx: wire protocol violation type=%u off=%zu buf_sz=%zu avail=%zu val=%zu pos=%zu hex=%s",
-                                  (unsigned long long)session_id_, type, off, buf.size(), avail, val, pos, hexbuf);
-                        buf.clear(); off = 0;
+                                  (unsigned long long)session_id_, type, dc.read_offset, dc.read_buf.size(), avail, val, pos, hexbuf);
+                        dc.read_buf.clear(); dc.read_offset = 0;
                         break;
                     }
 
@@ -1004,9 +1016,12 @@ void Session::register_data_connection_reader(size_t idx) {
                     dispatch_data_conn_packet(ptr + pos + 1, val - 1, (int)(idx + 1));
                     off += pos + val;
                 }
-                if (off > MAX_PACKET_SIZE) {
-                    buf.erase(buf.begin(), buf.begin() + off);
-                    off = 0;
+                {
+                    auto &dc = data_connections_[idx];
+                    if (dc.read_offset > MAX_PACKET_SIZE) {
+                        dc.read_buf.erase(dc.read_buf.begin(), dc.read_buf.begin() + dc.read_offset);
+                        dc.read_offset = 0;
+                    }
                 }
             }
         }
