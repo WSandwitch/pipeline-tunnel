@@ -510,13 +510,23 @@ void Session::handle_chain_create(const Packet &pkt) {
 }
 
 void Session::handle_reconnect(const Packet &pkt) {
-    if (pkt.payload.size() != 8) {
+    // Payload: 8 bytes SID + 64 bytes hex(SHA256(challenge + password))
+    if (pkt.payload.size() != 72) {
         Packet fail = Protocol::make_msg(MSG_AUTH_OK, "\x00", 1);
         send_packet(fail);
         return;
     }
     uint64_t sid;
     memcpy(&sid, pkt.payload.data(), 8);
+    std::string hash((const char *)pkt.payload.data() + 8, 64);
+    std::string expected = hex_sha256(challenge1_ + password_);
+    if (hash != expected) {
+        log_error("session %llx: reconnect auth failed", (unsigned long long)session_id_);
+        Packet fail = Protocol::make_msg(MSG_AUTH_OK, "\x00", 1);
+        send_packet(fail);
+        state_ = DISCONNECTED;
+        return;
+    }
     auto it = g_session_registry.find(sid);
     if (it == g_session_registry.end() || it->second.expired()) {
         Packet fail = Protocol::make_msg(MSG_AUTH_OK, "\x00", 1);

@@ -22,12 +22,15 @@ endif()
 
 # pack target: copy binaries and .so to out/
 set(PACK_DIR "${CMAKE_SOURCE_DIR}/out")
+set(MODULES copy base64 split)
 add_custom_target(pack
   COMMAND ${CMAKE_COMMAND} -E make_directory ${PACK_DIR}
   COMMAND ${CMAKE_COMMAND} -E make_directory ${PACK_DIR}/modules
   COMMAND ${CMAKE_COMMAND} -E copy $<TARGET_FILE:ppltunnel-server> ${PACK_DIR}/
   COMMAND ${CMAKE_COMMAND} -E copy $<TARGET_FILE:ppltunnel-client> ${PACK_DIR}/
   COMMAND ${CMAKE_COMMAND} -E copy $<TARGET_FILE:copy> ${PACK_DIR}/modules/
+  COMMAND ${CMAKE_COMMAND} -E copy $<TARGET_FILE:base64> ${PACK_DIR}/modules/
+  COMMAND ${CMAKE_COMMAND} -E copy $<TARGET_FILE:split> ${PACK_DIR}/modules/
   COMMENT "Packing binaries and modules to ${PACK_DIR}"
-  DEPENDS ppltunnel-server ppltunnel-client copy
+  DEPENDS ppltunnel-server ppltunnel-client ${MODULES}
 )

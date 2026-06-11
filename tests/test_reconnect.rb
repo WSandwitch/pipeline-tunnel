@@ -218,6 +218,19 @@ def create_chain(sock)
   sid
 end
 
+def reconnect(sock, sid)
+  pkt = recv_msg(sock)
+  raise "no auth challenge for reconnect" unless pkt && pkt[0] == 0x01
+  hash = sha256(pkt[1] + PASS)
+  sock.send(msg(0x05, [sid].pack('Q<') + hash), 0)
+  loop do
+    pkt = recv_msg(sock)
+    break if pkt.nil? || pkt.empty?
+    break if pkt[0] == 0x03
+  end
+  raise "reconnect failed" unless pkt && pkt[0] == 0x03 && pkt[1].getbyte(0) == 1
+end
+
 def send_connect_req(sock, addr)
   payload = [addr.bytesize, addr].pack('CA*')
   send_control(sock, 0x30, payload)  # MSG_CONNECT_REQ
@@ -285,21 +298,10 @@ def test_simple
     sock1.close
     wait_for_pause
 
-    # --- Reconnect: new TCP connection, send MSG_RECONNECT as varint ---
+    # --- Reconnect: new TCP connection, authenticate, restore session ---
     sock2 = Socket.new(:INET, :STREAM)
     sock2.connect(Addrinfo.tcp(HOST, svr_port))
-    # Wait for server poll timeout (200ms) to avoid the 9-byte data-connection
-    # handshake check consuming MSG_RECONNECT bytes
-    sleep 0.25
-    sock2.send(msg(0x05, [sid].pack('Q<')), 0)  # MSG_RECONNECT
-    # Drain MSG_AUTH_CHALLENGE (sent during the wait period), then read AUTH_OK
-    pkt = nil
-    loop do
-      pkt = recv_msg(sock2)
-      break if pkt.nil? || pkt.empty?
-      break if pkt[0] == 0x03  # MSG_AUTH_OK
-    end
-    raise "reconnect failed: #{pkt.inspect}" unless pkt && pkt[0] == 0x03 && pkt[1].getbyte(0) == 1
+    reconnect(sock2, sid)
     wait_for_reconnect_targets
 
     data2 = 'B' * 2048
@@ -354,15 +356,7 @@ def test_load
 
     sock2 = Socket.new(:INET, :STREAM)
     sock2.connect(Addrinfo.tcp(HOST, svr_port))
-    sleep 0.25
-    sock2.send(msg(0x05, [sid].pack('Q<')), 0)
-    pkt = nil
-    loop do
-      pkt = recv_msg(sock2)
-      break if pkt.nil? || pkt.empty?
-      break if pkt[0] == 0x03  # MSG_AUTH_OK
-    end
-    raise "reconnect failed (load): #{pkt.inspect}" unless pkt && pkt[0] == 0x03 && pkt[1].getbyte(0) == 1
+    reconnect(sock2, sid)
     wait_for_reconnect_targets
 
     verify = 'C' * 512
@@ -409,15 +403,7 @@ def test_multi
 
       sock = Socket.new(:INET, :STREAM)
       sock.connect(Addrinfo.tcp(HOST, svr_port))
-      sleep 0.25
-      sock.send(msg(0x05, [sid].pack('Q<')), 0)
-      pkt = nil
-      loop do
-        pkt = recv_msg(sock)
-        break if pkt.nil? || pkt.empty?
-        break if pkt[0] == 0x03
-      end
-      raise "multi: reconnect failed iter #{i}: #{pkt.inspect}" unless pkt && pkt[0] == 0x03 && pkt[1].getbyte(0) == 1
+      reconnect(sock, sid)
       wait_for_reconnect_targets
 
       post = 'N' * (512 * (i + 1))
