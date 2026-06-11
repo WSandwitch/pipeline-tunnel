@@ -1,6 +1,12 @@
 #!/bin/sh
 set -e
 
+BUILD_TYPE="${1:-Debug}"
+case "$BUILD_TYPE" in
+  Debug|Release) ;;
+  *) echo "Usage: $0 [Debug|Release]" >&2; exit 1 ;;
+esac
+
 IMAGE=pppltunnel:dev
 USER_ID=$(id -u)
 GROUP_ID=$(id -g)
@@ -25,8 +31,4 @@ exec docker run --rm \
   -v "$(pwd):/app" \
   -v "$BUILD_DIR:/app/build" \
   -v /tmp:/tmp \
-  "$IMAGE" sh -c '
-    mkdir -p /app/build/tests/test_modules &&
-    cmake -B /app/build -DCMAKE_BUILD_TYPE=Debug &&
-    cmake --build /app/build -j"$(nproc)"
-  '
+  "$IMAGE" sh -c "mkdir -p /app/build/tests/test_modules && cmake -B /app/build -DCMAKE_BUILD_TYPE=$BUILD_TYPE && cmake --build /app/build -j\$(nproc)"
