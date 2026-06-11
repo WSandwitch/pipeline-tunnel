@@ -1,5 +1,8 @@
 #!/usr/bin/env ruby
 # frozen_string_literal: true
+
+$stdout.sync = true
+
 require 'socket'
 require 'digest'
 require 'timeout'

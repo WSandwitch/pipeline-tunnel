@@ -1,6 +1,8 @@
 #!/usr/bin/env ruby
 # frozen_string_literal: true
 
+$stdout.sync = true
+
 # Tests reconnection: client disconnects, reconnects with same session_id,
 # chain resumes, data flows again.
 #

@@ -1,6 +1,8 @@
 #!/usr/bin/env ruby
 # frozen_string_literal: true
 
+$stdout.sync = true
+
 require 'optparse'
 
 TESTS_DIR = File.dirname(File.absolute_path(__FILE__))

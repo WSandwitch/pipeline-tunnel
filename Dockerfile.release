@@ -1,0 +1,21 @@
+FROM alpine:3.19 AS builder
+RUN apk add --no-cache \
+    build-base \
+    cmake \
+    openssl-dev \
+    linux-headers \
+    musl-dev
+COPY . /src
+WORKDIR /src
+RUN cmake -B /build -DCMAKE_BUILD_TYPE=Release \
+    && cmake --build /build -j"$(nproc)" \
+    && cmake --build /build --target pack
+
+FROM alpine:3.19
+RUN apk add --no-cache \
+    libssl3 \
+    libcrypto3 \
+    libstdc++
+COPY --from=builder /src/out/ /app/
+WORKDIR /app
+CMD ["./ppltunnel-server"]
