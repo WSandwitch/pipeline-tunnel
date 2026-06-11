@@ -21,8 +21,8 @@ options = {
 op = OptionParser.new do |o|
   o.banner = "Usage: #{$PROGRAM_NAME} -S <build_dir> -M <mod_dir> [options] <command> [-- <extra>...]"
 
-  o.on('-S', '--server-dir DIR', 'Path to build dir with ppltunnel-server/client') { |v| options[:build_dir] = v }
-  o.on('-M', '--module-dir DIR', 'Path to .so modules dir') { |v| options[:mod_dir] = v }
+  o.on('-S', '--server-dir DIR', 'Path to build dir with ppltunnel-server/client') { |v| options[:build_dir] = File.absolute_path(v) }
+  o.on('-M', '--module-dir DIR', 'Path to .so modules dir') { |v| options[:mod_dir] = File.absolute_path(v) }
   o.on('--workers LIST', 'Worker counts (comma-separated, 0=auto)') { |v| options[:workers] = v.split(',').map(&:to_i) }
   o.on('-v', '--verbose', 'Print each command before running') { options[:verbose] = true }
   o.on('-q', '--quiet', 'Only print summary') { options[:quiet] = true }
@@ -141,21 +141,27 @@ configs.each do |cfg|
     total += 1
     wt = w == 0 ? '0' : w.to_s
     cmd = cmd_parts.dup
+    # if command is a relative path, resolve it relative to TESTS_DIR
+    cmd[0] = File.join(TESTS_DIR, cmd[0]) unless cmd[0].start_with?('/')
+    # prepend ruby if script is not executable
+    cmd.unshift('ruby') unless File.executable?(cmd[0])
     cmd.concat(cmd_extra) if cmd_extra
+    cmd << '-S' << options[:build_dir] if options[:build_dir]
+    cmd << '-M' << options[:mod_dir] if options[:mod_dir]
     cmd << '-C' << cfg
     cmd << '-t' << wt
 
     cmd_str = cmd.map { |s| s.include?(' ') || s.include?(';') || s.include?('|') || s.include?('"') ? "\"#{s}\"" : s }.join(' ')
     puts cmd_str if options[:verbose]
 
+    unless options[:quiet]
+      puts "#{cfg} t=#{wt}"
+    end
+
     system(*cmd)
     ok = $?.exitstatus == 0
     passed += 1 if ok
     failed_configs << [cfg, w] unless ok
-
-    unless options[:quiet]
-      puts "#{ok ? 'PASS' : 'FAIL'}  #{cfg} t=#{wt}"
-    end
 
     if !ok && options[:stop_on_fail]
       puts "STOP-ON-FAIL"

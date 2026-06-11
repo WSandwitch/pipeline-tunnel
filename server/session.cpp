@@ -94,7 +94,7 @@ void Session::on_data(const uint8_t *data, size_t len) {
                         handle_auth2_challenge(pkt);
                     break;
                 case MSG_RECONNECT:
-                    if (state_ == AWAIT_CONNECT_REQ || state_ == AWAIT_CHAIN_CREATE)
+                    if (state_ == AWAIT_AUTH1_CHALLENGE_RESP || state_ == AWAIT_CONNECT_REQ || state_ == AWAIT_CHAIN_CREATE)
                         handle_reconnect(pkt);
                     break;
                 default:
@@ -492,8 +492,10 @@ void Session::handle_chain_create(const Packet &pkt) {
         }
     }
 
-    // Send MSG_CHAIN_READY
-    Packet ready = Protocol::make_msg(MSG_CHAIN_READY);
+    // Send MSG_CHAIN_READY (includes session_id for reconnect support)
+    std::vector<uint8_t> ready_payload(9, 0x01);  // status + session_id
+    memcpy(&ready_payload[1], &session_id_, 8);
+    Packet ready = Protocol::make_msg(MSG_CHAIN_READY, ready_payload.data(), 9);
     send_control(ready);
     log_info("session %llx: MSG_CHAIN_READY sent", (unsigned long long)session_id_);
 
@@ -847,6 +849,27 @@ void Session::register_data_connection_reader(size_t idx) {
             size_t old = dc.read_buf.size();
             dc.read_buf.resize(old + MAX_PACKET_SIZE);
             ssize_t n = read(dc.fd, dc.read_buf.data() + old, MAX_PACKET_SIZE);
+            if (n == 0) {
+                kernel_->del_fd(dc.fd);
+                dc.read_buf.clear();
+                dc.read_offset = 0;
+                dc.fd = -1;
+                on_disconnect();
+                g_paused_sessions[session_id_] = self;
+                return;
+            }
+            if (n < 0) {
+                if (errno != EAGAIN && errno != EWOULDBLOCK) {
+                    kernel_->del_fd(dc.fd);
+                    dc.read_buf.clear();
+                    dc.read_offset = 0;
+                    dc.fd = -1;
+                    on_disconnect();
+                    g_paused_sessions[session_id_] = self;
+                }
+                dc.read_buf.resize(old);
+                return;
+            }
             if (n > 0) {
                 last_wire_activity_ = std::chrono::steady_clock::now();
                 heartbeating_ = false;
@@ -1228,6 +1251,9 @@ bool Session::reconnect(int new_client_fd) {
     auto self = shared_from_this();
     g_paused_sessions.erase(session_id_);
 
+    data_connections_[0].writer.clear();
+    data_connections_[0].read_buf.clear();
+    data_connections_[0].read_offset = 0;
     data_connections_[0].fd = client_fd_;
     chain_ref_.out_fds = {client_fd_};
     chain_ref_.out_writer = &data_connections_[0].writer;
@@ -1236,7 +1262,7 @@ bool Session::reconnect(int new_client_fd) {
     // Defer target reconnect until all data connections are ready
     // (secondary connections must be re-established first)
     pending_reconnect_targets_ = std::move(saved_targets_);
-
+    process_pending_reconnect_targets();
     paused_ = false;
 
     log_info("session %llx: resumed after reconnect", (unsigned long long)session_id_);
