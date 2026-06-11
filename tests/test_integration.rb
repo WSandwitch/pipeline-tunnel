@@ -102,9 +102,12 @@ def thread_args(n)
 end
 
 def start_tunnel(svr_port, cli_port, tgt_port)
+  svr_log = Tempfile.new(%w[ppltunnel-server- .log])
+  cli_log = Tempfile.new(%w[ppltunnel-client- .log])
+
   svr = Process.spawn(SERVER, "-l#{HOST}:#{svr_port}", "-A#{PASS}",
                       "-M#{MPATH}", *thread_args($options[:threads]),
-                      %i[out err] => File::NULL)
+                      out: svr_log, err: [:child, :out])
   wait_port_listen(svr_port)
 
   chain = $options[:config] ? ";#{$options[:config]}" : ''
@@ -112,9 +115,9 @@ def start_tunnel(svr_port, cli_port, tgt_port)
                       "-M#{MPATH}",
                       "#{HOST}:#{svr_port},#{PASS}#{chain}",
                       *thread_args($options[:threads]),
-                      %i[out err] => File::NULL)
+                      out: cli_log, err: [:child, :out])
   wait_port_listen(cli_port)
-  [svr, cli]
+  [svr, cli, svr_log, cli_log]
 end
 
 def stop_procs(*pids)
@@ -129,11 +132,22 @@ end
 def with_tunnel(tgt_port)
   svr_port = find_free_port(32_001, 33_000)
   cli_port = find_free_port(33_001, 34_000)
+  svr_log = cli_log = nil
   begin
-    svr, cli = start_tunnel(svr_port, cli_port, tgt_port)
+    svr, cli, svr_log, cli_log = start_tunnel(svr_port, cli_port, tgt_port)
     yield cli_port
+  rescue => e
+    [svr_log, cli_log].compact.each do |f|
+      f.rewind
+      data = f.read
+      unless data.empty?
+        log "  # #{File.basename(f.path)}:\n#{data.each_line.map { |l| "  # #{l}" }.join}"
+      end
+    end
+    raise
   ensure
     stop_procs(cli, svr)
+    [svr_log, cli_log].compact.each { |f| f.close rescue nil }
     killall
   end
 end
