@@ -109,10 +109,12 @@ struct WriteBuffer {
     }
 
     bool empty() const {
+        std::lock_guard<std::mutex> lock(*mtx_);
         return chunks.empty();
     }
 
     size_t size() const {
+        std::lock_guard<std::mutex> lock(*mtx_);
         return total_size;
     }
 

@@ -28,6 +28,7 @@ options = {
   config: nil,
   threads: 1,
   quiet: false,
+  verbose: false,
   test_types: %w[short long blocking bidi blocking_bidi],
 }
 
@@ -38,6 +39,7 @@ op = OptionParser.new do |o|
   o.on('-C', '--config CONFIG', 'Chain config string') { |v| options[:config] = v }
   o.on('-t', '--threads N', Integer, 'Worker thread count (0=auto)') { |v| options[:threads] = v }
   o.on('-q', '--quiet', 'Suppress output') { options[:quiet] = true }
+  o.on('-v', '--verbose', 'Print commands before execution') { options[:verbose] = true }
 end
 rest = op.parse(ARGV)
 options[:test_types] = rest unless rest.empty?
@@ -105,17 +107,23 @@ def start_tunnel(svr_port, cli_port, tgt_port)
   svr_log = Tempfile.new(%w[ppltunnel-server- .log])
   cli_log = Tempfile.new(%w[ppltunnel-client- .log])
 
-  svr = Process.spawn(SERVER, "-l#{HOST}:#{svr_port}", "-A#{PASS}",
-                      "-M#{MPATH}", *thread_args($options[:threads]),
-                      out: svr_log, err: [:child, :out])
+  svr_argv = [SERVER, "-l#{HOST}:#{svr_port}", "-A#{PASS}",
+              "-M#{MPATH}", *thread_args($options[:threads])]
+  if $options[:verbose]
+    $stderr.puts "  + #{svr_argv.map { |a| a.include?(' ') ? "'#{a}'" : a }.join(' ')} 2>&1 | tee #{svr_log.path}"
+  end
+  svr = Process.spawn(*svr_argv, out: svr_log, err: [:child, :out])
   wait_port_listen(svr_port)
 
   chain = $options[:config] ? ";#{$options[:config]}" : ''
-  cli = Process.spawn(CLIENT, "-L#{HOST}:#{cli_port}:#{HOST}:#{tgt_port}",
-                      "-M#{MPATH}",
-                      "#{HOST}:#{svr_port},#{PASS}#{chain}",
-                      *thread_args($options[:threads]),
-                      out: cli_log, err: [:child, :out])
+  cli_argv = [CLIENT, "-L#{HOST}:#{cli_port}:#{HOST}:#{tgt_port}",
+              "-M#{MPATH}",
+              "#{HOST}:#{svr_port},#{PASS}#{chain}",
+              *thread_args($options[:threads])]
+  if $options[:verbose]
+    $stderr.puts "  + #{cli_argv.map { |a| a.include?(' ') ? "'#{a}'" : a }.join(' ')} 2>&1 | tee #{cli_log.path}"
+  end
+  cli = Process.spawn(*cli_argv, out: cli_log, err: [:child, :out])
   wait_port_listen(cli_port)
   [svr, cli, svr_log, cli_log]
 end

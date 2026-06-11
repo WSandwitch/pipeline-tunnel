@@ -39,9 +39,15 @@ void ThreadPool::worker_loop() {
             if (shutdown_.load()) return;
             task = std::move(queue_.front());
             queue_.pop_front();
+            if (task.order_mutex) {
+                task.order_mutex->lock();
+            }
         }
         if (task.fn) {
             try { task.fn(); } catch (...) {}
+        }
+        if (task.order_mutex) {
+            task.order_mutex->unlock();
         }
     }
 }

@@ -199,7 +199,7 @@ void Chain::push_packet(const uint8_t *data, size_t len, int src_idx, int dir) {
             cur_src = g_ctx.src_idx;
         }
         task_done();
-    });
+    }, &dir_order_mutex_[dir]);
 }
 
 void Chain::task_done() {

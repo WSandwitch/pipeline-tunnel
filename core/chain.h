@@ -54,6 +54,7 @@ private:
     std::mutex _drain_mtx;
     std::condition_variable _drain_cv;
     std::unordered_map<Module*, int> _requested_outputs;
+    std::mutex dir_order_mutex_[2];
 
     void task_done();
 };
