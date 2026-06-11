@@ -1,6 +1,7 @@
 #!/bin/sh
 set -e
 
+APP_DIR="$(cd "$(dirname "$0")/.." && pwd)"
 IMAGE=pppltunnel:dev
 USER_ID=$(id -u)
 GROUP_ID=$(id -g)
@@ -15,6 +16,7 @@ if ! docker image inspect "$IMAGE" >/dev/null 2>&1; then
 elif [ ! -f "$STAMP_FILE" ] || [ "Dockerfile.dev" -nt "$STAMP_FILE" ]; then
   NEEDS_BUILD=true
 fi
+cd "$APP_DIR"
 if [ "$NEEDS_BUILD" = true ]; then
   docker build -f Dockerfile.dev -t "$IMAGE" .
   touch "$STAMP_FILE"
@@ -22,7 +24,7 @@ fi
 
 exec docker run --rm \
   --user "$USER_ID:$GROUP_ID" \
-  -v "$(pwd):/app" \
+  -v "$APP_DIR:/app" \
   -v "$BUILD_DIR:/app/build" \
   -v /tmp:/tmp \
-  "$IMAGE" ruby /app/tests/tester.rb -S /app/build -M /app/build/tests/test_modules "$@"
+  "$IMAGE" "$@"
