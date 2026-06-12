@@ -1,16 +1,17 @@
 #!/bin/sh
 set -e
 
-cmd="$(dirname "$0")/tester.rb -S /tmp/modtunnel-hostbuild -M /tmp/modtunnel-hostbuild/tests/test_modules"
+SCRIPT_DIR="$(dirname "$0")"
+cmd="ruby /app/tests/tester.rb -S /app/build -M /app/build/tests/test_modules"
 
 case "${1:-}" in
   "")
-    exec $cmd --list-configs
+    exec "$SCRIPT_DIR/runindocker.sh" $cmd --list-configs
     ;;
   all)
-    exec $cmd test_benchmark.rb
+    exec "$SCRIPT_DIR/runindocker.sh" $cmd test_benchmark.rb
     ;;
   *)
-    exec $cmd test_benchmark.rb "$@"
+    exec "$SCRIPT_DIR/runindocker.sh" $cmd test_benchmark.rb "$@"
     ;;
 esac

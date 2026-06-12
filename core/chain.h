@@ -47,8 +47,8 @@ public:
 
     void check_module_heartbeats(int system_interval_ms);
 
-    static constexpr int WATERMARK_HIGH = 4;
-    static constexpr int WATERMARK_LOW = 2;
+    static constexpr int BACKPRESSURE_HIGH = 2;
+    static constexpr int BACKPRESSURE_LOW = 1;
 
 private:
     KernelAPI *_kapi = nullptr;

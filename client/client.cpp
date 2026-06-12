@@ -786,13 +786,16 @@ void Client::handle_auth2_challenge(const Packet &pkt) {
     chain_->set_pause_callback(1, [this](bool pause) {
         std::lock_guard<std::mutex> lock(data_mtx_);
         pending_io_.push_back([this, pause]() {
-            if (tcp_fd_ >= 0) {
-                if (pause)
-                    kernel_->mod_fd_events(tcp_fd_, 0, EPOLLIN);
-                else
-                    kernel_->mod_fd_events(tcp_fd_, EPOLLIN, 0);
+            for (auto &dc : data_connections_) {
+                if (dc.fd >= 0) {
+                    if (pause)
+                        kernel_->mod_fd_events(dc.fd, 0, EPOLLIN);
+                    else
+                        kernel_->mod_fd_events(dc.fd, EPOLLIN, 0);
+                }
             }
         });
+        kernel_->wakeup();
     });
 
     // Setup data connection on wire fd

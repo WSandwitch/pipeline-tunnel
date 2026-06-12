@@ -140,8 +140,6 @@ struct ChainContext {
 
 thread_local ChainContext g_ctx;
 
-static constexpr int BACKPRESSURE_MODULE_LIMIT = 2;
-
 void Chain::push_packet(const uint8_t *data, size_t len, int src_idx, int dir) {
     if (_cancelled.load()) {
         free(const_cast<uint8_t*>(data));
@@ -172,8 +170,8 @@ void Chain::enqueue_module(Module *mod, const uint8_t *data, size_t len,
         return;
     }
 
-    _inflight.fetch_add(1);
     mod->pending[dir].fetch_add(1);
+    _inflight.fetch_add(1);
     check_backpressure(dir);
 
     _pool->enqueue([this, data, len, src_idx, dir, output_port, mod, owner,
@@ -234,11 +232,11 @@ void Chain::check_backpressure(int dir) {
     for (auto &m : _clone_modules)
         if (auto v = m->pending[dir].load(); v > max_p) max_p = v;
 
-    if (max_p > BACKPRESSURE_MODULE_LIMIT && !_backpressure_paused[dir]) {
+    if (max_p > BACKPRESSURE_HIGH && !_backpressure_paused[dir]) {
         _backpressure_paused[dir] = true;
         if (_pause_cb[dir]) _pause_cb[dir](true);
     }
-    if (max_p == 0 && _backpressure_paused[dir]) {
+    if (max_p <= BACKPRESSURE_LOW && _backpressure_paused[dir]) {
         _backpressure_paused[dir] = false;
         if (_pause_cb[dir]) _pause_cb[dir](false);
     }

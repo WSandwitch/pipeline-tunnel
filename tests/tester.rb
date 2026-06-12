@@ -47,6 +47,7 @@ end
 
 # Parse options (leftovers are the command)
 rest = []
+unknown = []
 loop do
   begin
     leftovers = op.parse(ARGV)
@@ -54,13 +55,18 @@ loop do
     break
   rescue OptionParser::InvalidOption => e
     opt = e.args.first
-    rest << opt if opt&.start_with?('-')
-    idx = ARGV.index(opt)
-    ARGV.delete_at(idx) if idx
+    if opt&.start_with?('-')
+      idx = ARGV.index(opt)
+      unknown << opt
+      if idx && idx + 1 < ARGV.length && !ARGV[idx + 1].start_with?('-')
+        unknown << ARGV.delete_at(idx + 1)
+      end
+      ARGV.delete_at(idx) if idx
+    end
   end
 end
 
-cmd_parts = rest
+cmd_parts = rest + unknown
 
 if options[:build_dir].nil? || options[:mod_dir].nil?
   puts op.help
