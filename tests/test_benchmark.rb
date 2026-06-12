@@ -145,7 +145,10 @@ begin
     tunnels << { cli_port: cli_port, svr_pid: svr, cli_pid: cli }
   end
 
-  threads = tunnels.map do |t|
+  $stderr.puts "[#{options[:config]}] Starting #{options[:direction]} " \
+       "(#{options[:clients]} clients, P=#{options[:parallel]}, #{options[:duration]}s)..."
+
+  threads = tunnels.map.with_index do |t, i|
     Thread.new do
       port = t[:cli_port]
       args = ['iperf3', '-c', HOST, '-p', port.to_s,
@@ -154,7 +157,9 @@ begin
       when 'reverse' then args << '-R'
       when 'bidir' then args << '--bidir'
       end
+      $stderr.puts "  client #{i + 1} starting on port #{port}..."
       output = IO.popen(args, err: [:child, :out], &:read)
+      $stderr.puts "  client #{i + 1} done."
       rates = parse_iperf_bitrate(output)
       { output: output, rates: rates }
     end
