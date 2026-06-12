@@ -12,6 +12,6 @@ case "${1:-}" in
     exec "$SCRIPT_DIR/runindocker.sh" $cmd test_integration.rb
     ;;
   *)
-    exec "$SCRIPT_DIR/runindocker.sh" $cmd "$@"
+    exec "$SCRIPT_DIR/runindocker.sh" $cmd "$@" test_integration.rb
     ;;
 esac

@@ -27,7 +27,7 @@ op = OptionParser.new do |o|
   o.on('-S', '--server-dir DIR', 'Path to build dir with ppltunnel-server/client') { |v| options[:build_dir] = File.absolute_path(v) }
   o.on('-M', '--module-dir DIR', 'Path to .so modules dir') { |v| options[:mod_dir] = File.absolute_path(v) }
   o.on('-C', '--config CONFIG', 'Only run configs matching this module/config') { |v| options[:config] = v }
-  o.on('--workers LIST', 'Worker counts (comma-separated, 0=auto)') { |v| options[:workers] = v.split(',').map(&:to_i) }
+  o.on('-t', '--workers LIST', 'Worker counts (comma-separated, 0=auto)') { |v| options[:workers] = v.split(',').map(&:to_i) }
   o.on('-v', '--verbose', 'Print each command before running') { options[:verbose] = true }
   o.on('-q', '--quiet', 'Only print summary') { options[:quiet] = true }
   o.on('--stop-on-fail', 'Stop on first failure') { options[:stop_on_fail] = true }

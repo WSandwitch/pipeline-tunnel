@@ -11,6 +11,6 @@ case "${1:-}" in
     exec $cmd test_benchmark.rb
     ;;
   *)
-    exec $cmd "$@"
+    exec $cmd "$@" test_benchmark.rb
     ;;
 esac
