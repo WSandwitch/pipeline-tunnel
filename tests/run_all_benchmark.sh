@@ -5,7 +5,7 @@ cmd="$(dirname "$0")/tester.rb -S /tmp/modtunnel-hostbuild -M /tmp/modtunnel-hos
 
 case "${1:-}" in
   "")
-    exec $cmd --list-modules
+    exec $cmd --list-configs
     ;;
   all)
     exec $cmd test_benchmark.rb

@@ -104,16 +104,11 @@ end
 configs = []
 
 module_names.each do |m|
+  configs << m
   cfg_file = File.join(MODULE_CONF_DIR, "#{m}.cfg.list")
   if File.exist?(cfg_file)
     lines = File.readlines(cfg_file, chomp: true).map(&:strip).reject { |l| l.empty? || l.start_with?('#') }
-    if lines.empty?
-      configs << m
-    else
-      lines.each { |l| configs << "#{m}|#{l}" }
-    end
-  else
-    configs << m
+    lines.each { |l| configs << "#{m}|#{l}" }
   end
 end
 

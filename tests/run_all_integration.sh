@@ -6,7 +6,7 @@ cmd="ruby /app/tests/tester.rb -S /app/build -M /app/build/tests/test_modules"
 
 case "${1:-}" in
   "")
-    exec "$SCRIPT_DIR/runindocker.sh" $cmd --list-modules
+    exec "$SCRIPT_DIR/runindocker.sh" $cmd --list-configs
     ;;
   all)
     exec "$SCRIPT_DIR/runindocker.sh" $cmd test_integration.rb
