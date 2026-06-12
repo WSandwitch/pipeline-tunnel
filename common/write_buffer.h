@@ -56,9 +56,12 @@ struct WriteBuffer {
     int write(int fd, const uint8_t *data, size_t len) {
         std::lock_guard<std::mutex> lock(*mtx_);
         if (!chunks.empty()) {
-            chunks.emplace_back(data, data + len);
-            total_size += len;
-            return 1;
+            flush_unlocked(fd);
+            if (!chunks.empty()) {
+                chunks.emplace_back(data, data + len);
+                total_size += len;
+                return 1;
+            }
         }
         ssize_t n = ::write(fd, data, len);
         if (n < 0) {
@@ -79,6 +82,10 @@ struct WriteBuffer {
 
     bool flush(int fd) {
         std::lock_guard<std::mutex> lock(*mtx_);
+        return flush_unlocked(fd);
+    }
+
+    bool flush_unlocked(int fd) {
         if (chunks.empty()) return true;
         while (!chunks.empty()) {
             auto &front = chunks.front();

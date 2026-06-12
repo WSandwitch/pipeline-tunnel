@@ -140,6 +140,7 @@ private:
     bool heartbeating_ = false;
     int heartbeat_interval_ms_;
 
+    bool dc_paused_ = false;
     std::mutex data_mtx_;
     std::vector<std::function<void()>> pending_io_;
 

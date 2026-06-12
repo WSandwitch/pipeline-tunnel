@@ -72,9 +72,7 @@ bool Client::connect_to_server() {
         return false;
     }
     set_nonblock(tcp_fd_);
-    int bufsz = 1048576;
-    setsockopt(tcp_fd_, SOL_SOCKET, SO_SNDBUF, &bufsz, sizeof(bufsz));
-    setsockopt(tcp_fd_, SOL_SOCKET, SO_RCVBUF, &bufsz, sizeof(bufsz));
+    // Let kernel auto-tune socket buffers
     log_info("client connected to %s:%d", server_host_.c_str(), server_port_);
     return true;
 }
@@ -464,9 +462,6 @@ void Client::on_listener_accept(int cfd, const struct sockaddr_in &addr) {
     log_info("client: external connection from %s (pending conn_id)", sockaddr_to_str(addr).c_str());
 
     set_nonblock(cfd);
-    int bufsz = 1048576;
-    setsockopt(cfd, SOL_SOCKET, SO_SNDBUF, &bufsz, sizeof(bufsz));
-
     pending_ext_.push_back({cfd, addr});
 
     std::vector<uint8_t> payload;
@@ -700,16 +695,13 @@ void Client::handle_auth2_challenge(const Packet &pkt) {
         frame.push_back(0); // type=0 (WIRE_DATA)
         frame.insert(frame.end(), data, data + len);
         int wret = self->data_connections_[dc_idx].writer.write(fd, frame.data(), frame.size());
-        {
+        if (wret > 0) {
             std::lock_guard<std::mutex> lock(self->data_mtx_);
             self->pending_io_.push_back([self, dc_idx]() {
                 if ((size_t)dc_idx < self->data_connections_.size() &&
                     self->data_connections_[dc_idx].fd >= 0)
                     self->register_data_conn_epollout(dc_idx, self->data_connections_[dc_idx].fd);
             });
-        }
-        if (wret > 0) {
-            std::lock_guard<std::mutex> lock(self->data_mtx_);
             self->pending_io_.push_back([self, dc_idx]() {
                 auto &w = self->data_connections_[dc_idx].writer;
                 if (w.size() > w.high_water) {
@@ -722,6 +714,7 @@ void Client::handle_auth2_challenge(const Packet &pkt) {
                     }
                 }
             });
+            self->kernel_->wakeup();
         } else {
             std::lock_guard<std::mutex> lock(self->data_mtx_);
             self->pending_io_.push_back([self, dc_idx]() {
@@ -736,6 +729,7 @@ void Client::handle_auth2_challenge(const Packet &pkt) {
                     }
                 }
             });
+            self->kernel_->wakeup();
         }
         free(const_cast<uint8_t*>(data));
         return 0;
@@ -936,9 +930,7 @@ void Client::open_secondary_connections() {
             continue;
         }
         set_nonblock(fd);
-        int bufsz = 1048576;
-        setsockopt(fd, SOL_SOCKET, SO_SNDBUF, &bufsz, sizeof(bufsz));
-        setsockopt(fd, SOL_SOCKET, SO_RCVBUF, &bufsz, sizeof(bufsz));
+        // Let kernel auto-tune socket buffers
 
         // Send 9-byte handshake: [session_id:8][output_idx:1]
         uint8_t handshake[9];
@@ -1197,6 +1189,26 @@ void Client::check_heartbeat() {
 }
 
 void Client::process_pending_io() {
+    // Backpressure: pause target readers when data connection writer grows too large
+    {
+        size_t dc_size = 0;
+        for (auto &dc : data_connections_) dc_size += dc.writer.size();
+        if (dc_size > 1024 * 1024 && !dc_paused_) {
+            dc_paused_ = true;
+            for (auto &[id, conn] : conns_) {
+                (void)id;
+                if (conn.fd >= 0)
+                    kernel_->mod_fd_events(conn.fd, 0, EPOLLIN);
+            }
+        } else if (dc_size < 256 * 1024 && dc_paused_) {
+            dc_paused_ = false;
+            for (auto &[id, conn] : conns_) {
+                (void)id;
+                if (conn.fd >= 0)
+                    kernel_->mod_fd_events(conn.fd, EPOLLIN, 0);
+            }
+        }
+    }
     std::vector<std::function<void()>> batch;
     {
         std::lock_guard<std::mutex> lock(data_mtx_);

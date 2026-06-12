@@ -245,6 +245,7 @@ void Session::handle_auth2_response(const Packet &pkt) {
                         if (it != self->targets_.end() && self->chain_ref_.register_in_epollout)
                             self->chain_ref_.register_in_epollout(self->chain_ref_.cb_ctx, conn_id);
                     });
+                    self->kernel_->wakeup();
                 }
                 if (need_pause) {
                     std::lock_guard<std::mutex> lock(self->data_mtx_);
@@ -255,6 +256,7 @@ void Session::handle_auth2_response(const Packet &pkt) {
                             self->send_pause(conn_id);
                         }
                     });
+                    self->kernel_->wakeup();
                 }
                 free(const_cast<uint8_t*>(data));
                 return ret;
@@ -289,6 +291,7 @@ void Session::handle_auth2_response(const Packet &pkt) {
                         self->data_connections_[dc_idx].fd >= 0)
                         self->register_data_conn_epollout(dc_idx, fd);
                 });
+                self->kernel_->wakeup();
             }
             if (ret > 0) {
                 std::lock_guard<std::mutex> lock(self->data_mtx_);
@@ -302,6 +305,7 @@ void Session::handle_auth2_response(const Packet &pkt) {
                         }
                     }
                 });
+                self->kernel_->wakeup();
             } else {
                 bool all_below = true;
                 for (auto &check_dc : self->data_connections_) {
@@ -322,6 +326,7 @@ void Session::handle_auth2_response(const Packet &pkt) {
                             }
                         }
                     });
+                    self->kernel_->wakeup();
                 }
             }
             free(const_cast<uint8_t*>(data));
@@ -1179,8 +1184,7 @@ bool Session::setup_tunnel_target(const std::string &target_addr, uint8_t conn_i
         return false;
     }
 
-    int bufsz = 1048576;
-    setsockopt(fd, SOL_SOCKET, SO_SNDBUF, &bufsz, sizeof(bufsz));
+    // Let kernel auto-tune the send buffer (tcp_wmem max = 4MB)
 
     int flags = fcntl(fd, F_GETFL, 0);
     fcntl(fd, F_SETFL, flags | O_NONBLOCK);
@@ -1435,6 +1439,28 @@ void Session::send_resume(uint8_t conn_id) {
 }
 
 void Session::process_pending_io() {
+    // Backpressure: pause target readers when data connection writer grows too large
+    {
+        size_t dc_size = 0;
+        for (auto &dc : data_connections_) dc_size += dc.writer.size();
+        if (dc_size > 1024 * 1024 && !dc_paused_) {
+            dc_paused_ = true;
+            std::lock_guard<std::mutex> lock(targets_mtx_);
+            for (auto &[cid, tgt] : targets_) {
+                (void)cid;
+                if (tgt.fd >= 0)
+                    kernel_->mod_fd_events(tgt.fd, 0, EPOLLIN);
+            }
+        } else if (dc_size < 256 * 1024 && dc_paused_) {
+            dc_paused_ = false;
+            std::lock_guard<std::mutex> lock(targets_mtx_);
+            for (auto &[cid, tgt] : targets_) {
+                (void)cid;
+                if (tgt.fd >= 0)
+                    kernel_->mod_fd_events(tgt.fd, EPOLLIN, 0);
+            }
+        }
+    }
     std::vector<std::function<void()>> batch;
     {
         std::lock_guard<std::mutex> lock(data_mtx_);

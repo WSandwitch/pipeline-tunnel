@@ -100,6 +100,7 @@ private:
     std::shared_ptr<Kernel> kernel_;
     std::shared_ptr<void> chain_guard_;
 
+    bool dc_paused_ = false;
     std::mutex data_mtx_;
     std::vector<std::function<void()>> pending_io_;
     void process_pending_io();

@@ -32,8 +32,11 @@ public:
     void start_workers(size_t count);
     ThreadPool &pool() { return pool_; }
 
+    void wakeup();  // wake up event loop from another thread
+
 private:
     int epoll_fd_ = -1;
+    int wake_fd_ = -1;
     std::atomic<bool> running_{false};
     static std::atomic<bool> stop_requested_;
 

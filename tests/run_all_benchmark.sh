@@ -1,5 +1,16 @@
 #!/bin/sh
 set -e
-BUILD_DIR=/tmp/modtunnel-hostbuild
-MOD_DIR="$BUILD_DIR/tests/test_modules"
-exec "$(dirname "$0")/tester.rb" -S "$BUILD_DIR" -M "$MOD_DIR" test_benchmark.rb
+
+cmd="$(dirname "$0")/tester.rb -S /tmp/modtunnel-hostbuild -M /tmp/modtunnel-hostbuild/tests/test_modules"
+
+case "${1:-}" in
+  "")
+    exec $cmd --list-modules
+    ;;
+  all)
+    exec $cmd test_benchmark.rb
+    ;;
+  *)
+    exec $cmd "$@"
+    ;;
+esac

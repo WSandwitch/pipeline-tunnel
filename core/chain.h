@@ -66,8 +66,12 @@ private:
     std::mutex dir_order_mutex_[2];
 
     PauseCallback _pause_cb[2];  // pause/resume callbacks per direction
+    bool _backpressure_paused[2] = {false, false};  // track per-direction pause state
 
     void task_done();
+    void enqueue_module(Module *mod, const uint8_t *data, size_t len,
+                        int src_idx, int dir, int output_port);
+    void check_backpressure(int dir);
 };
 
 #endif

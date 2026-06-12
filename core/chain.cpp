@@ -140,6 +140,8 @@ struct ChainContext {
 
 thread_local ChainContext g_ctx;
 
+static constexpr int BACKPRESSURE_MODULE_LIMIT = 2;
+
 void Chain::push_packet(const uint8_t *data, size_t len, int src_idx, int dir) {
     if (_cancelled.load()) {
         free(const_cast<uint8_t*>(data));
@@ -153,6 +155,17 @@ void Chain::push_packet(const uint8_t *data, size_t len, int src_idx, int dir) {
         }
         return;
     }
+    if (!_owner.lock()) {
+        free(const_cast<uint8_t*>(data));
+        return;
+    }
+
+    Module *first = dir == 0 ? _modules[0].get() : _modules.back().get();
+    enqueue_module(first, data, len, src_idx, dir, -1);
+}
+
+void Chain::enqueue_module(Module *mod, const uint8_t *data, size_t len,
+                           int src_idx, int dir, int output_port) {
     auto owner = _owner.lock();
     if (!owner) {
         free(const_cast<uint8_t*>(data));
@@ -160,48 +173,49 @@ void Chain::push_packet(const uint8_t *data, size_t len, int src_idx, int dir) {
     }
 
     _inflight.fetch_add(1);
+    mod->pending[dir].fetch_add(1);
+    check_backpressure(dir);
 
-    _pool->enqueue([this, data, len, src_idx, dir, owner, om = &dir_order_mutex_[dir]]() {
+    _pool->enqueue([this, data, len, src_idx, dir, output_port, mod, owner,
+                   om = &dir_order_mutex_[dir]]() {
         if (_cancelled.load()) {
+            mod->pending[dir].fetch_sub(1);
+            check_backpressure(dir);
             om->unlock();
             free(const_cast<uint8_t*>(data));
             task_done();
             return;
         }
 
-        const uint8_t *cur_data = data;
-        size_t cur_len = len;
-        int cur_src = src_idx;
-        g_ctx = ChainContext{cur_data, cur_len, cur_src, dir, -1, nullptr};
+        g_ctx = ChainContext{data, len, src_idx, dir, output_port, nullptr};
 
-        Module *mod = dir == 0 ? _modules[0].get()
-                               : (_modules.empty() ? nullptr : _modules.back().get());
-        // Transitional unlock: release order_mutex after first dir_mutex acquisition
-        bool om_released = false;
-        while (mod) {
-            g_ctx.next_mod = nullptr;
-            g_ctx.data = cur_data;
-            g_ctx.len = cur_len;
-            {
-                std::lock_guard<std::mutex> lock(mod->hb_mutex);
-                mod->last_activity = std::chrono::steady_clock::now();
-            }
-            std::lock_guard<std::mutex> lock(mod->dir_mutex[dir]);
-            if (!om_released) {
-                om->unlock();
-                om_released = true;
-            }
-            int ret = mod->base->process_fn(mod->ctx, dir, cur_src);
-            if (ret < 0) {
-                log_debug("chain: module process_fn returned %d, dropping packet", ret);
-                break;
-            }
-            mod = g_ctx.next_mod;
-            cur_data = g_ctx.data;
-            cur_len = g_ctx.len;
-            cur_src = g_ctx.src_idx;
+        {
+            std::lock_guard<std::mutex> lock(mod->hb_mutex);
+            mod->last_activity = std::chrono::steady_clock::now();
         }
-        if (!om_released) om->unlock();
+
+        std::lock_guard<std::mutex> lock(mod->dir_mutex[dir]);
+        om->unlock();
+
+        int ret = mod->base->process_fn(mod->ctx, dir, src_idx);
+
+        mod->pending[dir].fetch_sub(1);
+        check_backpressure(dir);
+
+        if (ret < 0) {
+            log_debug("chain: module process_fn returned %d, dropping packet", ret);
+            task_done();
+            return;
+        }
+
+        // Reverse chaining: write_packet(dir=1, dst=0) sets g_ctx.next_mod
+        if (g_ctx.next_mod) {
+            Module *next = g_ctx.next_mod;
+            g_ctx.next_mod = nullptr;
+            enqueue_module(next, g_ctx.data, g_ctx.len,
+                          g_ctx.src_idx, dir, g_ctx.output_port);
+        }
+
         task_done();
     }, &dir_order_mutex_[dir]);
 }
@@ -210,6 +224,23 @@ void Chain::task_done() {
     if (_inflight.fetch_sub(1) == 1) {
         std::lock_guard<std::mutex> lock(_drain_mtx);
         _drain_cv.notify_all();
+    }
+}
+
+void Chain::check_backpressure(int dir) {
+    int max_p = 0;
+    for (auto &m : _modules)
+        if (auto v = m->pending[dir].load(); v > max_p) max_p = v;
+    for (auto &m : _clone_modules)
+        if (auto v = m->pending[dir].load(); v > max_p) max_p = v;
+
+    if (max_p > BACKPRESSURE_MODULE_LIMIT && !_backpressure_paused[dir]) {
+        _backpressure_paused[dir] = true;
+        if (_pause_cb[dir]) _pause_cb[dir](true);
+    }
+    if (max_p == 0 && _backpressure_paused[dir]) {
+        _backpressure_paused[dir] = false;
+        if (_pause_cb[dir]) _pause_cb[dir](false);
     }
 }
 
@@ -363,23 +394,7 @@ int Chain::write_packet_impl(Module *mod, int dst, const uint8_t *data, size_t l
     if (dst >= 0 && (size_t)dst < mod->outputs.size()) {
         if (mod->outputs[dst]) {
             Module *m = mod->outputs[dst];
-            while (m) {
-                g_ctx.next_mod = nullptr;
-                g_ctx.data = data;
-                g_ctx.len = len;
-                {
-                    std::lock_guard<std::mutex> lock(m->hb_mutex);
-                    m->last_activity = std::chrono::steady_clock::now();
-                }
-                {
-                    std::lock_guard<std::mutex> lock(m->dir_mutex[g_ctx.dir]);
-                    int ret = m->base->process_fn(m->ctx, g_ctx.dir, g_ctx.src_idx);
-                    if (ret < 0) return ret;
-                }
-                m = g_ctx.next_mod;
-                data = g_ctx.data;
-                len = g_ctx.len;
-            }
+            enqueue_module(m, data, len, g_ctx.src_idx, g_ctx.dir, g_ctx.output_port);
             return 0;
         }
     }

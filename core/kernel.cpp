@@ -1,6 +1,7 @@
 #include "kernel.h"
 #include "common/logger.h"
 #include <sys/epoll.h>
+#include <sys/eventfd.h>
 #include <unistd.h>
 #include <cstring>
 #include <signal.h>
@@ -16,6 +17,17 @@ Kernel::Kernel() {
     if (epoll_fd_ < 0) {
         log_error("epoll_create1: %s", strerror(errno));
     }
+    wake_fd_ = eventfd(0, EFD_NONBLOCK);
+    if (wake_fd_ < 0) {
+        log_error("eventfd: %s", strerror(errno));
+    } else {
+        struct epoll_event ev;
+        ev.events = EPOLLIN;
+        ev.data.u64 = (uint64_t)wake_fd_;
+        if (epoll_ctl(epoll_fd_, EPOLL_CTL_ADD, wake_fd_, &ev) < 0) {
+            log_error("epoll_ctl add wake_fd: %s", strerror(errno));
+        }
+    }
     struct sigaction sa;
     memset(&sa, 0, sizeof(sa));
     sa.sa_handler = sigint_handler;
@@ -25,8 +37,17 @@ Kernel::Kernel() {
 
 Kernel::~Kernel() {
     stop();
+    if (wake_fd_ >= 0)
+        close(wake_fd_);
     if (epoll_fd_ >= 0)
         close(epoll_fd_);
+}
+
+void Kernel::wakeup() {
+    if (wake_fd_ >= 0) {
+        uint64_t val = 1;
+        ::write(wake_fd_, &val, sizeof(val));
+    }
 }
 
 void Kernel::add_fd_handler(int fd, EventCallback callback, uint32_t events) {
@@ -113,6 +134,13 @@ void Kernel::event_loop() {
         for (int i = 0; i < nfds; i++) {
             int fd = (int)events[i].data.u64;
             uint32_t e = events[i].events;
+
+            // Consume eventfd wakeup
+            if (fd == wake_fd_) {
+                uint64_t val;
+                while (::read(wake_fd_, &val, sizeof(val)) > 0) {}
+                continue;
+            }
 
             // Process EPOLLIN first to drain data before handling hangup
             if (e & EPOLLIN) {
