@@ -148,6 +148,7 @@ begin
   $stderr.puts "[#{options[:config]}] Starting #{options[:direction]} " \
        "(#{options[:clients]} clients, P=#{options[:parallel]}, #{options[:duration]}s)..."
 
+  mutex = Mutex.new
   threads = tunnels.map.with_index do |t, i|
     Thread.new do
       port = t[:cli_port]
@@ -157,23 +158,25 @@ begin
       when 'reverse' then args << '-R'
       when 'bidir' then args << '--bidir'
       end
-      $stderr.puts "  client #{i + 1} starting on port #{port}..."
-      output = IO.popen(args, err: [:child, :out], &:read)
-      $stderr.puts "  client #{i + 1} done."
+      mutex.synchronize { $stderr.puts "  client #{i + 1} starting on port #{port}..." }
+      lines = []
+      IO.popen(args, err: [:child, :out]) do |io|
+        io.each_line do |line|
+          lines << line
+          mutex.synchronize { $stderr.print "  [#{i + 1}] #{line}" unless options[:quiet] }
+        end
+      end
+      output = lines.join
+      mutex.synchronize { $stderr.puts "  client #{i + 1} done." }
       rates = parse_iperf_bitrate(output)
       { output: output, rates: rates }
     end
   end
 
   results = threads.map(&:value)
-  results.each_with_index do |r, i|
+  results.each do |r|
     all_outputs << r[:output]
     all_rates.concat(r[:rates])
-    unless options[:quiet]
-      puts "-" * 40
-      puts "Client #{i + 1}:"
-      puts r[:output]
-    end
   end
 
   max_rate = all_rates.max || 0
