@@ -20,8 +20,10 @@ enum MessageType : uint8_t {
     MSG_CONNECT_FAIL    = 0x32,
     MSG_MODULE_MSG      = 0x40,
     MSG_DISCONNECT      = 0x51,
-    MSG_CONNECT_PAUSE   = 0x52,
-    MSG_CONNECT_RESUME  = 0x53,
+    MSG_WRITER_PAUSE    = 0x52,
+    MSG_WRITER_RESUME   = 0x53,
+    MSG_CHAIN_PAUSE     = 0x54,
+    MSG_CHAIN_RESUME    = 0x55,
 };
 
 struct Packet {

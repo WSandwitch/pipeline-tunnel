@@ -21,6 +21,7 @@ options = {
   parallel: 1,
   clients: 1,
   quiet: false,
+  verbose: false,
 }
 
 op = OptionParser.new do |o|
@@ -34,6 +35,7 @@ op = OptionParser.new do |o|
   o.on('-P', '--parallel N', Integer, 'iperf3 parallel streams') { |v| options[:parallel] = v }
   o.on('-n', '--clients N', Integer, 'Concurrent iperf3 processes') { |v| options[:clients] = v }
   o.on('-q', '--quiet', 'Suppress iperf3 output') { options[:quiet] = true }
+  o.on('-v', '--verbose', 'Show output from all spawned processes') { options[:verbose] = true }
 end
 def find_bin(dir, name)
   [File.join(dir, name), File.join(dir, 'server', name), File.join(dir, 'client', name)].find { |f| File.exist?(f) }
@@ -75,6 +77,15 @@ def wait_port_listen(port, timeout = 10)
   raise "port #{port} not ready after #{timeout}s"
 end
 
+def null_redirect
+  $options[:verbose] ? STDERR : File::NULL
+end
+
+def spawn_verbosely(*args)
+  $stderr.puts "  + #{args.map { |a| a.to_s.include?(' ') ? "'#{a}'" : a }.join(' ')}" if $options[:verbose]
+  Process.spawn(*args)
+end
+
 def killall
   system('killall', '-9', 'ppltunnel-server', 'ppltunnel-client', 'iperf3', %i[out err] => File::NULL)
 end
@@ -84,16 +95,17 @@ def thread_args(n)
 end
 
 def start_tunnel(svr_port, cli_port, tgt_port)
-  svr = Process.spawn(SERVER, "-l#{HOST}:#{svr_port}", "-A#{PASS}",
-                      "-M#{MPATH}", *thread_args($options[:threads]),
-                      %i[out err] => File::NULL)
+  redir = null_redirect
+  svr = spawn_verbosely(SERVER, "-l#{HOST}:#{svr_port}", "-A#{PASS}",
+                        "-M#{MPATH}", *thread_args($options[:threads]),
+                        %i[out err] => redir)
   wait_port_listen(svr_port)
   chain = ";#{$options[:config]}"
-  cli = Process.spawn(CLIENT, "-L#{HOST}:#{cli_port}:#{HOST}:#{tgt_port}",
-                      "-M#{MPATH}",
-                      "#{HOST}:#{svr_port},#{PASS}#{chain}",
-                      *thread_args($options[:threads]),
-                      %i[out err] => File::NULL)
+  cli = spawn_verbosely(CLIENT, "-L#{HOST}:#{cli_port}:#{HOST}:#{tgt_port}",
+                        "-M#{MPATH}",
+                        "#{HOST}:#{svr_port},#{PASS}#{chain}",
+                        *thread_args($options[:threads]),
+                        %i[out err] => redir)
   wait_port_listen(cli_port)
   [svr, cli]
 end
@@ -134,8 +146,9 @@ begin
   killall
   options[:clients].times do |i|
     tgt = find_free_port
-    iperf_pid = Process.spawn('iperf3', '-s', '-D', '-p', tgt.to_s,
-                              %i[out err] => File::NULL)
+    redir = null_redirect
+    iperf_pid = spawn_verbosely('iperf3', '-s', '-D', '-p', tgt.to_s,
+                                %i[out err] => redir)
     wait_port_listen(tgt)
     servers << { tgt_port: tgt, pid: iperf_pid }
 
@@ -149,6 +162,8 @@ begin
        "(#{options[:clients]} clients, P=#{options[:parallel]}, #{options[:duration]}s)..."
 
   mutex = Mutex.new
+  thread_results = []
+  thread_errors = []
   threads = tunnels.map.with_index do |t, i|
     Thread.new do
       port = t[:cli_port]
@@ -160,20 +175,40 @@ begin
       end
       mutex.synchronize { $stderr.puts "  client #{i + 1} starting on port #{port}..." }
       lines = []
-      IO.popen(args, err: [:child, :out]) do |io|
-        io.each_line do |line|
-          lines << line
-          mutex.synchronize { $stderr.print "  [#{i + 1}] #{line}" unless options[:quiet] }
+      begin
+        IO.popen(args, err: [:child, :out]) do |io|
+          io.each_line do |line|
+            lines << line
+            mutex.synchronize { $stderr.print "  [#{i + 1}] #{line}" unless options[:quiet] }
+          end
         end
+        output = lines.join
+        rates = parse_iperf_bitrate(output)
+        mutex.synchronize { thread_results << { output: output, rates: rates } }
+      rescue => e
+        mutex.synchronize { thread_errors << e }
       end
-      output = lines.join
       mutex.synchronize { $stderr.puts "  client #{i + 1} done." }
-      rates = parse_iperf_bitrate(output)
-      { output: output, rates: rates }
     end
   end
 
-  results = threads.map(&:value)
+  test_timeout = [(options[:duration] || 30) + 10, 15].max
+  timed_out = false
+  begin
+    Timeout.timeout(test_timeout) { threads.each(&:join) }
+  rescue Timeout::Error
+    timed_out = true
+    $stderr.puts "  TIMEOUT after #{test_timeout}s, cleaning up..."
+    tunnels.each { |t| stop_procs(t[:cli_pid], t[:svr_pid]) }
+    killall
+    threads.each(&:join)
+  end
+
+  unless thread_errors.empty?
+    $stderr.puts "  WARNING: #{thread_errors.length} thread(s) raised errors"
+  end
+
+  results = thread_results
   results.each do |r|
     all_outputs << r[:output]
     all_rates.concat(r[:rates])
@@ -182,7 +217,7 @@ begin
   max_rate = all_rates.max || 0
   total_rate = all_rates.sum
   avg_rate = all_rates.empty? ? 0 : total_rate / all_rates.length
-  ok = max_rate > 0
+  ok = max_rate > 0 && !timed_out
 
   dir_label = options[:direction]
   puts "-" * 40

@@ -82,10 +82,12 @@ private:
         struct sockaddr_in addr;
         bool connected = false;
         WriteBuffer writer;
-        bool paused = false;
-        bool pause_sent = false;
+        bool writer_paused = false;        // received MSG_WRITER_PAUSE — remote socket full
+        bool local_writer_sent = false;    // sent MSG_WRITER_PAUSE
         bool disconnecting = false;
-        bool paused_by_backpressure = false;
+        bool ext_overflow_paused = false;  // local writer overflow (dc writer full)
+        bool chain_paused = false;         // received MSG_CHAIN_PAUSE — remote chain full
+        bool local_chain_sent = false;     // sent MSG_CHAIN_PAUSE
         bool shutting_down_wr = false;
     };
     std::unordered_map<uint8_t, ExternalConn> conns_;
@@ -151,8 +153,10 @@ private:
     void dispatch_data_conn_packet(const uint8_t *payload, size_t len, int src_idx);
     void process_wire_buffer(const uint8_t *data, size_t len);
 
-    void send_pause(uint8_t conn_id);
-    void send_resume(uint8_t conn_id);
+    void send_writer_pause(uint8_t conn_id);
+    void send_writer_resume(uint8_t conn_id);
+    void send_chain_pause();
+    void send_chain_resume();
     void resume_paused_dcfds();
 
     void handle_auth1_challenge(const Packet &pkt);
@@ -162,8 +166,10 @@ private:
     void handle_connect_ok(const Packet &pkt);
     void handle_connect_fail(const Packet &pkt);
     void handle_disconnect(const Packet &pkt);
-    void handle_connect_pause(const Packet &pkt);
-    void handle_connect_resume(const Packet &pkt);
+    void handle_writer_pause(const Packet &pkt);
+    void handle_writer_resume(const Packet &pkt);
+    void handle_chain_pause(const Packet &pkt);
+    void handle_chain_resume(const Packet &pkt);
     void handle_chain_ready(const Packet &pkt);
     void handle_transmit_ready(const Packet &pkt);
     void open_secondary_connections();

@@ -18,7 +18,7 @@ inline void set_nonblock(int fd) {
 }
 
 // Maximum data chunk size
-constexpr size_t MAX_PACKET_SIZE = 65536;
+constexpr size_t MAX_PACKET_SIZE = 131072;
 
 // Wire protocol type byte values
 constexpr uint8_t TYPE_DATA = 0;         // [varint(2+len)][0][conn_id][payload] → dispatch → Chain

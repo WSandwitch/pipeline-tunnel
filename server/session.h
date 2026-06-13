@@ -80,8 +80,10 @@ private:
     void register_target_epollout(uint8_t conn_id, int tfd);
     void register_data_conn_epollout(size_t idx, int fd);
 
-    void send_pause(uint8_t conn_id);
-    void send_resume(uint8_t conn_id);
+    void send_writer_pause(uint8_t conn_id);
+    void send_writer_resume(uint8_t conn_id);
+    void send_chain_pause();
+    void send_chain_resume();
     void send_control(const Packet &pkt);
 
     void register_data_connection_reader(size_t idx);
@@ -93,9 +95,11 @@ private:
         int fd = -1;
         std::string addr;
         WriteBuffer writer;
-        bool paused_by_client = false;
-        bool pause_sent = false;
-        bool paused_by_backpressure = false;
+        bool writer_paused = false;        // received MSG_WRITER_PAUSE — remote socket full
+        bool local_writer_sent = false;    // sent MSG_WRITER_PAUSE
+        bool ext_overflow_paused = false;  // local writer overflow (dc writer full)
+        bool chain_paused = false;         // received MSG_CHAIN_PAUSE — remote chain full
+        bool local_chain_sent = false;     // sent MSG_CHAIN_PAUSE
         bool shutdown_wr = false;      // received SHUTDOWN_WR from client
         bool shutdown_wr_sent = false; // shutdown(fd, SHUT_WR) called
     };
@@ -116,8 +120,10 @@ private:
     void handle_reconnect(const Packet &pkt);
     void handle_connect_req(const Packet &pkt);
     void handle_disconnect(const Packet &pkt);
-    void handle_connect_pause(const Packet &pkt);
-    void handle_connect_resume(const Packet &pkt);
+    void handle_writer_pause(const Packet &pkt);
+    void handle_writer_resume(const Packet &pkt);
+    void handle_chain_pause(const Packet &pkt);
+    void handle_chain_resume(const Packet &pkt);
     void handle_module_list_req(const Packet &pkt);
     void handle_chain_create(const Packet &pkt);
     bool setup_tunnel_target(const std::string &target_addr, uint8_t conn_id);
