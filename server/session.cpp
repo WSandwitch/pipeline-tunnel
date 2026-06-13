@@ -511,10 +511,15 @@ void Session::handle_chain_create(const Packet &pkt) {
     chain_->set_pause_callback(1, [this](bool pause) {
         std::lock_guard<std::mutex> lock(data_mtx_);
         pending_io_.push_back([this, pause]() {
+            // Pause/resume wire fd reads to stop data flow at TCP level.
+            // Writes are unaffected (TCP full-duplex), so control messages
+            // (MSG_CHAIN_PAUSE/RESUME) sent via send_control still work.
             for (auto &dc : data_connections_) {
                 if (dc.fd >= 0) {
-                    // NEVER stop wire fd reads — control packets must always flow
-                    // Instead: stop target reads and send MSG_CHAIN_PAUSE to remote
+                    if (pause)
+                        kernel_->mod_fd_events(dc.fd, 0, EPOLLIN);
+                    else
+                        kernel_->mod_fd_events(dc.fd, EPOLLIN, 0);
                 }
             }
             std::lock_guard<std::mutex> tlock(targets_mtx_);
