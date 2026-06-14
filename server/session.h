@@ -113,6 +113,7 @@ private:
     // Targets to reconnect after all data connections are ready
     std::vector<std::pair<uint8_t, std::string>> pending_reconnect_targets_;
     std::atomic<bool> paused_{false};
+    std::atomic<bool> destroying_{false};
 
     void handle_auth_challenge_response(const Packet &pkt);
     void handle_auth2_challenge(const Packet &pkt);

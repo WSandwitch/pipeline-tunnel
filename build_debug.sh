@@ -10,7 +10,7 @@ esac
 IMAGE=pppltunnel:dev
 USER_ID=$(id -u)
 GROUP_ID=$(id -g)
-BUILD_DIR=/tmp/modtunnel-build
+BUILD_DIR=/tmp/modtunnel-build-mount
 
 [ -d "$BUILD_DIR" ] || mkdir -p "$BUILD_DIR"
 

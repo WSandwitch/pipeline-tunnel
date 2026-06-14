@@ -171,13 +171,15 @@ bool Server::start() {
 
     // Tick callback to process pending I/O for all sessions
     kernel_->set_tick_callback([]() {
+        std::vector<std::shared_ptr<Session>> alive;
         for (auto &[sid, wptr] : g_session_registry) {
             (void)sid;
             auto sess = wptr.lock();
-            if (sess) {
-                sess->process_pending_io();
-                sess->check_heartbeat();
-            }
+            if (sess) alive.push_back(sess);
+        }
+        for (auto &sess : alive) {
+            sess->process_pending_io();
+            sess->check_heartbeat();
         }
     });
 

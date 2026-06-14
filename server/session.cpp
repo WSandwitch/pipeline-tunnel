@@ -31,12 +31,12 @@ Session::Session(int client_fd, const std::string &password,
 }
 
 Session::~Session() {
+    if (destroying_.exchange(true)) return;
     if (chain_) {
         chain_->cancel();
         chain_->wait_drain();
     }
     g_session_registry.erase(session_id_);
-    g_paused_sessions.erase(session_id_);
     close_all_targets();
     for (auto &dc : data_connections_)
         if (dc.fd >= 0) {
@@ -511,17 +511,10 @@ void Session::handle_chain_create(const Packet &pkt) {
     chain_->set_pause_callback(1, [this](bool pause) {
         std::lock_guard<std::mutex> lock(data_mtx_);
         pending_io_.push_back([this, pause]() {
-            // Pause/resume wire fd reads to stop data flow at TCP level.
-            // Writes are unaffected (TCP full-duplex), so control messages
-            // (MSG_CHAIN_PAUSE/RESUME) sent via send_control still work.
-            for (auto &dc : data_connections_) {
-                if (dc.fd >= 0) {
-                    if (pause)
-                        kernel_->mod_fd_events(dc.fd, 0, EPOLLIN);
-                    else
-                        kernel_->mod_fd_events(dc.fd, EPOLLIN, 0);
-                }
-            }
+            // Wire reads NOT paused here — the 3-pause system (ext_overflow_paused,
+            // chain_paused, writer_paused) stops target reads, which backpressures
+            // through the chain to the source ext socket via MSG_CHAIN_PAUSE/RESUME.
+            // Data already inflight is bounded and drains naturally.
             std::lock_guard<std::mutex> tlock(targets_mtx_);
             if (pause) {
                 bool any_sent = false;
