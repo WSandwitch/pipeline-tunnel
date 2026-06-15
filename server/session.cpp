@@ -323,7 +323,7 @@ void Session::handle_auth2_response(const Packet &pkt) {
                     self->dc_paused_ = true;
                     size_t dsz = 0;
                     for (auto &dc : self->data_connections_) dsz += dc.writer.size();
-                    log_debug("session %llx: [DBG] wire_write PAUSE setting ext_overflow_paused dc_total=%zu", (unsigned long long)self->session_id_, dsz);
+                    log_debug("session %llx: wire_write PAUSE setting ext_overflow_paused dc_total=%zu", (unsigned long long)self->session_id_, dsz);
                     for (auto &[cid, tgt] : self->targets_) {
                         if (!tgt.ext_overflow_paused) {
                             tgt.ext_overflow_paused = true;
@@ -348,11 +348,11 @@ void Session::handle_auth2_response(const Packet &pkt) {
                         for (auto &[cid, tgt] : self->targets_) {
                             if (tgt.ext_overflow_paused) {
                                 tgt.ext_overflow_paused = false;
-                                log_debug("session %llx: [DBG] wire_write resume conn=%u attempt", (unsigned long long)self->session_id_, cid);
+                                log_debug("session %llx: wire_write resume conn=%u attempt", (unsigned long long)self->session_id_, cid);
                                 if (!tgt.writer_paused && !tgt.chain_paused)
                                     self->kernel_->mod_fd_events(tgt.fd, EPOLLIN, 0);
                                 else
-                                    log_debug("session %llx: [DBG] wire_write resume blocked conn=%u writer_paused=%d chain_paused=%d", (unsigned long long)self->session_id_, cid, tgt.writer_paused, tgt.chain_paused);
+                                    log_debug("session %llx: wire_write resume blocked conn=%u writer_paused=%d chain_paused=%d", (unsigned long long)self->session_id_, cid, tgt.writer_paused, tgt.chain_paused);
                                 log_debug("session %llx: BW resume target conn_id=%u",
                                           (unsigned long long)self->session_id_, cid);
                             }
@@ -855,11 +855,11 @@ void Session::process_wire_buffer(const uint8_t *data, size_t len) {
                             auto it = targets_.find(cid);
                             if (it != targets_.end()) {
                                 it->second.writer_paused = false;
-                                log_debug("session %llx: [DBG] WRITER_RESUME conn=%u attempt", (unsigned long long)session_id_, cid);
+                                log_debug("session %llx: WRITER_RESUME conn=%u attempt", (unsigned long long)session_id_, cid);
                                 if (it->second.fd >= 0 && !it->second.chain_paused && !it->second.ext_overflow_paused)
                                     kernel_->mod_fd_events(it->second.fd, EPOLLIN, 0);
                                 else
-                                    log_debug("session %llx: [DBG] WRITER_RESUME conn=%u blocked chain_paused=%d ext_overflow_paused=%d", (unsigned long long)session_id_, cid, it->second.chain_paused, it->second.ext_overflow_paused);
+                                    log_debug("session %llx: WRITER_RESUME conn=%u blocked chain_paused=%d ext_overflow_paused=%d", (unsigned long long)session_id_, cid, it->second.chain_paused, it->second.ext_overflow_paused);
                             }
                         }
                         break;
@@ -881,11 +881,11 @@ void Session::process_wire_buffer(const uint8_t *data, size_t len) {
                             (void)cid;
                             tgt.chain_paused = false;
                             if (tgt.fd >= 0) {
-                                log_debug("session %llx: [DBG] CHAIN_RESUME conn=%u attempt", (unsigned long long)session_id_, cid);
+                                log_debug("session %llx: CHAIN_RESUME conn=%u attempt", (unsigned long long)session_id_, cid);
                                 if (!tgt.writer_paused && !tgt.ext_overflow_paused)
                                     kernel_->mod_fd_events(tgt.fd, EPOLLIN, 0);
                                 else
-                                    log_debug("session %llx: [DBG] CHAIN_RESUME conn=%u blocked writer_paused=%d ext_overflow_paused=%d", (unsigned long long)session_id_, cid, tgt.writer_paused, tgt.ext_overflow_paused);
+                                    log_debug("session %llx: CHAIN_RESUME conn=%u blocked writer_paused=%d ext_overflow_paused=%d", (unsigned long long)session_id_, cid, tgt.writer_paused, tgt.ext_overflow_paused);
                             }
                         }
                         break;
@@ -1057,11 +1057,11 @@ void Session::register_data_connection_reader(size_t idx) {
                                         auto it = targets_.find(cid);
                                         if (it != targets_.end()) {
                                             it->second.writer_paused = false;
-                                            log_debug("session %llx: [DBG] WRITER_RESUME(2) conn=%u attempt", (unsigned long long)session_id_, cid);
+                                            log_debug("session %llx: WRITER_RESUME(2) conn=%u attempt", (unsigned long long)session_id_, cid);
                                             if (it->second.fd >= 0 && !it->second.chain_paused && !it->second.ext_overflow_paused)
                                                 kernel_->mod_fd_events(it->second.fd, EPOLLIN, 0);
                                             else
-                                                log_debug("session %llx: [DBG] WRITER_RESUME(2) conn=%u blocked chain_paused=%d ext_overflow_paused=%d", (unsigned long long)session_id_, cid, it->second.chain_paused, it->second.ext_overflow_paused);
+                                                log_debug("session %llx: WRITER_RESUME(2) conn=%u blocked chain_paused=%d ext_overflow_paused=%d", (unsigned long long)session_id_, cid, it->second.chain_paused, it->second.ext_overflow_paused);
                                         }
                                     }
                                     break;
@@ -1083,11 +1083,11 @@ void Session::register_data_connection_reader(size_t idx) {
                                         (void)cid;
                                         tgt.chain_paused = false;
                                         if (tgt.fd >= 0) {
-                                            log_debug("session %llx: [DBG] CHAIN_RESUME(2) conn=%u attempt", (unsigned long long)session_id_, cid);
+                                            log_debug("session %llx: CHAIN_RESUME(2) conn=%u attempt", (unsigned long long)session_id_, cid);
                                             if (!tgt.writer_paused && !tgt.ext_overflow_paused)
                                                 kernel_->mod_fd_events(tgt.fd, EPOLLIN, 0);
                                             else
-                                                log_debug("session %llx: [DBG] CHAIN_RESUME(2) conn=%u blocked writer_paused=%d ext_overflow_paused=%d", (unsigned long long)session_id_, cid, tgt.writer_paused, tgt.ext_overflow_paused);
+                                                log_debug("session %llx: CHAIN_RESUME(2) conn=%u blocked writer_paused=%d ext_overflow_paused=%d", (unsigned long long)session_id_, cid, tgt.writer_paused, tgt.ext_overflow_paused);
                                         }
                                     }
                                     break;
@@ -1189,11 +1189,11 @@ void Session::register_data_conn_epollout(size_t idx, int fd) {
                         for (auto &[cid, tgt] : targets_) {
                             if (tgt.ext_overflow_paused) {
                                 tgt.ext_overflow_paused = false;
-                                log_debug("session %llx: [DBG] data_conn_epollout resume conn=%u attempt", (unsigned long long)session_id_, cid);
+                                log_debug("session %llx: data_conn_epollout resume conn=%u attempt", (unsigned long long)session_id_, cid);
                                 if (!tgt.writer_paused && !tgt.chain_paused)
                                     kernel_->mod_fd_events(tgt.fd, EPOLLIN, 0);
                                 else
-                                    log_debug("session %llx: [DBG] data_conn_epollout resume conn=%u blocked writer_paused=%d chain_paused=%d", (unsigned long long)session_id_, cid, tgt.writer_paused, tgt.chain_paused);
+                                    log_debug("session %llx: data_conn_epollout resume conn=%u blocked writer_paused=%d chain_paused=%d", (unsigned long long)session_id_, cid, tgt.writer_paused, tgt.chain_paused);
                                 log_debug("session %llx: BW resume target conn_id=%u (flush)",
                                           (unsigned long long)session_id_, cid);
                             }
@@ -1523,7 +1523,6 @@ void Session::process_pending_io() {
     {
         size_t dc_size = 0;
         for (auto &dc : data_connections_) dc_size += dc.writer.size();
-        log_debug("session %llx: [DBG] process_pending_io dc_size=%zu dc_paused_=%d", (unsigned long long)session_id_, dc_size, dc_paused_);
         if (dc_size > 1024 * 1024 && !dc_paused_) {
             dc_paused_ = true;
             std::lock_guard<std::mutex> lock(targets_mtx_);
@@ -1533,18 +1532,14 @@ void Session::process_pending_io() {
                 if (tgt.fd >= 0)
                     kernel_->mod_fd_events(tgt.fd, 0, EPOLLIN);
             }
-            log_debug("session %llx: [DBG] ext_overflow_paused SET dc_size=%zu", (unsigned long long)session_id_, dc_size);
         } else if (dc_size < 256 * 1024 && dc_paused_) {
             dc_paused_ = false;
-            log_debug("session %llx: [DBG] ext_overflow_paused CLEAR dc_size=%zu", (unsigned long long)session_id_, dc_size);
             std::lock_guard<std::mutex> lock(targets_mtx_);
             for (auto &[cid, tgt] : targets_) {
                 (void)cid;
                 tgt.ext_overflow_paused = false;
                 if (tgt.fd >= 0 && !tgt.writer_paused && !tgt.chain_paused)
                     kernel_->mod_fd_events(tgt.fd, EPOLLIN, 0);
-                else
-                    log_debug("session %llx: [DBG] ext_overflow_paused CLEAR conn=%u blocked writer_paused=%d chain_paused=%d", (unsigned long long)session_id_, cid, tgt.writer_paused, tgt.chain_paused);
             }
         }
     }

@@ -368,11 +368,11 @@ void Client::register_data_conn_epollout(size_t idx, int fd) {
                 for (auto &[cid, ext] : conns_) {
                     if (ext.ext_overflow_paused) {
                         ext.ext_overflow_paused = false;
-                        log_debug("client: [DBG] data_conn_epollout resume conn=%u attempt", cid);
+                        log_debug("client: data_conn_epollout resume conn=%u attempt", cid);
                         if (!ext.writer_paused && !ext.chain_paused)
                             kernel_->mod_fd_events(ext.fd, EPOLLIN, 0);
                         else
-                            log_debug("client: [DBG] data_conn_epollout resume conn=%u blocked writer_paused=%d chain_paused=%d", cid, ext.writer_paused, ext.chain_paused);
+                            log_debug("client: data_conn_epollout resume conn=%u blocked writer_paused=%d chain_paused=%d", cid, ext.writer_paused, ext.chain_paused);
                         log_debug("client: BW resume ext conn_id=%u (flush)", cid);
                     }
                 }
@@ -676,14 +676,45 @@ void Client::handle_auth2_challenge(const Packet &pkt) {
                 });
                 return 0;
             }
+        // Normal data for ext connection: write directly (no deferral)
+        // to avoid 50ms delay that causes DC TCP buffer buildup and stalls.
             uint8_t conn_id = data[0];
-            std::vector<uint8_t> payload(data + 1, data + len);
-            {
-                std::lock_guard<std::mutex> lock(self->data_mtx_);
-                self->pending_io_.push_back([self, conn_id, payload = std::move(payload)]() {
-                    self->send_raw_to_external(conn_id, payload.data(), payload.size());
-                });
+            auto it = self->conns_.find(conn_id);
+            if (it == self->conns_.end() || it->second.disconnecting || it->second.fd < 0) {
+                log_error("client: wire_write dst=0 conn_id=%u not found", conn_id);
+                free(const_cast<uint8_t*>(data));
+                return -1;
             }
+            int ext_fd = it->second.fd;
+            int ret = it->second.writer.write(ext_fd, data + 1, len - 1);
+            if (ret >= 0) {
+                std::lock_guard<std::mutex> lock(self->data_mtx_);
+                if (ret > 0) {
+                    self->pending_io_.push_back([self, conn_id, ext_fd]() {
+                        self->register_external_epollout(conn_id, ext_fd);
+                    });
+                    self->pending_io_.push_back([self, conn_id]() {
+                        auto ci = self->conns_.find(conn_id);
+                        if (ci == self->conns_.end()) return;
+                        auto &c = ci->second;
+                        if (c.writer.size() > c.writer.high_water && !c.local_writer_sent) {
+                            c.local_writer_sent = true;
+                            self->send_writer_pause(conn_id);
+                        }
+                    });
+                } else {
+                    self->pending_io_.push_back([self, conn_id]() {
+                        auto ci = self->conns_.find(conn_id);
+                        if (ci == self->conns_.end()) return;
+                        auto &c = ci->second;
+                        if (c.writer.size() <= c.writer.low_water && c.local_writer_sent) {
+                            c.local_writer_sent = false;
+                            self->send_writer_resume(conn_id);
+                        }
+                    });
+                }
+            }
+            self->kernel_->wakeup();
             free(const_cast<uint8_t*>(data));
             return 0;
         }
@@ -719,7 +750,7 @@ void Client::handle_auth2_challenge(const Packet &pkt) {
             });
             self->pending_io_.push_back([self, dc_idx]() {
                 auto &w = self->data_connections_[dc_idx].writer;
-                log_debug("client: [DBG] wire_write PAUSE check w.size=%zu high_water=%zu", w.size(), w.high_water);
+                log_debug("client: wire_write PAUSE check w.size=%zu high_water=%zu", w.size(), w.high_water);
                 if (w.size() > w.high_water) {
                     self->dc_paused_ = true;
                     for (auto &[cid, ext] : self->conns_) {
@@ -737,15 +768,15 @@ void Client::handle_auth2_challenge(const Packet &pkt) {
             self->pending_io_.push_back([self, dc_idx]() {
                 auto &w = self->data_connections_[dc_idx].writer;
                 if (w.size() <= w.low_water) {
-                    log_debug("client: [DBG] wire_write RESUME clear ext_overflow_paused w.size=%zu", w.size());
+                    log_debug("client: wire_write RESUME clear ext_overflow_paused w.size=%zu", w.size());
                     for (auto &[cid, ext] : self->conns_) {
                         if (ext.ext_overflow_paused) {
                             ext.ext_overflow_paused = false;
-                            log_debug("client: [DBG] wire_write RESUME conn=%u attempt", cid);
+                            log_debug("client: wire_write RESUME conn=%u attempt", cid);
                             if (!ext.writer_paused && !ext.chain_paused)
                                 self->kernel_->mod_fd_events(ext.fd, EPOLLIN, 0);
                             else
-                                log_debug("client: [DBG] wire_write RESUME conn=%u blocked writer_paused=%d chain_paused=%d", cid, ext.writer_paused, ext.chain_paused);
+                                log_debug("client: wire_write RESUME conn=%u blocked writer_paused=%d chain_paused=%d", cid, ext.writer_paused, ext.chain_paused);
                             log_debug("client: BW resume ext conn_id=%u", cid);
                         }
                     }
@@ -1092,7 +1123,7 @@ void Client::handle_writer_resume(const Packet &pkt) {
         if (!it->second.chain_paused && !it->second.ext_overflow_paused)
             kernel_->mod_fd_events(it->second.fd, EPOLLIN, 0);
         else
-            log_debug("client: [DBG] WRITER_RESUME conn=%u blocked chain_paused=%d ext_overflow_paused=%d", conn_id, it->second.chain_paused, it->second.ext_overflow_paused);
+            log_debug("client: WRITER_RESUME conn=%u blocked chain_paused=%d ext_overflow_paused=%d", conn_id, it->second.chain_paused, it->second.ext_overflow_paused);
     }
 }
 
@@ -1117,7 +1148,7 @@ void Client::handle_chain_resume(const Packet &pkt) {
             if (!conn.writer_paused && !conn.ext_overflow_paused)
                 kernel_->mod_fd_events(conn.fd, EPOLLIN, 0);
             else
-                log_debug("client: [DBG] CHAIN_RESUME conn=%u blocked writer_paused=%d ext_overflow_paused=%d", cid, conn.writer_paused, conn.ext_overflow_paused);
+                log_debug("client: CHAIN_RESUME conn=%u blocked writer_paused=%d ext_overflow_paused=%d", cid, conn.writer_paused, conn.ext_overflow_paused);
         }
     }
 }
@@ -1238,10 +1269,8 @@ void Client::process_pending_io() {
     {
         size_t dc_size = 0;
         for (auto &dc : data_connections_) dc_size += dc.writer.size();
-        log_debug("client: [DBG] process_pending_io dc_size=%zu dc_paused_=%d", dc_size, dc_paused_);
         if (dc_size > 1024 * 1024 && !dc_paused_) {
             dc_paused_ = true;
-            log_debug("client: [DBG] ext_overflow_paused SET dc_size=%zu", dc_size);
             for (auto &[id, conn] : conns_) {
                 (void)id;
                 conn.ext_overflow_paused = true;
@@ -1250,15 +1279,12 @@ void Client::process_pending_io() {
             }
         } else if (dc_size < 256 * 1024 && dc_paused_) {
             dc_paused_ = false;
-            log_debug("client: [DBG] ext_overflow_paused CLEAR dc_size=%zu", dc_size);
             for (auto &[id, conn] : conns_) {
                 (void)id;
                 conn.ext_overflow_paused = false;
                 if (conn.fd >= 0) {
                     if (!conn.writer_paused && !conn.chain_paused)
                         kernel_->mod_fd_events(conn.fd, EPOLLIN, 0);
-                    else
-                        log_debug("client: [DBG] ext_overflow CLEAR conn=%u blocked writer_paused=%d chain_paused=%d", id, conn.writer_paused, conn.chain_paused);
                 }
             }
         }
