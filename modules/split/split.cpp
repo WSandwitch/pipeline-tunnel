@@ -28,6 +28,10 @@ struct SplitContext {
     int node_id = -1;
     int chunk_size_min = DEF_CHUNK_SIZE;
     int chunk_size_max = DEF_CHUNK_SIZE;
+
+    // Pending split data: if write_packet fails mid-packet, save remainder here
+    std::vector<uint8_t> pending_data;
+    int pending_offset = 0;
 };
 
 static int parse_size(const char *s, int def) {
@@ -48,11 +52,21 @@ static int next_chunk_size(SplitContext *ctx) {
 }
 
 static int process_split(SplitContext *ctx, int /*trigger_idx*/) {
+    // Use pending data if we're recovering from a write failure
+    uint8_t *in_buf = nullptr;
     int sz = 0;
-    uint8_t *in_buf = (uint8_t *)ctx->api->get_packet(ctx->api->ctx, 0, &sz);
-    if (!in_buf || sz <= 0) return -1;
-
     int offset = 0;
+
+    if (!ctx->pending_data.empty()) {
+        sz = (int)ctx->pending_data.size();
+        offset = ctx->pending_offset;
+        if (ctx->trace)
+            std::fprintf(stderr, "[split] resume pending offset=%d sz=%d\n", offset, sz);
+    } else {
+        in_buf = (uint8_t *)ctx->api->get_packet(ctx->api->ctx, 0, &sz);
+        if (!in_buf || sz <= 0) return -1;
+    }
+
     while (offset < sz) {
         int remain = sz - offset;
         int chunk_len = next_chunk_size(ctx);
@@ -68,23 +82,44 @@ static int process_split(SplitContext *ctx, int /*trigger_idx*/) {
 
         int out_idx = (int)(ctx->rr_idx % (uint32_t)ctx->num_outputs);
         uint8_t *out_buf = (uint8_t *)std::malloc((size_t)(chunk_len + HEADER_SIZE));
-        if (!out_buf) { std::free(in_buf); return -1; }
+        if (!out_buf) {
+            if (in_buf) std::free(in_buf);
+            ctx->pending_data.clear();
+            return -1;
+        }
+        // For pending data: read from pending_data vector, not in_buf
+        const uint8_t *src;
+        if (ctx->pending_data.empty()) {
+            src = in_buf + offset;
+        } else {
+            src = ctx->pending_data.data() + offset;
+        }
         std::memcpy(out_buf, header, HEADER_SIZE);
-        std::memcpy(out_buf + HEADER_SIZE, in_buf + offset, (size_t)chunk_len);
+        std::memcpy(out_buf + HEADER_SIZE, src, (size_t)chunk_len);
 
         if (ctx->trace) std::fprintf(stderr, "[split] write chunk seq=%u more=%d idx=%d len=%d\n",
                 ctx->seqnum, more, out_idx, chunk_len);
         int ret = ctx->api->write_packet(ctx->api->ctx, out_idx,
                                          out_buf, (size_t)(chunk_len + HEADER_SIZE));
         if (ret < 0) {
-            std::free(in_buf);
-            return ret;
+            // Save remaining data for retry
+            if (ctx->pending_data.empty()) {
+                ctx->pending_data.assign(in_buf, in_buf + sz);
+                std::free(in_buf);
+                in_buf = nullptr;
+            }
+            ctx->pending_offset = offset;
+            return -1;
         }
         ctx->rr_idx++;
         ctx->seqnum++;
         offset += chunk_len;
     }
-    std::free(in_buf);
+
+    // All data written successfully
+    ctx->pending_data.clear();
+    ctx->pending_offset = 0;
+    if (in_buf) std::free(in_buf);
     return 0;
 }
 

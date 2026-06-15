@@ -317,6 +317,7 @@ void Session::handle_auth2_response(const Packet &pkt) {
             if (ret > 0) {
                 std::lock_guard<std::mutex> lock(self->data_mtx_);
                 self->pending_io_.push_back([self]() {
+                    self->dc_paused_ = true;
                     size_t dsz = 0;
                     for (auto &dc : self->data_connections_) dsz += dc.writer.size();
                     log_debug("session %llx: [DBG] wire_write PAUSE setting ext_overflow_paused dc_total=%zu", (unsigned long long)self->session_id_, dsz);

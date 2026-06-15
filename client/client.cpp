@@ -721,6 +721,7 @@ void Client::handle_auth2_challenge(const Packet &pkt) {
                 auto &w = self->data_connections_[dc_idx].writer;
                 log_debug("client: [DBG] wire_write PAUSE check w.size=%zu high_water=%zu", w.size(), w.high_water);
                 if (w.size() > w.high_water) {
+                    self->dc_paused_ = true;
                     for (auto &[cid, ext] : self->conns_) {
                         if (!ext.ext_overflow_paused) {
                             ext.ext_overflow_paused = true;
