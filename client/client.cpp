@@ -343,16 +343,10 @@ void Client::register_data_conn_epollout(size_t idx, int fd) {
             if (idx >= data_connections_.size()) return;
             auto &dc = data_connections_[idx];
 
-            // Step 1: loop-flush writer until drained or EAGAIN
-            bool drained;
-            do {
-                size_t old_ro = dc.writer.read_offset;
-                drained = dc.writer.flush(dc.fd);
-                if (dc.writer.read_offset == old_ro) break;
-            } while (!drained);
+            // Flush writer — after each complete chunk, flush priority messages
+            bool drained = dc.writer.flush(dc.fd);
 
-            // Step 2: flush priority_buf (only if writer fully drained)
-            if (drained) {
+            if (dc.writer.read_offset == 0) {
                 while (!dc.priority_buf.empty()) {
                     ssize_t n = ::write(dc.fd, dc.priority_buf.data(), dc.priority_buf.size());
                     if (n > 0) {
@@ -366,8 +360,7 @@ void Client::register_data_conn_epollout(size_t idx, int fd) {
                 }
             }
 
-            // Step 3: one-shot flush writer (data after priority_buf)
-            if (dc.priority_buf.empty())
+            if (!drained)
                 dc.writer.flush(dc.fd);
 
             // Step 4: resume paused ext connections if buffer drained below low_water
@@ -375,8 +368,11 @@ void Client::register_data_conn_epollout(size_t idx, int fd) {
                 for (auto &[cid, ext] : conns_) {
                     if (ext.ext_overflow_paused) {
                         ext.ext_overflow_paused = false;
+                        log_debug("client: [DBG] data_conn_epollout resume conn=%u attempt", cid);
                         if (!ext.writer_paused && !ext.chain_paused)
                             kernel_->mod_fd_events(ext.fd, EPOLLIN, 0);
+                        else
+                            log_debug("client: [DBG] data_conn_epollout resume conn=%u blocked writer_paused=%d chain_paused=%d", cid, ext.writer_paused, ext.chain_paused);
                         log_debug("client: BW resume ext conn_id=%u (flush)", cid);
                     }
                 }
@@ -723,6 +719,7 @@ void Client::handle_auth2_challenge(const Packet &pkt) {
             });
             self->pending_io_.push_back([self, dc_idx]() {
                 auto &w = self->data_connections_[dc_idx].writer;
+                log_debug("client: [DBG] wire_write PAUSE check w.size=%zu high_water=%zu", w.size(), w.high_water);
                 if (w.size() > w.high_water) {
                     for (auto &[cid, ext] : self->conns_) {
                         if (!ext.ext_overflow_paused) {
@@ -739,11 +736,15 @@ void Client::handle_auth2_challenge(const Packet &pkt) {
             self->pending_io_.push_back([self, dc_idx]() {
                 auto &w = self->data_connections_[dc_idx].writer;
                 if (w.size() <= w.low_water) {
+                    log_debug("client: [DBG] wire_write RESUME clear ext_overflow_paused w.size=%zu", w.size());
                     for (auto &[cid, ext] : self->conns_) {
                         if (ext.ext_overflow_paused) {
                             ext.ext_overflow_paused = false;
+                            log_debug("client: [DBG] wire_write RESUME conn=%u attempt", cid);
                             if (!ext.writer_paused && !ext.chain_paused)
                                 self->kernel_->mod_fd_events(ext.fd, EPOLLIN, 0);
+                            else
+                                log_debug("client: [DBG] wire_write RESUME conn=%u blocked writer_paused=%d chain_paused=%d", cid, ext.writer_paused, ext.chain_paused);
                             log_debug("client: BW resume ext conn_id=%u", cid);
                         }
                     }
@@ -788,56 +789,13 @@ void Client::handle_auth2_challenge(const Packet &pkt) {
         return;
     }
 
-    // Register backpressure callbacks
-    chain_->set_pause_callback(0, [this](bool pause) {
-        std::lock_guard<std::mutex> lock(data_mtx_);
-        pending_io_.push_back([this, pause]() {
-            for (auto &[id, conn] : conns_) {
-                (void)id;
-                if (conn.fd >= 0) {
-                    if (pause)
-                        kernel_->mod_fd_events(conn.fd, 0, EPOLLIN);
-                    else
-                        kernel_->mod_fd_events(conn.fd, EPOLLIN, 0);
-                }
-            }
-        });
+    // Register backpressure callbacks.
+    // Callbacks only wake the event loop — the centralized check in process_pending_io
+    // reads chain state atomically and handles EPOLLIN gating + MSG sending.
+    chain_->set_pause_callback(0, [this](bool) {
+        kernel_->wakeup();
     });
-    chain_->set_pause_callback(1, [this](bool pause) {
-        std::lock_guard<std::mutex> lock(data_mtx_);
-        pending_io_.push_back([this, pause]() {
-            // Wire reads NOT paused here — the 3-pause system (ext_overflow_paused,
-            // chain_paused, writer_paused) stops ext reads, which backpressures
-            // through the chain to the source target socket via MSG_CHAIN_PAUSE/RESUME.
-            // Data already inflight is bounded and drains naturally.
-            if (pause) {
-                bool any_sent = false;
-                for (auto &[id, conn] : conns_) {
-                    (void)id;
-                    if (!conn.local_chain_sent) {
-                        conn.local_chain_sent = true;
-                        any_sent = true;
-                    }
-                    if (conn.fd >= 0)
-                        kernel_->mod_fd_events(conn.fd, 0, EPOLLIN);
-                }
-                if (any_sent)
-                    send_chain_pause();
-            } else {
-                bool any_sent = false;
-                for (auto &[id, conn] : conns_) {
-                    (void)id;
-                    if (conn.local_chain_sent) {
-                        conn.local_chain_sent = false;
-                        any_sent = true;
-                    }
-                    if (conn.fd >= 0 && !conn.writer_paused && !conn.ext_overflow_paused)
-                        kernel_->mod_fd_events(conn.fd, EPOLLIN, 0);
-                }
-                if (any_sent)
-                    send_chain_resume();
-            }
-        });
+    chain_->set_pause_callback(1, [this](bool) {
         kernel_->wakeup();
     });
 
@@ -1129,8 +1087,12 @@ void Client::handle_writer_resume(const Packet &pkt) {
     if (it == conns_.end()) return;
     it->second.writer_paused = false;
     log_debug("client: WRITER_RESUME conn_id=%u", conn_id);
-    if (it->second.fd >= 0 && !it->second.chain_paused && !it->second.ext_overflow_paused)
-        kernel_->mod_fd_events(it->second.fd, EPOLLIN, 0);
+    if (it->second.fd >= 0) {
+        if (!it->second.chain_paused && !it->second.ext_overflow_paused)
+            kernel_->mod_fd_events(it->second.fd, EPOLLIN, 0);
+        else
+            log_debug("client: [DBG] WRITER_RESUME conn=%u blocked chain_paused=%d ext_overflow_paused=%d", conn_id, it->second.chain_paused, it->second.ext_overflow_paused);
+    }
 }
 
 void Client::handle_chain_pause(const Packet &pkt) {
@@ -1150,8 +1112,12 @@ void Client::handle_chain_resume(const Packet &pkt) {
     for (auto &[cid, conn] : conns_) {
         (void)cid;
         conn.chain_paused = false;
-        if (conn.fd >= 0 && !conn.writer_paused && !conn.ext_overflow_paused)
-            kernel_->mod_fd_events(conn.fd, EPOLLIN, 0);
+        if (conn.fd >= 0) {
+            if (!conn.writer_paused && !conn.ext_overflow_paused)
+                kernel_->mod_fd_events(conn.fd, EPOLLIN, 0);
+            else
+                log_debug("client: [DBG] CHAIN_RESUME conn=%u blocked writer_paused=%d ext_overflow_paused=%d", cid, conn.writer_paused, conn.ext_overflow_paused);
+        }
     }
 }
 
@@ -1271,8 +1237,10 @@ void Client::process_pending_io() {
     {
         size_t dc_size = 0;
         for (auto &dc : data_connections_) dc_size += dc.writer.size();
+        log_debug("client: [DBG] process_pending_io dc_size=%zu dc_paused_=%d", dc_size, dc_paused_);
         if (dc_size > 1024 * 1024 && !dc_paused_) {
             dc_paused_ = true;
+            log_debug("client: [DBG] ext_overflow_paused SET dc_size=%zu", dc_size);
             for (auto &[id, conn] : conns_) {
                 (void)id;
                 conn.ext_overflow_paused = true;
@@ -1281,11 +1249,16 @@ void Client::process_pending_io() {
             }
         } else if (dc_size < 256 * 1024 && dc_paused_) {
             dc_paused_ = false;
+            log_debug("client: [DBG] ext_overflow_paused CLEAR dc_size=%zu", dc_size);
             for (auto &[id, conn] : conns_) {
                 (void)id;
                 conn.ext_overflow_paused = false;
-                if (conn.fd >= 0 && !conn.writer_paused && !conn.chain_paused)
-                    kernel_->mod_fd_events(conn.fd, EPOLLIN, 0);
+                if (conn.fd >= 0) {
+                    if (!conn.writer_paused && !conn.chain_paused)
+                        kernel_->mod_fd_events(conn.fd, EPOLLIN, 0);
+                    else
+                        log_debug("client: [DBG] ext_overflow CLEAR conn=%u blocked writer_paused=%d chain_paused=%d", id, conn.writer_paused, conn.chain_paused);
+                }
             }
         }
     }
@@ -1296,6 +1269,45 @@ void Client::process_pending_io() {
     }
     for (auto &fn : batch)
         fn();
+
+    // Read chain backpressure state atomically (source of truth — no race)
+    bool bp0 = chain_ ? chain_->is_backpressure_paused(0) : false;
+    bool bp1 = chain_ ? chain_->is_backpressure_paused(1) : false;
+
+    // Self-heal MSG_CHAIN_PAUSE/RESUME for dir=1 (wire→ext full → tell server to pause)
+    {
+        bool local_sent = false;
+        for (auto &[id, conn] : conns_) {
+            (void)id;
+            if (conn.local_chain_sent) { local_sent = true; break; }
+        }
+        if (bp1 && !local_sent) {
+            for (auto &[id, conn] : conns_) { (void)id; conn.local_chain_sent = true; }
+            send_chain_pause();
+        } else if (!bp1 && local_sent) {
+            for (auto &[id, conn] : conns_) { (void)id; conn.local_chain_sent = false; }
+            send_chain_resume();
+        }
+    }
+
+    // Centralized EPOLLIN gating: evaluate all pause sources
+    for (auto &[id, conn] : conns_) {
+        (void)id;
+        if (conn.fd < 0) continue;
+        bool should_pause = conn.writer_paused || conn.chain_paused
+                         || conn.ext_overflow_paused || bp0 || bp1;
+        if (should_pause) {
+            if (!conn.epollin_removed) {
+                conn.epollin_removed = true;
+                kernel_->mod_fd_events(conn.fd, 0, EPOLLIN);
+            }
+        } else {
+            if (conn.epollin_removed) {
+                conn.epollin_removed = false;
+                kernel_->mod_fd_events(conn.fd, EPOLLIN, 0);
+            }
+        }
+    }
 
     // Clean up disconnected connections once chain is drained
     if (!pending_disconnect_ids_.empty()) {

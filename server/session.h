@@ -102,6 +102,7 @@ private:
         bool local_chain_sent = false;     // sent MSG_CHAIN_PAUSE
         bool shutdown_wr = false;      // received SHUTDOWN_WR from client
         bool shutdown_wr_sent = false; // shutdown(fd, SHUT_WR) called
+        bool epollin_removed = false;    // EPOLLIN was removed from fd
     };
     std::unordered_map<uint8_t, TargetConn> targets_;
     std::mutex targets_mtx_;

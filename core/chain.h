@@ -22,6 +22,7 @@ public:
 
     bool valid() const { return true; }
     bool is_drained() const { return _inflight.load() == 0; }
+    bool is_backpressure_paused(int dir) const { return _backpressure_paused[dir].load(); }
 
     // dir=0 (split/encode), dir=1 (merge/decode)
     using PauseCallback = std::function<void(bool paused)>;
@@ -66,7 +67,7 @@ private:
     std::mutex dir_order_mutex_[2];
 
     PauseCallback _pause_cb[2];  // pause/resume callbacks per direction
-    bool _backpressure_paused[2] = {false, false};  // track per-direction pause state
+    std::atomic<bool> _backpressure_paused[2] = {false, false};  // track per-direction pause state
 
     void task_done();
     void enqueue_module(Module *mod, const uint8_t *data, size_t len,

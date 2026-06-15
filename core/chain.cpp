@@ -232,12 +232,16 @@ void Chain::check_backpressure(int dir) {
     for (auto &m : _clone_modules)
         if (auto v = m->pending[dir].load(); v > max_p) max_p = v;
 
-    if (max_p > BACKPRESSURE_HIGH && !_backpressure_paused[dir]) {
-        _backpressure_paused[dir] = true;
+    log_debug("chain: check_bp dir=%d max_p=%d bp_paused=%d", dir, max_p, (int)_backpressure_paused[dir].load());
+
+    if (max_p > BACKPRESSURE_HIGH && !_backpressure_paused[dir].load()) {
+        _backpressure_paused[dir].store(true);
+        log_debug("chain: PAUSE dir=%d max_p=%d", dir, max_p);
         if (_pause_cb[dir]) _pause_cb[dir](true);
     }
-    if (max_p <= BACKPRESSURE_LOW && _backpressure_paused[dir]) {
-        _backpressure_paused[dir] = false;
+    if (max_p <= BACKPRESSURE_LOW && _backpressure_paused[dir].load()) {
+        _backpressure_paused[dir].store(false);
+        log_debug("chain: RESUME dir=%d max_p=%d", dir, max_p);
         if (_pause_cb[dir]) _pause_cb[dir](false);
     }
 }

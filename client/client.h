@@ -89,6 +89,7 @@ private:
         bool chain_paused = false;         // received MSG_CHAIN_PAUSE — remote chain full
         bool local_chain_sent = false;     // sent MSG_CHAIN_PAUSE
         bool shutting_down_wr = false;
+        bool epollin_removed = false;    // EPOLLIN was removed from fd
     };
     std::unordered_map<uint8_t, ExternalConn> conns_;
 
