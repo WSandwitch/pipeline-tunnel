@@ -177,12 +177,13 @@ void Chain::enqueue_module(Module *mod, const uint8_t *data, size_t len,
     _inflight.fetch_add(1);
     check_backpressure(dir);
 
-    _pool->enqueue([this, data, len, src_idx, dir, output_port, mod, owner,
-                   om = &dir_order_mutex_[dir]]() {
+    _pool->enqueue([this, data, len, src_idx, dir, output_port, mod, owner]() {
+        dir_order_mutex_[dir].lock();
+
         if (_cancelled.load()) {
+            dir_order_mutex_[dir].unlock();
             mod->pending[dir].fetch_sub(1);
             check_backpressure(dir);
-            om->unlock();
             free(const_cast<uint8_t*>(data));
             task_done();
             return;
@@ -198,7 +199,7 @@ void Chain::enqueue_module(Module *mod, const uint8_t *data, size_t len,
         }
 
         std::lock_guard<std::mutex> lock(mod->dir_mutex[dir]);
-        om->unlock();
+        dir_order_mutex_[dir].unlock();
 
         int ret = mod->base->process_fn(mod->ctx, dir, src_idx);
         fprintf(stderr, "CHAIN[%d]: AFTER dir=%d mod=%p ret=%d next_mod=%p dptr=%p dlen=%zu\n", my_gettid(), dir, (void*)mod, ret, (void*)g_ctx.next_mod, (void*)g_ctx.data, g_ctx.len);
@@ -222,7 +223,7 @@ void Chain::enqueue_module(Module *mod, const uint8_t *data, size_t len,
         }
 
         task_done();
-    }, &dir_order_mutex_[dir]);
+    });
 }
 
 void Chain::task_done() {
