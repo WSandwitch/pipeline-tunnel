@@ -12,6 +12,8 @@
 #include <algorithm>
 #include <fcntl.h>
 #include <openssl/sha.h>
+#include <sys/syscall.h>
+static pid_t my_gettid() { return (pid_t)syscall(SYS_gettid); }
 
 static std::string hex_sha256(const std::string &data) {
     unsigned char hash[SHA256_DIGEST_LENGTH];
@@ -679,14 +681,19 @@ void Client::handle_auth2_challenge(const Packet &pkt) {
         // Normal data for ext connection: write directly (no deferral)
         // to avoid 50ms delay that causes DC TCP buffer buildup and stalls.
             uint8_t conn_id = data[0];
-            auto it = self->conns_.find(conn_id);
-            if (it == self->conns_.end() || it->second.disconnecting || it->second.fd < 0) {
-                log_error("client: wire_write dst=0 conn_id=%u not found", conn_id);
-                free(const_cast<uint8_t*>(data));
-                return -1;
+            int ext_fd;
+            int ret;
+            {
+                std::lock_guard<std::mutex> lock(self->data_mtx_);
+                auto it = self->conns_.find(conn_id);
+                if (it == self->conns_.end() || it->second.disconnecting || it->second.fd < 0) {
+                    log_error("client: wire_write dst=0 conn_id=%u not found", conn_id);
+                    free(const_cast<uint8_t*>(data));
+                    return -1;
+                }
+                ext_fd = it->second.fd;
+                ret = it->second.writer.write(ext_fd, data + 1, len - 1);
             }
-            int ext_fd = it->second.fd;
-            int ret = it->second.writer.write(ext_fd, data + 1, len - 1);
             if (ret >= 0) {
                 std::lock_guard<std::mutex> lock(self->data_mtx_);
                 if (ret > 0) {
@@ -740,6 +747,7 @@ void Client::handle_auth2_challenge(const Packet &pkt) {
         frame.insert(frame.end(), varint_buf, varint_buf + varint_len);
         frame.push_back(0); // type=0 (WIRE_DATA)
         frame.insert(frame.end(), data, data + len);
+        fprintf(stderr, "WW[%d]: dc=%d writing %zu bytes to fd=%d (wbuf_sz=%zu errno=%d)\n", my_gettid(), dc_idx, frame.size(), fd, self->data_connections_[dc_idx].writer.size(), errno);
         int wret = self->data_connections_[dc_idx].writer.write(fd, frame.data(), frame.size());
         if (wret > 0) {
             std::lock_guard<std::mutex> lock(self->data_mtx_);
@@ -1190,7 +1198,13 @@ void Client::handle_connect_ok(const Packet &pkt) {
                 auto it = conns_.find(conn_id);
                 if (it != conns_.end())
                     it->second.shutting_down_wr = true;
-                if (!data_connections_.empty() && data_connections_[0].fd >= 0) {
+                if (chain_) {
+                    uint8_t *ctrl = (uint8_t*)malloc(3);
+                    ctrl[0] = 255;
+                    ctrl[1] = CHAIN_CTRL_SHUTDOWN_WR;
+                    ctrl[2] = conn_id;
+                    chain_->push_packet(ctrl, 3, 0, 0);
+                } else if (!data_connections_.empty() && data_connections_[0].fd >= 0) {
                     uint8_t pkt[3] = {2, WIRE_SHUTDOWN_WR, conn_id};
                     data_connections_[0].writer.write(data_connections_[0].fd, pkt, 3);
                     if (data_connections_[0].writer.size() > 0 && !data_connections_[0].writer.registered)

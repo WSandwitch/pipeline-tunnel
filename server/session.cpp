@@ -12,6 +12,8 @@
 #include <netdb.h>
 #include <fcntl.h>
 #include <openssl/sha.h>
+#include <sys/syscall.h>
+static pid_t my_gettid() { return (pid_t)syscall(SYS_gettid); }
 
 extern std::unordered_map<uint64_t, std::weak_ptr<Session>> g_session_registry;
 extern std::unordered_map<uint64_t, std::shared_ptr<Session>> g_paused_sessions;
@@ -237,10 +239,29 @@ void Session::handle_auth2_response(const Packet &pkt) {
             log_debug("session %llx: wire_write dst=%d len=%zu data[0]=%u",
                       (unsigned long long)self->session_id_, dst, len, len>0?data[0]:0);
             if (dst == 0) {
-                if (len < 1 || data[0] == 255) {
-                    if (len >= 1)
-                        log_error("session %llx: wire_write dst=0 conn_id=255 invalid",
-                                  (unsigned long long)self->session_id_);
+                if (len < 1) {
+                    free(const_cast<uint8_t*>(data));
+                    return -1;
+                }
+                if (data[0] == 255) {
+                    if (len >= 3 && data[1] == CHAIN_CTRL_SHUTDOWN_WR) {
+                        uint8_t conn_id = data[2];
+                        free(const_cast<uint8_t*>(data));
+                        std::lock_guard<std::mutex> lock(self->targets_mtx_);
+                        auto tit = self->targets_.find(conn_id);
+                        if (tit != self->targets_.end()) {
+                            tit->second.shutdown_wr = true;
+                            if (tit->second.writer.empty() ||
+                                tit->second.writer.flush(tit->second.fd)) {
+                                shutdown(tit->second.fd, SHUT_WR);
+                                tit->second.shutdown_wr_sent = true;
+                            }
+                        }
+                        return 0;
+                    }
+                    log_error("session %llx: wire_write dst=0 unknown chain ctrl type=%u",
+                              (unsigned long long)self->session_id_, len>=2?data[1]:0);
+                    fprintf(stderr, "WW_SRV[%d]: dst=0 drop chain ctrl\n", my_gettid());
                     free(const_cast<uint8_t*>(data));
                     return -1;
                 }
@@ -251,8 +272,17 @@ void Session::handle_auth2_response(const Packet &pkt) {
                 {
                     std::lock_guard<std::mutex> lock(self->targets_mtx_);
                     auto tit = self->targets_.find(conn_id);
-                    if (tit == self->targets_.end()) { free(const_cast<uint8_t*>(data)); return -1; }
+                    if (tit == self->targets_.end()) {
+                        struct timespec ts_now;
+                        clock_gettime(CLOCK_MONOTONIC, &ts_now);
+                        fprintf(stderr, "WW_SRV[%d]: dst=0 conn_id=%u NOT FOUND t=%lld.%09ld\n", my_gettid(), conn_id, (long long)ts_now.tv_sec, ts_now.tv_nsec);
+                        free(const_cast<uint8_t*>(data)); return -1;
+                    }
+                    struct timespec ts_now2;
+                    clock_gettime(CLOCK_MONOTONIC, &ts_now2);
+                    fprintf(stderr, "WW_SRV[%d]: dst=0 conn_id=%u fd=%d writing %zu bytes t=%lld.%09ld\n", my_gettid(), conn_id, tit->second.fd, len-1, (long long)ts_now2.tv_sec, ts_now2.tv_nsec);
                     ret = tit->second.writer.write(tit->second.fd, data + 1, len - 1);
+                    fprintf(stderr, "WW_SRV[%d]: dst=0 write ret=%d\n", my_gettid(), ret);
                     if (ret > 0) need_epollout = true;
                     if (ret > 0 && !ref->in_paused[conn_id]) {
                         need_pause = true;
@@ -634,13 +664,18 @@ void Session::handle_connect_req(const Packet &pkt) {
 
     // Send OK with conn_id
     Packet ok = Protocol::make_msg(MSG_CONNECT_OK, &conn_id, 1);
+    fprintf(stderr, "PRE_SEND_CONTROL[%d]: conn_id=%u\n", my_gettid(), conn_id);
     send_control(ok);
+    fprintf(stderr, "POST_SEND_CONTROL[%d]: conn_id=%u targets_sz=%zu\n", my_gettid(), conn_id, targets_.size());
 
     // Register target read handler
     int tfd = targets_[conn_id].fd;
     auto self = shared_from_this();
     kernel_->add_fd_handler(tfd, [this, self, conn_id](int fd, uint32_t events) {
         try {
+            struct timespec ts_now;
+            clock_gettime(CLOCK_MONOTONIC, &ts_now);
+            fprintf(stderr, "TARGET_EVENT[%d]: fd=%d events=0x%x conn_id=%u t=%lld.%09ld\n", my_gettid(), fd, events, conn_id, (long long)ts_now.tv_sec, ts_now.tv_nsec);
             if (events & EPOLLIN) {
                 {
                     uint8_t *rbuf = (uint8_t*)malloc(MAX_PACKET_SIZE);
@@ -1262,6 +1297,7 @@ bool Session::setup_tunnel_target(const std::string &target_addr, uint8_t conn_i
     targets_[conn_id] = {fd, target_addr};
     log_info("session %llx: connected to target %s:%s (fd=%d, conn_id=%u)",
              (unsigned long long)session_id_, host.c_str(), port.c_str(), fd, conn_id);
+
     return true;
 }
 
@@ -1319,6 +1355,9 @@ void Session::handle_target_eof(uint8_t conn_id) {
 void Session::close_target(uint8_t conn_id) {
     auto it = targets_.find(conn_id);
     if (it == targets_.end()) return;
+    struct timespec ts;
+    clock_gettime(CLOCK_MONOTONIC, &ts);
+    fprintf(stderr, "CLOSE_TARGET_CALLED[%d]: conn_id=%u fd=%d t=%lld.%09ld\\n", my_gettid(), conn_id, it->second.fd, (long long)ts.tv_sec, ts.tv_nsec);
     kernel_->del_fd(it->second.fd);
     close(it->second.fd);
     targets_.erase(it);

@@ -3,10 +3,18 @@
 
 $stdout.sync = true
 $stderr.sync = true
+SAVED_LOGS = []
+KEEP_LOGS = ENV['KEEP_LOGS'] == '1'
+if KEEP_LOGS
+  require 'fileutils'
+  SAVE_DIR = File.join('/tmp', "saved_logs_#{Time.now.to_i}_#{rand(1000)}")
+  FileUtils.mkdir_p(SAVE_DIR)
+end
 
 require 'optparse'
 require 'socket'
 require 'timeout'
+require 'tempfile'
 
 HOST = '127.0.0.1'
 PASS = 'testpass'
@@ -52,6 +60,13 @@ unless SERVER && CLIENT && MPATH && options[:config]
   exit 1
 end
 
+# stdbuf forces line-buffered output from iperf3 even when stdout is a pipe
+HAVE_STDBUF = system('which stdbuf >/dev/null 2>&1')
+
+def iperf3_args(*a)
+  HAVE_STDBUF ? ['stdbuf', '-oL', 'iperf3', *a] : ['iperf3', *a]
+end
+
 def find_free_port(low = 30_000, high = 34_000)
   50.times do
     port = rand(low..high)
@@ -77,10 +92,6 @@ def wait_port_listen(port, timeout = 10)
   raise "port #{port} not ready after #{timeout}s"
 end
 
-def null_redirect
-  $options[:verbose] ? STDERR : File::NULL
-end
-
 def spawn_verbosely(*args)
   $stderr.puts "  + #{args.map { |a| a.to_s.include?(' ') ? "'#{a}'" : a }.join(' ')}" if $options[:verbose]
   Process.spawn(*args)
@@ -90,24 +101,71 @@ def killall
   system('killall', '-9', 'ppltunnel-server', 'ppltunnel-client', 'iperf3', %i[out err] => File::NULL)
 end
 
+def read_log(f)
+  return '' unless f
+  f.rewind
+  f.read
+end
+
+def alive_check(pid, name, log = nil)
+  _, status = Process.waitpid2(pid, Process::WNOHANG)
+  return unless status
+  err = read_log(log)
+  msg = "#{name} (pid #{pid}) died immediately: #{status.inspect}"
+  msg += "\n#{err}" unless err.empty?
+  raise msg
+end
+
+def wait_port_or_die(pid, port, log, timeout = 10)
+  deadline = Process.clock_gettime(Process::CLOCK_MONOTONIC) + timeout
+  while Process.clock_gettime(Process::CLOCK_MONOTONIC) < deadline
+    _, status = Process.waitpid2(pid, Process::WNOHANG)
+    if status
+      err = read_log(log)
+      raise "Process died before listening:\n#{err.empty? ? '(no output)' : err}"
+    end
+    out = `ss -tln sport = #{port} 2>/dev/null`
+    return if out.include?(":#{port}")
+    sleep 0.05
+  end
+  _, status = Process.waitpid2(pid, Process::WNOHANG)
+  extra = status ? "(died: #{status.inspect})" : "(still running, port #{port} not listening)"
+  err = read_log(log)
+  msg = "port #{port} not ready after #{timeout}s #{extra}"
+  msg += "\n#{err}" unless err.empty?
+  raise msg
+end
+
 def thread_args(n)
   n == 0 ? ['-t'] : ['-t', n.to_s]
 end
 
 def start_tunnel(svr_port, cli_port, tgt_port)
-  redir = null_redirect
+  $stderr.puts "    start_tunnel: spawning server on #{svr_port}..."
+  svr_log = Tempfile.new(%w[ppltunnel-server- .log])
   svr = spawn_verbosely(SERVER, "-l#{HOST}:#{svr_port}", "-A#{PASS}",
-                        "-M#{MPATH}", *thread_args($options[:threads]),
-                        %i[out err] => redir)
-  wait_port_listen(svr_port)
-  chain = ";#{$options[:config]}"
+                        "-M#{MPATH}", '-H60',
+                        *thread_args($options[:threads]),
+                        out: svr_log, err: [:child, :out])
+  alive_check(svr, 'ppltunnel-server', svr_log)
+  $stderr.puts "    start_tunnel: waiting for server port #{svr_port}..."
+  wait_port_or_die(svr, svr_port, svr_log)
+  $stderr.puts "    start_tunnel: server ready"
+
+  chain = $options[:config]&.start_with?(';') ? $options[:config] : ";#{$options[:config]}"
+  $stderr.puts "    start_tunnel: spawning client (chain='#{chain}')..."
+  cli_log = Tempfile.new(%w[ppltunnel-client- .log])
   cli = spawn_verbosely(CLIENT, "-L#{HOST}:#{cli_port}:#{HOST}:#{tgt_port}",
-                        "-M#{MPATH}",
+                        "-M#{MPATH}", '-H60',
                         "#{HOST}:#{svr_port},#{PASS}#{chain}",
                         *thread_args($options[:threads]),
-                        %i[out err] => redir)
-  wait_port_listen(cli_port)
-  [svr, cli]
+                        out: cli_log, err: [:child, :out])
+  alive_check(cli, 'ppltunnel-client', cli_log)
+  $stderr.puts "    start_tunnel: waiting for client port #{cli_port}..."
+  wait_port_or_die(cli, cli_port, cli_log)
+  $stderr.puts "    start_tunnel: client ready"
+
+  [svr, cli, svr_log, cli_log]
 end
 
 def stop_procs(*pids)
@@ -145,17 +203,30 @@ tunnels = []
 begin
   killall
   options[:clients].times do |i|
-    tgt = find_free_port
-    redir = null_redirect
-    iperf_pid = spawn_verbosely('iperf3', '-s', '-D', '-p', tgt.to_s,
-                                %i[out err] => redir)
-    wait_port_listen(tgt)
-    servers << { tgt_port: tgt, pid: iperf_pid }
+    begin
+      $stderr.puts "  setup client #{i + 1}: finding ports..."
+      tgt = find_free_port
+      svr_port = find_free_port
+      cli_port = find_free_port
 
-    svr_port = find_free_port
-    cli_port = find_free_port
-    svr, cli = start_tunnel(svr_port, cli_port, tgt)
-    tunnels << { cli_port: cli_port, svr_pid: svr, cli_pid: cli }
+      $stderr.puts "  setup client #{i + 1}: starting iperf3 server on #{tgt}..."
+      iperf_log = Tempfile.new(%w[iperf3-server- .log])
+      iperf_pid = spawn_verbosely('iperf3', '-s', '-D', '-p', tgt.to_s,
+                                  out: iperf_log, err: [:child, :out])
+      wait_port_listen(tgt)
+      servers << { tgt_port: tgt, pid: iperf_pid, log: iperf_log }
+
+      $stderr.puts "  setup client #{i + 1}: starting tunnel svr=#{svr_port} cli=#{cli_port} -> tgt=#{tgt}..."
+      svr, cli, svr_log, cli_log = start_tunnel(svr_port, cli_port, tgt)
+      $stderr.puts "  setup client #{i + 1}: tunnel ready (svr=#{svr} cli=#{cli})"
+      tunnels << { cli_port: cli_port, svr_pid: svr, cli_pid: cli, svr_log: svr_log, cli_log: cli_log }
+    rescue => e
+      $stderr.puts "  SETUP ERROR (client #{i + 1}): #{e.message}"
+      servers.each { |s| stop_procs(s[:pid]) }
+      tunnels.each { |t| stop_procs(t[:cli_pid], t[:svr_pid]) }
+      killall
+      raise
+    end
   end
 
   $stderr.puts "[#{options[:config]}] Starting #{options[:direction]} " \
@@ -167,8 +238,8 @@ begin
   threads = tunnels.map.with_index do |t, i|
     Thread.new do
       port = t[:cli_port]
-      args = ['iperf3', '-c', HOST, '-p', port.to_s,
-              '-t', options[:duration].to_s, '-P', options[:parallel].to_s]
+      args = iperf3_args('-c', HOST, '-p', port.to_s,
+                         '-t', options[:duration].to_s, '-P', options[:parallel].to_s)
       case options[:direction]
       when 'reverse' then args << '-R'
       when 'bidir' then args << '--bidir'
@@ -205,7 +276,8 @@ begin
   end
 
   unless thread_errors.empty?
-    $stderr.puts "  WARNING: #{thread_errors.length} thread(s) raised errors"
+    $stderr.puts "  WARNING: #{thread_errors.length} thread(s) raised errors:"
+    thread_errors.each { |e| $stderr.puts "    #{e.class}: #{e.message}" }
   end
 
   results = thread_results
@@ -227,6 +299,18 @@ begin
 ensure
   tunnels.each { |t| stop_procs(t[:cli_pid], t[:svr_pid]) }
   killall
+  unless ok
+    servers.each do |s|
+      log = read_log(s[:log])
+      $stderr.puts "  # iperf3-server #{s[:tgt_port]} log:\n#{log.each_line.map { |l| "  # #{l}" }.join}" unless log.empty?
+    end
+    tunnels.each do |t|
+      [t[:svr_log], t[:cli_log]].compact.each do |log|
+        data = read_log(log)
+        $stderr.puts "  # #{File.basename(log.path)}:\n#{data.each_line.map { |l| "  # #{l}" }.join}" unless data.empty?
+      end
+    end
+  end
 end
 
-exit 0
+exit ok ? 0 : 1

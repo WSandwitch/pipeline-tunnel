@@ -33,9 +33,10 @@ ChainConfig parse_chain(const std::string &str) {
             return cfg;
     }
 
-    // remaining blocks: name|params
+    // remaining blocks: name|params (skip empty blocks)
     for (size_t i = 1; i < blocks.size(); i++) {
         std::string &b = blocks[i];
+        if (b.empty()) continue;
         ModuleSpec ms;
         auto pipe = b.find('|');
         if (pipe == std::string::npos) {

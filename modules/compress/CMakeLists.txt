@@ -5,4 +5,5 @@ set_target_properties(compress PROPERTIES PREFIX "" SUFFIX ".so")
 
 add_custom_command(TARGET compress POST_BUILD
   COMMAND ${CMAKE_COMMAND} -E copy $<TARGET_FILE:compress> ${CMAKE_BINARY_DIR}/tests/test_modules/
-  COMMENT "Copying compress.so to tests/test_modules/")
+  COMMAND ${CMAKE_COMMAND} -E copy $<TARGET_FILE:compress> ${CMAKE_BINARY_DIR}/modules/
+  COMMENT "Copying compress.so to tests/test_modules/ and modules/")

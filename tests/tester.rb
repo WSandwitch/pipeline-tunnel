@@ -129,9 +129,13 @@ end
 # Filter by config if -C was given
 if options[:config]
   filter = options[:config]
+  filter = filter.sub(/\A;+/, '').sub(/;+\z/, '')
   if filter.include?('|') || filter.include?(';')
+    # Full chain config — run only this one (add if not in list)
     configs.select! { |c| c == filter }
+    configs << filter if configs.empty?
   else
+    # Module name — run all configs for this module
     configs.select! { |c| c == filter || c.start_with?("#{filter}|") }
   end
 end

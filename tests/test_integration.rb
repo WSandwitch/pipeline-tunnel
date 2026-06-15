@@ -86,14 +86,41 @@ def find_free_port(low = 31_000, high = 34_000)
   raise 'no free port found'
 end
 
-def wait_port_listen(port, timeout = 10)
+def read_log(f)
+  return '' unless f
+  f.rewind
+  f.read
+end
+
+def alive_check(pid, name, log = nil)
+  _, status = Process.waitpid2(pid, Process::WNOHANG)
+  return unless status
+  err = read_log(log)
+  msg = "#{name} (pid #{pid}) died immediately: #{status.inspect}"
+  msg += "\n#{err}" unless err.empty?
+  raise msg
+end
+
+def wait_port_or_die(pid, port, log, timeout = 10)
   deadline = Process.clock_gettime(Process::CLOCK_MONOTONIC) + timeout
   while Process.clock_gettime(Process::CLOCK_MONOTONIC) < deadline
+    _, status = Process.waitpid2(pid, Process::WNOHANG)
+    if status
+      err = read_log(log)
+      raise "Process died before listening:\n#{err.empty? ? '(no output)' : err}"
+    end
     out = `ss -tln sport = #{port} 2>/dev/null`
-    return if out.include?("127.0.0.1:#{port}") || out.include?("0.0.0.0:#{port}")
+    if out.include?("127.0.0.1:#{port}") || out.include?("0.0.0.0:#{port}")
+      return
+    end
     sleep 0.05
   end
-  raise "port #{port} not ready after #{timeout}s"
+  _, status = Process.waitpid2(pid, Process::WNOHANG)
+  extra = status ? "(died: #{status.inspect})" : "(still running, port #{port} not listening)"
+  err = read_log(log)
+  msg = "port #{port} not ready after #{timeout}s #{extra}"
+  msg += "\n#{err}" unless err.empty?
+  raise msg
 end
 
 def killall
@@ -109,23 +136,29 @@ def start_tunnel(svr_port, cli_port, tgt_port)
   cli_log = Tempfile.new(%w[ppltunnel-client- .log])
 
   svr_argv = [SERVER, "-l#{HOST}:#{svr_port}", "-A#{PASS}",
-              "-M#{MPATH}", *thread_args($options[:threads])]
+              "-M#{MPATH}", '-H60', *thread_args($options[:threads])]
   if $options[:verbose]
     $stderr.puts "  + #{svr_argv.map { |a| a.include?(' ') ? "'#{a}'" : a }.join(' ')} 2>&1 | tee #{svr_log.path}"
   end
   svr = Process.spawn(*svr_argv, out: svr_log, err: [:child, :out])
-  wait_port_listen(svr_port)
+  alive_check(svr, 'ppltunnel-server', svr_log)
+  wait_port_or_die(svr, svr_port, svr_log)
 
-  chain = $options[:config] ? ";#{$options[:config]}" : ''
+  chain = if $options[:config]&.start_with?(';')
+             $options[:config]
+           else
+             $options[:config] ? ";#{$options[:config]}" : ''
+           end
   cli_argv = [CLIENT, "-L#{HOST}:#{cli_port}:#{HOST}:#{tgt_port}",
-              "-M#{MPATH}",
+              "-M#{MPATH}", '-H60',
               "#{HOST}:#{svr_port},#{PASS}#{chain}",
               *thread_args($options[:threads])]
   if $options[:verbose]
     $stderr.puts "  + #{cli_argv.map { |a| a.include?(' ') ? "'#{a}'" : a }.join(' ')} 2>&1 | tee #{cli_log.path}"
   end
   cli = Process.spawn(*cli_argv, out: cli_log, err: [:child, :out])
-  wait_port_listen(cli_port)
+  alive_check(cli, 'ppltunnel-client', cli_log)
+  wait_port_or_die(cli, cli_port, cli_log)
   [svr, cli, svr_log, cli_log]
 end
 

@@ -120,7 +120,7 @@ options[:count].times do |i|
                         %i[out err] => File::NULL)
     wait_port_listen(svr_port)
 
-    chain = ";#{$options[:config]}"
+    chain = $options[:config]&.start_with?(';') ? $options[:config] : ";#{$options[:config]}"
     cli = Process.spawn(CLIENT, "-L#{HOST}:#{cli_port}:#{HOST}:#{tgt}",
                         "-M#{MPATH}",
                         "#{HOST}:#{svr_port},#{PASS}#{chain}",

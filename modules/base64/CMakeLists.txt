@@ -98,4 +98,5 @@ set_target_properties(base64 PROPERTIES PREFIX "" SUFFIX ".so")
 
 add_custom_command(TARGET base64 POST_BUILD
   COMMAND ${CMAKE_COMMAND} -E copy $<TARGET_FILE:base64> ${CMAKE_BINARY_DIR}/tests/test_modules/
-  COMMENT "Copying base64.so to tests/test_modules/")
+  COMMAND ${CMAKE_COMMAND} -E copy $<TARGET_FILE:base64> ${CMAKE_BINARY_DIR}/modules/
+  COMMENT "Copying base64.so to tests/test_modules/ and modules/")

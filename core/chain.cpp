@@ -1,6 +1,9 @@
 #include "chain.h"
 #include "thread_pool.h"
 #include "common/logger.h"
+#include <sys/syscall.h>
+#include <unistd.h>
+static pid_t my_gettid() { return (pid_t)syscall(SYS_gettid); }
 
 static Module *find_module_by_idx(std::vector<std::unique_ptr<Module>> &vec, size_t idx) {
     if (idx >= vec.size()) return nullptr;
@@ -187,6 +190,8 @@ void Chain::enqueue_module(Module *mod, const uint8_t *data, size_t len,
 
         g_ctx = ChainContext{data, len, src_idx, dir, output_port, nullptr};
 
+        fprintf(stderr, "CHAIN[%d]: DATA ptr=%p len=%zu dir=%d mod=%p\n", my_gettid(), (void*)g_ctx.data, g_ctx.len, dir, (void*)mod);
+
         {
             std::lock_guard<std::mutex> lock(mod->hb_mutex);
             mod->last_activity = std::chrono::steady_clock::now();
@@ -196,12 +201,13 @@ void Chain::enqueue_module(Module *mod, const uint8_t *data, size_t len,
         om->unlock();
 
         int ret = mod->base->process_fn(mod->ctx, dir, src_idx);
+        fprintf(stderr, "CHAIN[%d]: AFTER dir=%d mod=%p ret=%d next_mod=%p dptr=%p dlen=%zu\n", my_gettid(), dir, (void*)mod, ret, (void*)g_ctx.next_mod, (void*)g_ctx.data, g_ctx.len);
 
         mod->pending[dir].fetch_sub(1);
         check_backpressure(dir);
 
         if (ret < 0) {
-            log_debug("chain: module process_fn returned %d, dropping packet", ret);
+            fprintf(stderr, "CHAIN[%d]: process_fn returned %d, dropping\n", my_gettid(), ret);
             task_done();
             return;
         }
@@ -210,6 +216,7 @@ void Chain::enqueue_module(Module *mod, const uint8_t *data, size_t len,
         if (g_ctx.next_mod) {
             Module *next = g_ctx.next_mod;
             g_ctx.next_mod = nullptr;
+            fprintf(stderr, "CHAIN[%d]: reverse chain to mod=%p\n", my_gettid(), (void*)next);
             enqueue_module(next, g_ctx.data, g_ctx.len,
                           g_ctx.src_idx, dir, g_ctx.output_port);
         }
@@ -300,7 +307,9 @@ void *Chain::get_packet_impl(Module *mod, int idx, int *out_size) {
     (void)mod;
     (void)idx;
     *out_size = (int)g_ctx.len;
-    return const_cast<uint8_t*>(g_ctx.data);
+    const uint8_t *ret_ptr = g_ctx.data;
+    fprintf(stderr, "GETPKT[%d]: mod=%p dptr=%p dlen=%d\n", my_gettid(), (void*)mod, (void*)ret_ptr, (int)g_ctx.len);
+    return const_cast<uint8_t*>(ret_ptr);
 }
 
 int Chain::request_heartbeat_static(void *chain_ctx, int interval_sec) {
