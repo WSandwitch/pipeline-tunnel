@@ -284,8 +284,11 @@ void Session::handle_auth2_response(const Packet &pkt) {
             }
             if (dst < 1 || (size_t)dst > self->data_connections_.size() ||
                 self->data_connections_[dst-1].fd < 0) {
-                log_error("session %llx: wire_write dst=%zu no data connection",
-                          (unsigned long long)self->session_id_, (size_t)dst);
+                std::string dcs;
+                for (size_t di = 0; di < self->data_connections_.size(); di++)
+                    dcs += std::to_string(self->data_connections_[di].fd) + " ";
+                log_error("session %llx: wire_write dst=%zu no data connection dc_fds=[%s]",
+                          (unsigned long long)self->session_id_, (size_t)dst, dcs.c_str());
                 return -1;
             }
             int fd = self->data_connections_[dst-1].fd;
@@ -721,8 +724,11 @@ void Session::add_data_connection(uint8_t output_idx, int fd) {
     }
     data_connections_[output_idx].fd = fd;
     register_data_connection_reader(output_idx);
-    log_info("session %llx: data connection %u added (fd=%d)",
-             (unsigned long long)session_id_, output_idx, fd);
+    std::string dcs;
+    for (size_t di = 0; di < data_connections_.size(); di++)
+        dcs += std::to_string(data_connections_[di].fd) + " ";
+    log_info("session %llx: data connection %u added (fd=%d) dc_fds=[%s]",
+             (unsigned long long)session_id_, output_idx, fd, dcs.c_str());
 
     // Check if all connections are ready
     bool all_ready = true;

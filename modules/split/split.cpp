@@ -163,20 +163,19 @@ static int process_merge(SplitContext *ctx, int trigger_idx) {
             if (!out_buf) { return -1; }
             std::memcpy(out_buf, out.data(), out.size());
 
+            int wr = ctx->api->write_packet(ctx->api->ctx, write_output, out_buf, out.size());
+            if (wr < 0) {
+                std::fprintf(stderr, "[split ERR] merge write_packet output=%d ret=%d\n",
+                        write_output, wr);
+                return wr;
+            }
+
             for (uint32_t s = ctx->merge_next_seq; s <= scan; s++) {
                 ctx->merge_buf.erase(s);
                 ctx->merge_more.erase(s);
             }
             ctx->merge_next_seq = scan + 1;
             scan = ctx->merge_next_seq;
-
-            int wr = ctx->api->write_packet(ctx->api->ctx, write_output, out_buf, out.size());
-            if (wr < 0) {
-                // out_buf ownership already transferred — do NOT free it
-                std::fprintf(stderr, "[split ERR] merge write_packet output=%d ret=%d\n",
-                        write_output, wr);
-                return wr;
-            }
             continue;
         }
         scan++;
