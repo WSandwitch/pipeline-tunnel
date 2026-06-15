@@ -261,7 +261,6 @@ void Session::handle_auth2_response(const Packet &pkt) {
                     }
                     log_error("session %llx: wire_write dst=0 unknown chain ctrl type=%u",
                               (unsigned long long)self->session_id_, len>=2?data[1]:0);
-                    fprintf(stderr, "WW_SRV[%d]: dst=0 drop chain ctrl\n", my_gettid());
                     free(const_cast<uint8_t*>(data));
                     return -1;
                 }
@@ -273,16 +272,9 @@ void Session::handle_auth2_response(const Packet &pkt) {
                     std::lock_guard<std::mutex> lock(self->targets_mtx_);
                     auto tit = self->targets_.find(conn_id);
                     if (tit == self->targets_.end()) {
-                        struct timespec ts_now;
-                        clock_gettime(CLOCK_MONOTONIC, &ts_now);
-                        fprintf(stderr, "WW_SRV[%d]: dst=0 conn_id=%u NOT FOUND t=%lld.%09ld\n", my_gettid(), conn_id, (long long)ts_now.tv_sec, ts_now.tv_nsec);
                         free(const_cast<uint8_t*>(data)); return -1;
                     }
-                    struct timespec ts_now2;
-                    clock_gettime(CLOCK_MONOTONIC, &ts_now2);
-                    fprintf(stderr, "WW_SRV[%d]: dst=0 conn_id=%u fd=%d writing %zu bytes t=%lld.%09ld\n", my_gettid(), conn_id, tit->second.fd, len-1, (long long)ts_now2.tv_sec, ts_now2.tv_nsec);
                     ret = tit->second.writer.write(tit->second.fd, data + 1, len - 1);
-                    fprintf(stderr, "WW_SRV[%d]: dst=0 write ret=%d\n", my_gettid(), ret);
                     if (ret > 0) need_epollout = true;
                     if (ret > 0 && !ref->in_paused[conn_id]) {
                         need_pause = true;
@@ -664,18 +656,13 @@ void Session::handle_connect_req(const Packet &pkt) {
 
     // Send OK with conn_id
     Packet ok = Protocol::make_msg(MSG_CONNECT_OK, &conn_id, 1);
-    fprintf(stderr, "PRE_SEND_CONTROL[%d]: conn_id=%u\n", my_gettid(), conn_id);
     send_control(ok);
-    fprintf(stderr, "POST_SEND_CONTROL[%d]: conn_id=%u targets_sz=%zu\n", my_gettid(), conn_id, targets_.size());
 
     // Register target read handler
     int tfd = targets_[conn_id].fd;
     auto self = shared_from_this();
     kernel_->add_fd_handler(tfd, [this, self, conn_id](int fd, uint32_t events) {
         try {
-            struct timespec ts_now;
-            clock_gettime(CLOCK_MONOTONIC, &ts_now);
-            fprintf(stderr, "TARGET_EVENT[%d]: fd=%d events=0x%x conn_id=%u t=%lld.%09ld\n", my_gettid(), fd, events, conn_id, (long long)ts_now.tv_sec, ts_now.tv_nsec);
             if (events & EPOLLIN) {
                 {
                     uint8_t *rbuf = (uint8_t*)malloc(MAX_PACKET_SIZE);
@@ -1355,9 +1342,6 @@ void Session::handle_target_eof(uint8_t conn_id) {
 void Session::close_target(uint8_t conn_id) {
     auto it = targets_.find(conn_id);
     if (it == targets_.end()) return;
-    struct timespec ts;
-    clock_gettime(CLOCK_MONOTONIC, &ts);
-    fprintf(stderr, "CLOSE_TARGET_CALLED[%d]: conn_id=%u fd=%d t=%lld.%09ld\\n", my_gettid(), conn_id, it->second.fd, (long long)ts.tv_sec, ts.tv_nsec);
     kernel_->del_fd(it->second.fd);
     close(it->second.fd);
     targets_.erase(it);

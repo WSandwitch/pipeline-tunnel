@@ -43,8 +43,6 @@ int process(void *ctx_ptr, int dir, int trigger_idx) {
         fprintf(stderr, "\n");
     }
     int write_dst = (trigger_idx == 0) ? 1 : 0;
-    fprintf(stderr, "COPY[%d]: node=%d dir=%d trig=%d sz=%d write_dst=%d\n", ctx->node_id, ctx->node_id, dir, trigger_idx, sz, write_dst);
-
     if (ctx->mode_copy) {
         uint8_t *cp = (uint8_t *)malloc((size_t)sz);
         if (!cp) { free(pkt); return -1; }

@@ -747,7 +747,6 @@ void Client::handle_auth2_challenge(const Packet &pkt) {
         frame.insert(frame.end(), varint_buf, varint_buf + varint_len);
         frame.push_back(0); // type=0 (WIRE_DATA)
         frame.insert(frame.end(), data, data + len);
-        fprintf(stderr, "WW[%d]: dc=%d writing %zu bytes to fd=%d (wbuf_sz=%zu errno=%d)\n", my_gettid(), dc_idx, frame.size(), fd, self->data_connections_[dc_idx].writer.size(), errno);
         int wret = self->data_connections_[dc_idx].writer.write(fd, frame.data(), frame.size());
         if (wret > 0) {
             std::lock_guard<std::mutex> lock(self->data_mtx_);
