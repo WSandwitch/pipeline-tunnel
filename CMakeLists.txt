@@ -14,6 +14,7 @@ add_subdirectory(core)
 add_subdirectory(server)
 add_subdirectory(client)
 add_subdirectory(modules)
+file(MAKE_DIRECTORY ${CMAKE_BINARY_DIR}/tests/test_modules)
 
 option(BUILD_MODULE_TESTER "Build module_tester" OFF)
 if(BUILD_MODULE_TESTER)

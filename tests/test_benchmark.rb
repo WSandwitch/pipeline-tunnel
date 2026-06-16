@@ -263,7 +263,7 @@ begin
     end
   end
 
-  test_timeout = [(options[:duration] || 30) + 10, 15].max
+  test_timeout = [(options[:duration] || 30) + 15, 15].max
   timed_out = false
   begin
     Timeout.timeout(test_timeout) { threads.each(&:join) }

@@ -5,8 +5,11 @@ RUN apk add --no-cache \
     openssl-dev \
     linux-headers \
     musl-dev \
+    procps-ng \
     ruby \
     iperf3 \
     iproute2 \
-    python3
+    curl \
+    python3 \
+    gdb
 WORKDIR /app

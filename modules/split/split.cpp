@@ -5,16 +5,23 @@
 #include <cstdlib>
 #include <ctime>
 #include <vector>
-#include <unordered_map>
-
 
 #define CLAMP(x,lo,hi) ((x) < (lo) ? (lo) : (x) > (hi) ? (hi) : (x))
 
 #define DEF_CHUNK_SIZE 16384
 #define MIN_CHUNK 64
 #define MAX_CHUNK 65536
-
 #define HEADER_SIZE 5
+#define MAX_CHUNKS_PER_PASS 65536
+#define RING_SIZE 65536
+#define RING_MASK (RING_SIZE - 1)
+
+struct SlotEntry {
+    uint8_t *data;
+    uint32_t size;
+    uint16_t seq_high;
+    uint8_t flags;
+};
 
 struct SplitContext {
     ModuleChain *api = nullptr;
@@ -22,8 +29,7 @@ struct SplitContext {
     uint32_t rr_idx = 0;
     uint32_t seqnum = 0;
     uint32_t merge_next_seq = 0;
-    std::unordered_map<uint32_t, std::vector<std::vector<uint8_t>>> merge_buf;
-    std::unordered_map<uint32_t, bool> merge_more;
+    std::vector<SlotEntry> ring;
     int trace = 0;
     int node_id = -1;
     int chunk_size_min = DEF_CHUNK_SIZE;
@@ -58,12 +64,18 @@ static int process_split(SplitContext *ctx, int trigger_idx) {
     if (ctx->trace) std::fprintf(stderr, "[SPLIT] dir=0 IN sz=%d trigger=%d rr_idx=%u seqnum=%u outputs=%d\n", sz, trigger_idx, ctx->rr_idx, ctx->seqnum, ctx->num_outputs);
 
     int offset = 0;
+    int chunks = 0;
 
     while (offset < sz) {
         int remain = sz - offset;
-        int chunk_len = next_chunk_size(ctx);
-        if (chunk_len > remain) chunk_len = remain;
-        int more = (chunk_len < remain) ? 1 : 0;
+        int chunk_len;
+        if (chunks >= MAX_CHUNKS_PER_PASS - 1) {
+            chunk_len = remain;
+        } else {
+            chunk_len = next_chunk_size(ctx);
+            if (chunk_len > remain) chunk_len = remain;
+        }
+        int more = (offset + chunk_len < sz) ? 1 : 0;
 
         uint8_t header[HEADER_SIZE];
         header[0] = (uint8_t)(ctx->seqnum & 0xFF);
@@ -82,12 +94,13 @@ static int process_split(SplitContext *ctx, int trigger_idx) {
         std::memcpy(out_buf + HEADER_SIZE, in_buf + offset, (size_t)chunk_len);
 
         if (ctx->trace) std::fprintf(stderr, "[SPLIT] OUT seq=%u more=%d out=%d len=%d offset=%d/%d remain=%d\n",
-                ctx->seqnum, more, out_idx, chunk_len, offset, sz, sz - offset - chunk_len);
+                ctx->seqnum, more, out_idx, chunk_len, offset, sz, remain - chunk_len);
         ctx->api->write_packet(ctx->api->ctx, out_idx,
                                out_buf, (size_t)(chunk_len + HEADER_SIZE));
         ctx->rr_idx++;
         ctx->seqnum++;
         offset += chunk_len;
+        chunks++;
     }
 
     std::free(in_buf);
@@ -98,7 +111,7 @@ static int process_merge(SplitContext *ctx, int trigger_idx) {
     int sz = 0;
     uint8_t *buf = (uint8_t *)ctx->api->get_packet(ctx->api->ctx, 0, &sz);
     if (!buf || sz <= 0) {
-        if (ctx->trace) std::fprintf(stderr, "[MERGE] dir=1 IN sz=%d trigger=%d next_seq=%u buffered=%zu\n", sz, trigger_idx, ctx->merge_next_seq, ctx->merge_buf.size());
+        if (ctx->trace) std::fprintf(stderr, "[MERGE] dir=1 IN sz=%d trigger=%d next_seq=%u\n", sz, trigger_idx, ctx->merge_next_seq);
         return 0;
     }
 
@@ -111,11 +124,18 @@ static int process_merge(SplitContext *ctx, int trigger_idx) {
     uint8_t *data = buf + HEADER_SIZE;
     int data_len = sz - HEADER_SIZE;
 
-    if (ctx->trace) std::fprintf(stderr, "[MERGE] RECV seq=%u more=%d len=%d trigger=%d next_seq=%u buffered=%zu\n",
-            seq, more, data_len, trigger_idx, ctx->merge_next_seq, ctx->merge_buf.size());
+    if (ctx->trace) std::fprintf(stderr, "[MERGE] RECV seq=%u more=%d len=%d trigger=%d next_seq=%u\n",
+            seq, more, data_len, trigger_idx, ctx->merge_next_seq);
 
-    ctx->merge_buf[seq].emplace_back(data, data + data_len);
-    ctx->merge_more[seq] = more != 0;
+    SlotEntry &s = ctx->ring[seq & RING_MASK];
+    if (s.flags & 2) {
+        std::free(s.data);
+    }
+    s.data = (uint8_t *)std::malloc((size_t)data_len);
+    std::memcpy(s.data, data, (size_t)data_len);
+    s.size = (uint32_t)data_len;
+    s.seq_high = (uint16_t)(seq >> 16);
+    s.flags = (uint8_t)((more ? 1 : 0) | 2);
 
     std::free(buf);
 
@@ -123,40 +143,39 @@ static int process_merge(SplitContext *ctx, int trigger_idx) {
 
     uint32_t scan = ctx->merge_next_seq;
     while (true) {
-        auto it = ctx->merge_buf.find(scan);
-        if (it == ctx->merge_buf.end()) {
-            break;
-        }
-        if (!ctx->merge_more[scan]) {
-            std::vector<uint8_t> out;
+        SlotEntry &es = ctx->ring[scan & RING_MASK];
+        if (!(es.flags & 2)) break;
+        if (!(es.flags & 1)) {
+            size_t total = 0;
             for (uint32_t s = ctx->merge_next_seq; s <= scan; s++) {
-                auto ci = ctx->merge_buf.find(s);
-                if (ci == ctx->merge_buf.end()) break;
-                for (auto &chunk : ci->second) {
-                    out.insert(out.end(), chunk.begin(), chunk.end());
-                }
-            }
-            uint8_t *out_buf = (uint8_t *)std::malloc(out.size());
-            if (out_buf) {
-                std::memcpy(out_buf, out.data(), out.size());
-                if (ctx->trace) std::fprintf(stderr, "[MERGE] FLUSH seq=%u..%u out=%d size=%zu next_seq=%u buffered=%zu\n",
-                        ctx->merge_next_seq, scan, write_output, out.size(), scan + 1, ctx->merge_buf.size() - (scan - ctx->merge_next_seq + 1));
-                ctx->api->write_packet(ctx->api->ctx, write_output, out_buf, out.size());
+                total += ctx->ring[s & RING_MASK].size;
             }
 
-            for (uint32_t s = ctx->merge_next_seq; s <= scan; s++) {
-                ctx->merge_buf.erase(s);
-                ctx->merge_more.erase(s);
+            if (ctx->trace) std::fprintf(stderr, "[MERGE] FLUSH seq=%u..%u out=%d size=%zu next=%u\n",
+                    ctx->merge_next_seq, scan, write_output, total, scan + 1);
+
+            uint8_t *out_buf = (uint8_t *)std::malloc(total);
+            if (out_buf) {
+                size_t off = 0;
+                for (uint32_t s = ctx->merge_next_seq; s <= scan; s++) {
+                    SlotEntry &cs = ctx->ring[s & RING_MASK];
+                    std::memcpy(out_buf + off, cs.data, cs.size);
+                    off += cs.size;
+                    std::free(cs.data);
+                    cs.data = nullptr;
+                    cs.flags = 0;
+                }
+                ctx->api->write_packet(ctx->api->ctx, write_output, out_buf, total);
             }
+
             ctx->merge_next_seq = scan + 1;
             scan = ctx->merge_next_seq;
-            if (ctx->trace) std::fprintf(stderr, "[MERGE] FLUSHED next_seq=%u remaining=%zu\n", ctx->merge_next_seq, ctx->merge_buf.size());
             continue;
         }
         scan++;
     }
 
-    if (ctx->trace) std::fprintf(stderr, "[MERGE] WAIT next=%u buffered=%zu\n", ctx->merge_next_seq, ctx->merge_buf.size());
+    if (ctx->trace) std::fprintf(stderr, "[MERGE] WAIT next=%u\n", ctx->merge_next_seq);
     return 0;
 }
 
@@ -164,6 +183,7 @@ extern "C" {
 
 void *init(ModuleChain *api, const char *config) {
     SplitContext *ctx = new SplitContext();
+    ctx->ring.resize(RING_SIZE);
     ctx->api = api;
     ctx->chunk_size_min = DEF_CHUNK_SIZE;
     ctx->chunk_size_max = DEF_CHUNK_SIZE;
