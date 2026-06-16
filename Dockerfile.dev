@@ -6,6 +6,7 @@ RUN apk add --no-cache \
     linux-headers \
     musl-dev \
     procps-ng \
+    coreutils \
     ruby \
     iperf3 \
     iproute2 \
