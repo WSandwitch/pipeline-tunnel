@@ -27,7 +27,8 @@ options = {
   build_dir: nil,
   mod_dir: nil,
   config: nil,
-  threads: 1,
+  client_threads: 1,
+  server_threads: 1,
   quiet: false,
   verbose: false,
   test_types: %w[short long blocking bidi blocking_bidi],
@@ -38,7 +39,8 @@ op = OptionParser.new do |o|
   o.on('-S', '--server-dir DIR', 'Path to build dir') { |v| options[:build_dir] = v }
   o.on('-M', '--module-dir DIR', 'Path to .so modules dir') { |v| options[:mod_dir] = v }
   o.on('-C', '--config CONFIG', 'Chain config string') { |v| options[:config] = v }
-  o.on('-t', '--threads N', Integer, 'Worker thread count (0=auto)') { |v| options[:threads] = v }
+  o.on('-c', '--client-threads N', Integer, 'Client worker thread count') { |v| options[:client_threads] = v }
+  o.on('-s', '--server-threads N', Integer, 'Server worker thread count') { |v| options[:server_threads] = v }
   o.on('-q', '--quiet', 'Suppress output') { options[:quiet] = true }
   o.on('-v', '--verbose', 'Print commands before execution') { options[:verbose] = true }
 end
@@ -127,8 +129,14 @@ def killall
   system('killall', '-9', 'ppltunnel-server', 'ppltunnel-client', %i[out err] => File::NULL)
 end
 
-def thread_args(n)
-  n == 0 ? ['-t'] : ['-t', n.to_s]
+def server_thread_args
+  n = $options[:server_threads]
+  ['-t', n.to_s]
+end
+
+def client_thread_args
+  n = $options[:client_threads]
+  ['-t', n.to_s]
 end
 
 def start_tunnel(svr_port, cli_port, tgt_port)
@@ -136,7 +144,7 @@ def start_tunnel(svr_port, cli_port, tgt_port)
   cli_log = Tempfile.new(%w[ppltunnel-client- .log])
 
   svr_argv = [SERVER, "-l#{HOST}:#{svr_port}", "-A#{PASS}",
-              "-M#{MPATH}", '-H60', *thread_args($options[:threads])]
+              "-M#{MPATH}", '-H60', *server_thread_args]
   if $options[:verbose]
     $stderr.puts "  + #{svr_argv.map { |a| a.include?(' ') ? "'#{a}'" : a }.join(' ')} 2>&1 | tee #{svr_log.path}"
   end
@@ -152,7 +160,7 @@ def start_tunnel(svr_port, cli_port, tgt_port)
   cli_argv = [CLIENT, "-L#{HOST}:#{cli_port}:#{HOST}:#{tgt_port}",
               "-M#{MPATH}", '-H60',
               "#{HOST}:#{svr_port},#{PASS}#{chain}",
-              *thread_args($options[:threads])]
+              *client_thread_args]
   if $options[:verbose]
     $stderr.puts "  + #{cli_argv.map { |a| a.include?(' ') ? "'#{a}'" : a }.join(' ')} 2>&1 | tee #{cli_log.path}"
   end
