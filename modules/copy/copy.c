@@ -42,7 +42,7 @@ int process(void *ctx_ptr, int dir, int trigger_idx) {
         if ((size_t)sz > 64) fprintf(stderr, "...");
         fprintf(stderr, "\n");
     }
-    int write_dst = (trigger_idx == 0) ? 1 : 0;
+    int write_dst = (dir == 0) ? 1 : 0;
     if (ctx->mode_copy) {
         uint8_t *cp = (uint8_t *)malloc((size_t)sz);
         if (!cp) { free(pkt); return -1; }

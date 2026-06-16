@@ -28,10 +28,6 @@ struct SplitContext {
     int node_id = -1;
     int chunk_size_min = DEF_CHUNK_SIZE;
     int chunk_size_max = DEF_CHUNK_SIZE;
-
-    // Pending split data: if write_packet fails mid-packet, save remainder here
-    std::vector<uint8_t> pending_data;
-    int pending_offset = 0;
 };
 
 static int parse_size(const char *s, int def) {
@@ -51,21 +47,17 @@ static int next_chunk_size(SplitContext *ctx) {
     return lo + (int)((unsigned)std::rand() % (unsigned)(hi - lo + 1));
 }
 
-static int process_split(SplitContext *ctx, int /*trigger_idx*/) {
-    // Use pending data if we're recovering from a write failure
-    uint8_t *in_buf = nullptr;
+static int process_split(SplitContext *ctx, int trigger_idx) {
     int sz = 0;
-    int offset = 0;
-
-    if (!ctx->pending_data.empty()) {
-        sz = (int)ctx->pending_data.size();
-        offset = ctx->pending_offset;
-        if (ctx->trace)
-            std::fprintf(stderr, "[split] resume pending offset=%d sz=%d\n", offset, sz);
-    } else {
-        in_buf = (uint8_t *)ctx->api->get_packet(ctx->api->ctx, 0, &sz);
-        if (!in_buf || sz <= 0) return -1;
+    uint8_t *in_buf = (uint8_t *)ctx->api->get_packet(ctx->api->ctx, 0, &sz);
+    if (!in_buf || sz <= 0) {
+        if (ctx->trace) std::fprintf(stderr, "[SPLIT] dir=0 IN sz=%d trigger=%d rr_idx=%u seqnum=%u outputs=%d\n", sz, trigger_idx, ctx->rr_idx, ctx->seqnum, ctx->num_outputs);
+        return 0;
     }
+
+    if (ctx->trace) std::fprintf(stderr, "[SPLIT] dir=0 IN sz=%d trigger=%d rr_idx=%u seqnum=%u outputs=%d\n", sz, trigger_idx, ctx->rr_idx, ctx->seqnum, ctx->num_outputs);
+
+    int offset = 0;
 
     while (offset < sz) {
         int remain = sz - offset;
@@ -80,55 +72,37 @@ static int process_split(SplitContext *ctx, int /*trigger_idx*/) {
         header[3] = (uint8_t)((ctx->seqnum >> 24) & 0xFF);
         header[4] = (uint8_t)more;
 
-        int out_idx = (int)(ctx->rr_idx % (uint32_t)ctx->num_outputs);
+        int out_idx = 1 + (int)(ctx->rr_idx % (uint32_t)ctx->num_outputs);
         uint8_t *out_buf = (uint8_t *)std::malloc((size_t)(chunk_len + HEADER_SIZE));
         if (!out_buf) {
-            if (in_buf) std::free(in_buf);
-            ctx->pending_data.clear();
-            return -1;
-        }
-        // For pending data: read from pending_data vector, not in_buf
-        const uint8_t *src;
-        if (ctx->pending_data.empty()) {
-            src = in_buf + offset;
-        } else {
-            src = ctx->pending_data.data() + offset;
+            std::free(in_buf);
+            return 0;
         }
         std::memcpy(out_buf, header, HEADER_SIZE);
-        std::memcpy(out_buf + HEADER_SIZE, src, (size_t)chunk_len);
+        std::memcpy(out_buf + HEADER_SIZE, in_buf + offset, (size_t)chunk_len);
 
-        if (ctx->trace) std::fprintf(stderr, "[split] write chunk seq=%u more=%d idx=%d len=%d\n",
-                ctx->seqnum, more, out_idx, chunk_len);
-        int ret = ctx->api->write_packet(ctx->api->ctx, out_idx,
-                                         out_buf, (size_t)(chunk_len + HEADER_SIZE));
-        if (ret < 0) {
-            // Save remaining data for retry
-            if (ctx->pending_data.empty()) {
-                ctx->pending_data.assign(in_buf, in_buf + sz);
-                std::free(in_buf);
-                in_buf = nullptr;
-            }
-            ctx->pending_offset = offset;
-            return -1;
-        }
+        if (ctx->trace) std::fprintf(stderr, "[SPLIT] OUT seq=%u more=%d out=%d len=%d offset=%d/%d remain=%d\n",
+                ctx->seqnum, more, out_idx, chunk_len, offset, sz, sz - offset - chunk_len);
+        ctx->api->write_packet(ctx->api->ctx, out_idx,
+                               out_buf, (size_t)(chunk_len + HEADER_SIZE));
         ctx->rr_idx++;
         ctx->seqnum++;
         offset += chunk_len;
     }
 
-    // All data written successfully
-    ctx->pending_data.clear();
-    ctx->pending_offset = 0;
-    if (in_buf) std::free(in_buf);
+    std::free(in_buf);
     return 0;
 }
 
 static int process_merge(SplitContext *ctx, int trigger_idx) {
     int sz = 0;
     uint8_t *buf = (uint8_t *)ctx->api->get_packet(ctx->api->ctx, 0, &sz);
-    if (!buf || sz <= 0) return -1;
+    if (!buf || sz <= 0) {
+        if (ctx->trace) std::fprintf(stderr, "[MERGE] dir=1 IN sz=%d trigger=%d next_seq=%u buffered=%zu\n", sz, trigger_idx, ctx->merge_next_seq, ctx->merge_buf.size());
+        return 0;
+    }
 
-    if (sz < HEADER_SIZE) { std::free(buf); return -1; }
+    if (sz < HEADER_SIZE) { std::free(buf); return 0; }
     uint32_t seq = (uint32_t)buf[0]
                  | ((uint32_t)buf[1] << 8)
                  | ((uint32_t)buf[2] << 16)
@@ -137,12 +111,15 @@ static int process_merge(SplitContext *ctx, int trigger_idx) {
     uint8_t *data = buf + HEADER_SIZE;
     int data_len = sz - HEADER_SIZE;
 
+    if (ctx->trace) std::fprintf(stderr, "[MERGE] RECV seq=%u more=%d len=%d trigger=%d next_seq=%u buffered=%zu\n",
+            seq, more, data_len, trigger_idx, ctx->merge_next_seq, ctx->merge_buf.size());
+
     ctx->merge_buf[seq].emplace_back(data, data + data_len);
     ctx->merge_more[seq] = more != 0;
 
     std::free(buf);
 
-    int write_output = (trigger_idx == 0) ? 1 : 0;
+    int write_output = 0;
 
     uint32_t scan = ctx->merge_next_seq;
     while (true) {
@@ -160,14 +137,11 @@ static int process_merge(SplitContext *ctx, int trigger_idx) {
                 }
             }
             uint8_t *out_buf = (uint8_t *)std::malloc(out.size());
-            if (!out_buf) { return -1; }
-            std::memcpy(out_buf, out.data(), out.size());
-
-            int wr = ctx->api->write_packet(ctx->api->ctx, write_output, out_buf, out.size());
-            if (wr < 0) {
-                std::fprintf(stderr, "[split ERR] merge write_packet output=%d ret=%d\n",
-                        write_output, wr);
-                return wr;
+            if (out_buf) {
+                std::memcpy(out_buf, out.data(), out.size());
+                if (ctx->trace) std::fprintf(stderr, "[MERGE] FLUSH seq=%u..%u out=%d size=%zu next_seq=%u buffered=%zu\n",
+                        ctx->merge_next_seq, scan, write_output, out.size(), scan + 1, ctx->merge_buf.size() - (scan - ctx->merge_next_seq + 1));
+                ctx->api->write_packet(ctx->api->ctx, write_output, out_buf, out.size());
             }
 
             for (uint32_t s = ctx->merge_next_seq; s <= scan; s++) {
@@ -176,11 +150,13 @@ static int process_merge(SplitContext *ctx, int trigger_idx) {
             }
             ctx->merge_next_seq = scan + 1;
             scan = ctx->merge_next_seq;
+            if (ctx->trace) std::fprintf(stderr, "[MERGE] FLUSHED next_seq=%u remaining=%zu\n", ctx->merge_next_seq, ctx->merge_buf.size());
             continue;
         }
         scan++;
     }
 
+    if (ctx->trace) std::fprintf(stderr, "[MERGE] WAIT next=%u buffered=%zu\n", ctx->merge_next_seq, ctx->merge_buf.size());
     return 0;
 }
 
