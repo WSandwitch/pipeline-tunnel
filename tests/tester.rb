@@ -14,7 +14,8 @@ options = {
   build_dir: nil,
   mod_dir: nil,
   config: nil,
-  workers: [1, 2, 3, 4, 8, 0],
+  client_workers: [1, 2, 3],
+  server_workers: [1, 2, 3],
   verbose: false,
   quiet: false,
   stop_on_fail: false,
@@ -28,7 +29,8 @@ op = OptionParser.new do |o|
   o.on('-S', '--server-dir DIR', 'Path to build dir with ppltunnel-server/client') { |v| options[:build_dir] = File.absolute_path(v) }
   o.on('-M', '--module-dir DIR', 'Path to .so modules dir') { |v| options[:mod_dir] = File.absolute_path(v) }
   o.on('-C', '--config CONFIG', 'Only run configs matching this module/config') { |v| options[:config] = v }
-  o.on('-t', '--workers LIST', 'Worker counts (comma-separated, 0=auto)') { |v| options[:workers] = v.split(',').map(&:to_i) }
+  o.on('-c', '--client-workers LIST', 'Client worker counts (comma-separated)') { |v| options[:client_workers] = v.split(',').map(&:to_i) }
+  o.on('-s', '--server-workers LIST', 'Server worker counts (comma-separated)') { |v| options[:server_workers] = v.split(',').map(&:to_i) }
   o.on('-v', '--verbose', 'Print each command before running') { options[:verbose] = true }
   o.on('-q', '--quiet', 'Only print summary') { options[:quiet] = true }
   o.on('--stop-on-fail', 'Stop on first failure') { options[:stop_on_fail] = true }
@@ -156,36 +158,37 @@ passed = 0
 
 failed_configs = []
 
-configs.each do |cfg|
-  options[:workers].each do |w|
-    total += 1
-    wt = w == 0 ? '0' : w.to_s
-    cmd = cmd_parts.dup
-    # if command is a relative path, resolve it relative to TESTS_DIR
-    cmd[0] = File.join(TESTS_DIR, cmd[0]) unless cmd[0].start_with?('/')
-    # prepend ruby if script is not executable
-    cmd.unshift('ruby') unless File.executable?(cmd[0])
-    cmd.concat(cmd_extra) if cmd_extra
-    cmd << '-S' << options[:build_dir] if options[:build_dir]
-    cmd << '-M' << options[:mod_dir] if options[:mod_dir]
-    cmd << '-C' << cfg
-    cmd << '-t' << wt
+catch(:stop) do
+  configs.each do |cfg|
+    options[:client_workers].each do |cw|
+      options[:server_workers].each do |sw|
+        total += 1
+        cmd = cmd_parts.dup
+        # if command is a relative path, resolve it relative to TESTS_DIR
+        cmd[0] = File.join(TESTS_DIR, cmd[0]) unless cmd[0].start_with?('/')
+        # prepend ruby if script is not executable
+        cmd.unshift('ruby') unless File.executable?(cmd[0])
+        cmd.concat(cmd_extra) if cmd_extra
+        cmd << '-S' << options[:build_dir] if options[:build_dir]
+        cmd << '-M' << options[:mod_dir] if options[:mod_dir]
+        cmd << '-C' << cfg
+        cmd << '-c' << cw.to_s
+        cmd << '-s' << sw.to_s
 
-    cmd_str = cmd.map { |s| s.include?(' ') || s.include?(';') || s.include?('|') || s.include?('"') ? "\"#{s}\"" : s }.join(' ')
-    puts cmd_str if options[:verbose]
+        cmd_str = cmd.map { |s| s.include?(' ') || s.include?(';') || s.include?('|') || s.include?('"') ? "\"#{s}\"" : s }.join(' ')
+        puts cmd_str if options[:verbose]
 
-    unless options[:quiet]
-      puts "#{cfg} t=#{wt}"
-    end
+        unless options[:quiet]
+          puts "#{cfg} c=#{cw} s=#{sw}"
+        end
 
-    system(*cmd)
-    ok = $?.exitstatus == 0
-    passed += 1 if ok
-    failed_configs << [cfg, w] unless ok
+        system(*cmd)
+        ok = $?.exitstatus == 0
+        passed += 1 if ok
+        failed_configs << [cfg, cw, sw] unless ok
 
-    if !ok && options[:stop_on_fail]
-      puts "STOP-ON-FAIL"
-      break
+        throw :stop if !ok && options[:stop_on_fail]
+      end
     end
   end
 end
@@ -193,7 +196,7 @@ end
 unless options[:quiet]
   puts "#{passed}/#{total} passed"
   if failed_configs.any?
-    puts "Failed: #{failed_configs.map { |c, w| "#{c} t=#{w}" }.join(', ')}"
+    puts "Failed: #{failed_configs.map { |c, cw, sw| "#{c} c=#{cw} s=#{sw}" }.join(', ')}"
   end
 end
 exit passed == total ? 0 : 1

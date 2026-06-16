@@ -23,7 +23,8 @@ options = {
   build_dir: nil,
   mod_dir: nil,
   config: nil,
-  threads: 1,
+  client_threads: 1,
+  server_threads: 1,
   duration: 30,
   direction: 'forward',
   parallel: 1,
@@ -37,7 +38,8 @@ op = OptionParser.new do |o|
   o.on('-S', '--server-dir DIR', 'Path to build dir') { |v| options[:build_dir] = v }
   o.on('-M', '--module-dir DIR', 'Path to .so modules dir') { |v| options[:mod_dir] = v }
   o.on('-C', '--config CONFIG', 'Chain config string') { |v| options[:config] = v }
-  o.on('-t', '--threads N', Integer, 'Worker thread count (0=auto)') { |v| options[:threads] = v }
+  o.on('-c', '--client-threads N', Integer, 'Client worker thread count') { |v| options[:client_threads] = v }
+  o.on('-s', '--server-threads N', Integer, 'Server worker thread count') { |v| options[:server_threads] = v }
   o.on('-d N', '--duration N', Integer, 'Test duration in seconds') { |v| options[:duration] = v }
   o.on('--direction DIR', %w[forward reverse bidir], "forward|reverse|bidir") { |v| options[:direction] = v }
   o.on('-P', '--parallel N', Integer, 'iperf3 parallel streams') { |v| options[:parallel] = v }
@@ -136,8 +138,14 @@ def wait_port_or_die(pid, port, log, timeout = 10)
   raise msg
 end
 
-def thread_args(n)
-  n == 0 ? ['-t'] : ['-t', n.to_s]
+def server_thread_args
+  n = $options[:server_threads]
+  ['-t', n.to_s]
+end
+
+def client_thread_args
+  n = $options[:client_threads]
+  ['-t', n.to_s]
 end
 
 def start_tunnel(svr_port, cli_port, tgt_port)
@@ -145,7 +153,7 @@ def start_tunnel(svr_port, cli_port, tgt_port)
   svr_log = Tempfile.new(%w[ppltunnel-server- .log])
   svr = spawn_verbosely(SERVER, "-l#{HOST}:#{svr_port}", "-A#{PASS}",
                         "-M#{MPATH}", '-H60',
-                        *thread_args($options[:threads]),
+                        *server_thread_args,
                         out: svr_log, err: [:child, :out])
   alive_check(svr, 'ppltunnel-server', svr_log)
   $stderr.puts "    start_tunnel: waiting for server port #{svr_port}..."
@@ -158,7 +166,7 @@ def start_tunnel(svr_port, cli_port, tgt_port)
   cli = spawn_verbosely(CLIENT, "-L#{HOST}:#{cli_port}:#{HOST}:#{tgt_port}",
                         "-M#{MPATH}", '-H60',
                         "#{HOST}:#{svr_port},#{PASS}#{chain}",
-                        *thread_args($options[:threads]),
+                        *client_thread_args,
                         out: cli_log, err: [:child, :out])
   alive_check(cli, 'ppltunnel-client', cli_log)
   $stderr.puts "    start_tunnel: waiting for client port #{cli_port}..."
