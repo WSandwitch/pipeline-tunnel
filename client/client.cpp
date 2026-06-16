@@ -652,32 +652,32 @@ void Client::handle_auth2_challenge(const Packet &pkt) {
         auto *self = (Client*)ref->cb_ctx;
         log_debug("client: wire_write dst=%d len=%zu data[0]=%u", dst, len, len>0?data[0]:0);
         if (dst == 0) {
-            if (len < 1) {
+        if (len < 1) {
+            free(const_cast<uint8_t*>(data));
+            return 0;
+        }
+        if (data[0] == 255) {
+            if (len < 3 || data[1] != CHAIN_CTRL_DISCONNECT) {
+                log_error("client: wire_write dst=0 unknown chain ctrl type=%u",
+                          len>=2?data[1]:0);
                 free(const_cast<uint8_t*>(data));
-                return -1;
-            }
-            if (data[0] == 255) {
-                if (len < 3 || data[1] != CHAIN_CTRL_DISCONNECT) {
-                    log_error("client: wire_write dst=0 unknown chain ctrl type=%u",
-                              len>=2?data[1]:0);
-                    free(const_cast<uint8_t*>(data));
-                    return -1;
-                }
-                uint8_t conn_id = data[2];
-                free(const_cast<uint8_t*>(data));
-                std::lock_guard<std::mutex> lock(self->data_mtx_);
-                self->pending_io_.push_back([self, conn_id]() {
-                    log_info("client: chain ctrl disconnect conn_id=%u", conn_id);
-                    auto it = self->conns_.find(conn_id);
-                    if (it == self->conns_.end()) return;
-                    it->second.disconnecting = true;
-                    self->chain_ref_.in_fd.erase(conn_id);
-                    self->chain_ref_.in_writer.erase(conn_id);
-                    self->chain_ref_.in_paused.erase(conn_id);
-                    self->pending_disconnect_ids_.push_back(conn_id);
-                });
                 return 0;
             }
+            uint8_t conn_id = data[2];
+            free(const_cast<uint8_t*>(data));
+            std::lock_guard<std::mutex> lock(self->data_mtx_);
+            self->pending_io_.push_back([self, conn_id]() {
+                log_info("client: chain ctrl disconnect conn_id=%u", conn_id);
+                auto it = self->conns_.find(conn_id);
+                if (it == self->conns_.end()) return;
+                it->second.disconnecting = true;
+                self->chain_ref_.in_fd.erase(conn_id);
+                self->chain_ref_.in_writer.erase(conn_id);
+                self->chain_ref_.in_paused.erase(conn_id);
+                self->pending_disconnect_ids_.push_back(conn_id);
+            });
+            return 0;
+        }
         // Normal data for ext connection: write directly (no deferral)
         // to avoid 50ms delay that causes DC TCP buffer buildup and stalls.
             uint8_t conn_id = data[0];
@@ -689,7 +689,7 @@ void Client::handle_auth2_challenge(const Packet &pkt) {
                 if (it == self->conns_.end() || it->second.disconnecting || it->second.fd < 0) {
                     log_error("client: wire_write dst=0 conn_id=%u not found", conn_id);
                     free(const_cast<uint8_t*>(data));
-                    return -1;
+                    return 0;
                 }
                 ext_fd = it->second.fd;
                 ret = it->second.writer.write(ext_fd, data + 1, len - 1);
@@ -729,7 +729,8 @@ void Client::handle_auth2_challenge(const Packet &pkt) {
         if (dst < 1 || (size_t)dst > self->data_connections_.size() ||
             self->data_connections_[dst-1].fd < 0) {
             log_error("client: wire_write dst=%d no data connection", dst);
-            return -1;
+            free(const_cast<uint8_t*>(data));
+            return 0;
         }
         int fd = self->data_connections_[dst-1].fd;
         int dc_idx = dst - 1;
@@ -1335,7 +1336,7 @@ void Client::process_pending_io() {
         (void)id;
         if (conn.fd < 0) continue;
         bool should_pause = conn.writer_paused || conn.chain_paused
-                         || conn.ext_overflow_paused || bp0 || bp1;
+                         || conn.ext_overflow_paused || bp0;
         if (should_pause) {
             if (!conn.epollin_removed) {
                 conn.epollin_removed = true;

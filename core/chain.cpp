@@ -405,6 +405,6 @@ int Chain::write_packet_impl(Module *mod, int dst, const uint8_t *data, size_t l
         }
     }
     int wire_dst = (g_ctx.output_port >= 0 && g_ctx.dir == 0) ? (g_ctx.output_port + 1) : dst;
-    int ret = _kapi->wire_write(_kapi->ctx, wire_dst, data, len);
-    return ret;
+    _kapi->wire_write(_kapi->ctx, wire_dst, data, len);
+    return 0;
 }

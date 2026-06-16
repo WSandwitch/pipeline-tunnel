@@ -241,7 +241,7 @@ void Session::handle_auth2_response(const Packet &pkt) {
             if (dst == 0) {
                 if (len < 1) {
                     free(const_cast<uint8_t*>(data));
-                    return -1;
+                    return 0;
                 }
                 if (data[0] == 255) {
                     if (len >= 3 && data[1] == CHAIN_CTRL_SHUTDOWN_WR) {
@@ -262,7 +262,7 @@ void Session::handle_auth2_response(const Packet &pkt) {
                     log_error("session %llx: wire_write dst=0 unknown chain ctrl type=%u",
                               (unsigned long long)self->session_id_, len>=2?data[1]:0);
                     free(const_cast<uint8_t*>(data));
-                    return -1;
+                    return 0;
                 }
                 uint8_t conn_id = data[0];
                 int ret = 0;
@@ -272,7 +272,7 @@ void Session::handle_auth2_response(const Packet &pkt) {
                     std::lock_guard<std::mutex> lock(self->targets_mtx_);
                     auto tit = self->targets_.find(conn_id);
                     if (tit == self->targets_.end()) {
-                        free(const_cast<uint8_t*>(data)); return -1;
+                        free(const_cast<uint8_t*>(data)); return 0;
                     }
                     ret = tit->second.writer.write(tit->second.fd, data + 1, len - 1);
                     if (ret > 0) need_epollout = true;
@@ -302,7 +302,7 @@ void Session::handle_auth2_response(const Packet &pkt) {
                     self->kernel_->wakeup();
                 }
                 free(const_cast<uint8_t*>(data));
-                return ret;
+                return 0;
             }
             if (dst < 1 || (size_t)dst > self->data_connections_.size() ||
                 self->data_connections_[dst-1].fd < 0) {
@@ -356,6 +356,21 @@ void Session::handle_auth2_response(const Packet &pkt) {
                     }
                 });
                 self->kernel_->wakeup();
+            } else if (ret < 0) {
+                // Hard error (EPIPE, ECONNRESET) - trigger disconnect, but return 0 to module
+                log_debug("session %llx: wire_write hard error on data conn %d, triggering disconnect",
+                          (unsigned long long)self->session_id_, dc_idx);
+                self->pending_io_.push_back([self, dc_idx]() {
+                    if ((size_t)dc_idx < self->data_connections_.size()) {
+                        self->data_connections_[dc_idx].writer.clear();
+                        if (self->data_connections_[dc_idx].fd >= 0) {
+                            self->kernel_->del_fd(self->data_connections_[dc_idx].fd);
+                            close(self->data_connections_[dc_idx].fd);
+                            self->data_connections_[dc_idx].fd = -1;
+                        }
+                    }
+                });
+                self->kernel_->wakeup();
             } else {
                 bool all_below = true;
                 for (auto &check_dc : self->data_connections_) {
@@ -384,7 +399,7 @@ void Session::handle_auth2_response(const Packet &pkt) {
                 }
             }
             free(const_cast<uint8_t*>(data));
-            return ret;
+            return 0;
         };
 
         // Setup pause/resume and epollout callbacks
@@ -1602,7 +1617,7 @@ void Session::process_pending_io() {
             (void)id;
             if (tgt.fd < 0) continue;
             bool should_pause = tgt.writer_paused || tgt.chain_paused
-                             || tgt.ext_overflow_paused || bp0 || bp1;
+                             || tgt.ext_overflow_paused || bp0;
             if (should_pause) {
                 if (!tgt.epollin_removed) {
                     tgt.epollin_removed = true;
