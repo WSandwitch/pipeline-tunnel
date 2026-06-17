@@ -1,5 +1,6 @@
 #include "config.h"
 #include "common/utils.h"
+#include <algorithm>
 #include <cstdlib>
 
 ChainConfig parse_chain(const std::string &str) {

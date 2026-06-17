@@ -43,7 +43,6 @@ public:
     void *get_packet_impl(Module *mod, int idx, int *out_size);
     int   write_packet_impl(Module *mod, int dst, const uint8_t *data, size_t len);
     int   request_outputs_impl(Module *mod, int count);
-    int   get_output_fd_impl(Module *mod, int idx);
     int   request_heartbeat_impl(Module *mod, int interval_sec);
 
     void check_module_heartbeats(int system_interval_ms);
@@ -54,8 +53,10 @@ public:
 private:
     KernelAPI *_kapi = nullptr;
     std::vector<std::unique_ptr<Module>> _modules;
-    std::vector<std::unique_ptr<Module>> _clone_modules;
     ChainConfig _cfg;
+
+    Module *_entry_ext = nullptr;           // ext-side copy, entry для dir=0
+    std::vector<Module *> _wire_entries;    // [conn_id] → wire-side copy для dir=1
 
     ThreadPool *_pool = nullptr;
     std::weak_ptr<void> _owner;
@@ -63,7 +64,7 @@ private:
     std::atomic<int> _inflight{0};
     std::mutex _drain_mtx;
     std::condition_variable _drain_cv;
-    std::unordered_map<Module*, int> _requested_outputs;
+    std::unordered_map<Module*, int> _requested_outputs;  // заполняется при init, очищается после построения
     std::mutex dir_order_mutex_[2];
 
     PauseCallback _pause_cb[2];  // pause/resume callbacks per direction
@@ -71,7 +72,7 @@ private:
 
     void task_done();
     void enqueue_module(Module *mod, const uint8_t *data, size_t len,
-                        int src_idx, int dir, int output_port);
+                        int src_idx, int dir);
     void check_backpressure(int dir);
 };
 

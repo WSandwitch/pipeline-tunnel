@@ -14,7 +14,9 @@ struct Module {
     ModuleChain api;
     Chain *chain = nullptr;
     int id = -1;
-    std::vector<Module *> outputs;  // outputs[dst] → next module, null = wire/kernel
+    std::vector<Module *> near;     // near[0]=к ext, near[1]=к wire, near[2+]=доп выходы
+    int wire_dst = -1;              // порт для wire_write на конце цепочки (-1=не крайний)
+    size_t cfg_idx = SIZE_MAX;      // индекс в cfg.modules (для построения подцепочек)
     void *ctx = nullptr;
     std::mutex dir_mutex[2];        // per-direction serialization
     std::atomic<int> pending[2]{0, 0}; // tasks queued + processing for this module, per direction
