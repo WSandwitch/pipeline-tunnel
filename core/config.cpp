@@ -48,6 +48,9 @@ ChainConfig parse_chain(const std::string &str) {
         cfg.modules.push_back(std::move(ms));
     }
 
+    cfg.modules.insert(cfg.modules.begin(), ModuleSpec{"copy", ""});
+    cfg.modules.emplace_back("copy", "");
+    std::reverse(cfg.modules.begin(), cfg.modules.end());
     cfg.valid = true;
     return cfg;
 }
