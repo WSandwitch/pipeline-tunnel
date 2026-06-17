@@ -2,8 +2,10 @@
 #define UTILS_H
 
 #include <cstdint>
+#include <cstdio>
 #include <string>
 #include <vector>
+#include <chrono>
 #include <arpa/inet.h>
 #include <sys/socket.h>
 #include <fcntl.h>
@@ -27,5 +29,15 @@ constexpr uint8_t TYPE_HEARTBEAT2 = 2;   // [varint(1)][2] — empty, pong
 
 std::vector<uint8_t> make_varint_packet(const uint8_t *data, size_t len);
 std::vector<std::string> scan_modules(const std::string &dir);
+
+inline double now_sec() {
+    auto now = std::chrono::steady_clock::now().time_since_epoch();
+    return std::chrono::duration<double>(now).count();
+}
+
+// Debug trace with timestamp
+#define TRACE(fmt, ...) do { \
+    fprintf(stderr, "[%.3f " fmt "\n", now_sec(), ##__VA_ARGS__); \
+} while(0)
 
 #endif

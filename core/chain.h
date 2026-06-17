@@ -23,6 +23,12 @@ public:
     bool valid() const { return true; }
     bool is_drained() const { return _inflight.load() == 0; }
     bool is_backpressure_paused(int dir) const { return _backpressure_paused[dir].load(); }
+    uint64_t get_max_dir_bytes(int dir) const {
+        uint64_t m = 0;
+        for (auto &mod : _modules)
+            if (auto v = mod->dir_bytes[dir].load(); v > m) m = v;
+        return m;
+    }
 
     // dir=0 (split/encode), dir=1 (merge/decode)
     using PauseCallback = std::function<void(bool paused)>;
@@ -47,8 +53,8 @@ public:
 
     void check_module_heartbeats(int system_interval_ms);
 
-    static constexpr int BACKPRESSURE_HIGH = 2;
-    static constexpr int BACKPRESSURE_LOW = 1;
+    static constexpr uint64_t BACKPRESSURE_HIGH = 1048576; // 1MB
+    static constexpr uint64_t BACKPRESSURE_LOW  = 262144;  // 256KB
 
 private:
     KernelAPI *_kapi = nullptr;

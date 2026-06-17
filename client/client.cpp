@@ -734,6 +734,7 @@ void Client::handle_auth2_challenge(const Packet &pkt) {
         }
         int fd = self->data_connections_[dst-1].fd;
         int dc_idx = dst - 1;
+
         uint8_t varint_buf[10];
         size_t varint_len = 0;
         uint64_t total = 1 + len; // type + data (no sub-stream)
@@ -1115,6 +1116,7 @@ void Client::handle_writer_pause(const Packet &pkt) {
     auto it = conns_.find(conn_id);
     if (it == conns_.end()) return;
     it->second.writer_paused = true;
+    TRACE("CLI PAUSE recv conn_id=%u fd=%d", conn_id, it->second.fd);
     log_debug("client: WRITER_PAUSE conn_id=%u (external %s)", conn_id, it->second.fd >= 0 ? "paused" : "nofd");
     if (it->second.fd >= 0)
         kernel_->mod_fd_events(it->second.fd, 0, EPOLLIN);
@@ -1126,6 +1128,7 @@ void Client::handle_writer_resume(const Packet &pkt) {
     auto it = conns_.find(conn_id);
     if (it == conns_.end()) return;
     it->second.writer_paused = false;
+    TRACE("CLI RESUME recv conn_id=%u fd=%d wp=%d cp=%d eop=%d", conn_id, it->second.fd, (int)it->second.writer_paused, (int)it->second.chain_paused, (int)it->second.ext_overflow_paused);
     log_debug("client: WRITER_RESUME conn_id=%u", conn_id);
     if (it->second.fd >= 0) {
         if (!it->second.chain_paused && !it->second.ext_overflow_paused)
@@ -1190,8 +1193,10 @@ void Client::handle_connect_ok(const Packet &pkt) {
             ssize_t n = read(fd, buf + 1, MAX_PACKET_SIZE - 1);
             if (n > 0) {
                 buf[0] = conn_id;
+                TRACE("CLI EXT read conn_id=%u n=%zd", conn_id, n);
                 chain_->push_packet(buf, (size_t)n + 1, 0, 0);
             } else {
+                TRACE("CLI EXT read conn_id=%u n=%zd events=0x%x", conn_id, n, events);
                 free(buf);
             }
             if (n == 0) {
@@ -1279,12 +1284,23 @@ void Client::check_heartbeat() {
 }
 
 void Client::process_pending_io() {
+    { static int ppi_cnt = 0; ppi_cnt++; if (ppi_cnt % 100 == 0) TRACE("CLI PPI tick %d", ppi_cnt); }
+    { static int stats_cnt = 0; stats_cnt++; if (chain_ && stats_cnt % 10 == 0) {
+        TRACE("CLI STATS: bp0=%d bp1=%d maxdb0=%lu maxdb1=%lu dc0=%zu dc1=%zu",
+              chain_->is_backpressure_paused(0),
+              chain_->is_backpressure_paused(1),
+              (unsigned long)chain_->get_max_dir_bytes(0),
+              (unsigned long)chain_->get_max_dir_bytes(1),
+              data_connections_.size()>0?data_connections_[0].writer.size():0,
+              data_connections_.size()>1?data_connections_[1].writer.size():0);
+    } }
     // Backpressure: pause target readers when data connection writer grows too large
     {
         size_t dc_size = 0;
         for (auto &dc : data_connections_) dc_size += dc.writer.size();
         if (dc_size > 1024 * 1024 && !dc_paused_) {
             dc_paused_ = true;
+            TRACE("CLI DC ext_overflow PAUSE dc_size=%zuKB", dc_size / 1024);
             for (auto &[id, conn] : conns_) {
                 (void)id;
                 conn.ext_overflow_paused = true;
@@ -1293,6 +1309,7 @@ void Client::process_pending_io() {
             }
         } else if (dc_size < 256 * 1024 && dc_paused_) {
             dc_paused_ = false;
+            TRACE("CLI DC ext_overflow RESUME dc_size=%zuKB", dc_size / 1024);
             for (auto &[id, conn] : conns_) {
                 (void)id;
                 conn.ext_overflow_paused = false;
@@ -1340,11 +1357,13 @@ void Client::process_pending_io() {
         if (should_pause) {
             if (!conn.epollin_removed) {
                 conn.epollin_removed = true;
+                TRACE("CLI GATE rm EPOLLIN id=%u wp=%d cp=%d eop=%d bp0=%d", id, (int)conn.writer_paused, (int)conn.chain_paused, (int)conn.ext_overflow_paused, (int)bp0);
                 kernel_->mod_fd_events(conn.fd, 0, EPOLLIN);
             }
         } else {
             if (conn.epollin_removed) {
                 conn.epollin_removed = false;
+                TRACE("CLI GATE add EPOLLIN id=%u wp=%d cp=%d eop=%d bp0=%d", id, (int)conn.writer_paused, (int)conn.chain_paused, (int)conn.ext_overflow_paused, (int)bp0);
                 kernel_->mod_fd_events(conn.fd, EPOLLIN, 0);
             }
         }

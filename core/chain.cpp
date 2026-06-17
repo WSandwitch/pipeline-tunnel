@@ -1,6 +1,7 @@
 #include "chain.h"
 #include "thread_pool.h"
 #include "common/logger.h"
+#include "common/utils.h"
 #include <deque>
 #include <sys/syscall.h>
 #include <unistd.h>
@@ -165,6 +166,7 @@ void Chain::enqueue_module(Module *mod, const uint8_t *data, size_t len,
     }
 
     mod->pending[dir].fetch_add(1);
+    mod->dir_bytes[dir].fetch_add(len);
     _inflight.fetch_add(1);
     check_backpressure(dir);
 
@@ -173,6 +175,7 @@ void Chain::enqueue_module(Module *mod, const uint8_t *data, size_t len,
 
         if (_cancelled.load()) {
             dir_order_mutex_[dir].unlock();
+            mod->dir_bytes[dir].fetch_sub(len);
             mod->pending[dir].fetch_sub(1);
             check_backpressure(dir);
             free(const_cast<uint8_t*>(data));
@@ -192,6 +195,7 @@ void Chain::enqueue_module(Module *mod, const uint8_t *data, size_t len,
 
         int ret = mod->base->process_fn(mod->ctx, dir, src_idx);
 
+        mod->dir_bytes[dir].fetch_sub(len);
         mod->pending[dir].fetch_sub(1);
         check_backpressure(dir);
 
@@ -212,20 +216,18 @@ void Chain::task_done() {
 }
 
 void Chain::check_backpressure(int dir) {
-    int max_p = 0;
+    uint64_t max_bytes = 0;
     for (auto &m : _modules)
-        if (auto v = m->pending[dir].load(); v > max_p) max_p = v;
+        if (auto v = m->dir_bytes[dir].load(); v > max_bytes) max_bytes = v;
 
-    log_debug("chain: check_bp dir=%d max_p=%d bp_paused=%d", dir, max_p, (int)_backpressure_paused[dir].load());
-
-    if (max_p > BACKPRESSURE_HIGH && !_backpressure_paused[dir].load()) {
+    if (max_bytes > BACKPRESSURE_HIGH && !_backpressure_paused[dir].load()) {
         _backpressure_paused[dir].store(true);
-        log_debug("chain: PAUSE dir=%d max_p=%d", dir, max_p);
+        TRACE("CHAIN BP PAUSE dir=%d max_bytes=%zu inflight=%d", dir, (size_t)max_bytes, _inflight.load());
         if (_pause_cb[dir]) _pause_cb[dir](true);
     }
-    if (max_p <= BACKPRESSURE_LOW && _backpressure_paused[dir].load()) {
+    if (max_bytes <= BACKPRESSURE_LOW && _backpressure_paused[dir].load()) {
         _backpressure_paused[dir].store(false);
-        log_debug("chain: RESUME dir=%d max_p=%d", dir, max_p);
+        TRACE("CHAIN BP RESUME dir=%d max_bytes=%zu inflight=%d", dir, (size_t)max_bytes, _inflight.load());
         if (_pause_cb[dir]) _pause_cb[dir](false);
     }
 }

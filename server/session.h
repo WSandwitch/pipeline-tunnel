@@ -74,6 +74,8 @@ private:
         std::vector<uint8_t> priority_buf; // control msgs sent before data
         std::vector<uint8_t> read_buf;
         size_t read_offset = 0;
+        // Note: DC fds are never gated — gating one connection kills merge
+        // which needs chunks from all connections to reassemble packets.
     };
     std::vector<DataConnection> data_connections_;
 

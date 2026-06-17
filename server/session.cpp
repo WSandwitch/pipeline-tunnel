@@ -289,6 +289,7 @@ void Session::handle_auth2_response(const Packet &pkt) {
                             self->chain_ref_.register_in_epollout(self->chain_ref_.cb_ctx, conn_id);
                     });
                     self->kernel_->wakeup();
+                    TRACE("SVR WAKE need_epollout conn_id=%u", conn_id);
                 }
                 if (need_pause) {
                     std::lock_guard<std::mutex> lock(self->data_mtx_);
@@ -1528,7 +1529,11 @@ void Session::register_target_epollout(uint8_t conn_id, int tfd) {
                     it2->second.local_writer_sent = false;
                     this->chain_ref_.in_paused[conn_id] = false;
                     send_writer_resume(conn_id);
+                } else {
+                    TRACE("SVR EPOLLOUT drained=true local_writer_sent=false conn_id=%u", conn_id);
                 }
+            } else {
+                TRACE("SVR EPOLLOUT drained=false conn_id=%u", conn_id);
             }
         }
         if (events & (EPOLLERR | EPOLLHUP))
@@ -1537,26 +1542,31 @@ void Session::register_target_epollout(uint8_t conn_id, int tfd) {
 }
 
 void Session::send_writer_pause(uint8_t conn_id) {
+    TRACE("SVR PAUSE send conn_id=%u", conn_id);
     Packet pkt = Protocol::make_msg(MSG_WRITER_PAUSE, &conn_id, 1);
     send_control(pkt);
 }
 
 void Session::send_writer_resume(uint8_t conn_id) {
+    TRACE("SVR RESUME send conn_id=%u", conn_id);
     Packet pkt = Protocol::make_msg(MSG_WRITER_RESUME, &conn_id, 1);
     send_control(pkt);
 }
 
 void Session::send_chain_pause() {
+    TRACE("SVR CHAIN PAUSE send (bp1=%d)", chain_ ? (int)chain_->is_backpressure_paused(1) : -1);
     Packet pkt = Protocol::make_msg(MSG_CHAIN_PAUSE);
     send_control(pkt);
 }
 
 void Session::send_chain_resume() {
+    TRACE("SVR CHAIN RESUME send (bp1=%d)", chain_ ? (int)chain_->is_backpressure_paused(1) : -1);
     Packet pkt = Protocol::make_msg(MSG_CHAIN_RESUME);
     send_control(pkt);
 }
 
 void Session::process_pending_io() {
+    { static int ppi_cnt = 0; if (++ppi_cnt % 100 == 0) TRACE("SVR PPI tick %d", ppi_cnt); }
     // Backpressure: pause target readers when data connection writer grows too large
     {
         size_t dc_size = 0;
@@ -1631,6 +1641,16 @@ void Session::process_pending_io() {
             }
         }
     }
+
+    // NOTE: DC fds are NOT gated here — gating one connection would prevent
+    // the merge from receiving chunks from all data connections, causing a
+    // deadlock where the merge can never complete a packet. Instead, the
+    // chain backpressure (bp1) sends MSG_CHAIN_PAUSE to the client, which
+    // pauses the ext reader on the client side — stopping ALL new data from
+    // entering the tunnel. The server-side DC readers continue to drain TCP
+    // buffers and deliver queued chunks to the merge from ALL connections,
+    // allowing packets to be reassembled. Once inflight drops below the
+    // BACKPRESSURE_LOW threshold, RESUME fires and the cycle continues.
 
     if (disconnect_pending_) {
         if (!chain_ || chain_->is_drained()) {
