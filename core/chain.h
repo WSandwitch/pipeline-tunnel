@@ -24,10 +24,7 @@ public:
     bool is_drained() const { return _inflight.load() == 0; }
     bool is_backpressure_paused(int dir) const { return _backpressure_paused[dir].load(); }
     uint64_t get_max_dir_bytes(int dir) const {
-        uint64_t m = 0;
-        for (auto &mod : _modules)
-            if (auto v = mod->dir_bytes[dir].load(); v > m) m = v;
-        return m;
+        return _inflight_bytes[dir].load();
     }
 
     // dir=0 (split/encode), dir=1 (merge/decode)
@@ -60,6 +57,7 @@ private:
     KernelAPI *_kapi = nullptr;
     std::vector<std::unique_ptr<Module>> _modules;
     ChainConfig _cfg;
+    std::atomic<uint64_t> _inflight_bytes[2]{0, 0};
 
     Module *_entry_ext = nullptr;           // ext-side copy, entry для dir=0
     std::vector<Module *> _wire_entries;    // [conn_id] → wire-side copy для dir=1
@@ -71,7 +69,7 @@ private:
     std::mutex _drain_mtx;
     std::condition_variable _drain_cv;
     std::unordered_map<Module*, int> _requested_outputs;  // заполняется при init, очищается после построения
-    std::mutex dir_order_mutex_[2];
+    std::mutex nogap_mutex_[2];
 
     PauseCallback _pause_cb[2];  // pause/resume callbacks per direction
     std::atomic<bool> _backpressure_paused[2] = {false, false};  // track per-direction pause state

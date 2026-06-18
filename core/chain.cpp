@@ -165,18 +165,16 @@ void Chain::enqueue_module(Module *mod, const uint8_t *data, size_t len,
         return;
     }
 
-    mod->pending[dir].fetch_add(1);
-    mod->dir_bytes[dir].fetch_add(len);
     _inflight.fetch_add(1);
+    _inflight_bytes[dir].fetch_add(len);
     check_backpressure(dir);
 
     _pool->enqueue([this, data, len, src_idx, dir, mod, owner]() {
-        dir_order_mutex_[dir].lock();
+        nogap_mutex_[dir].lock();
 
         if (_cancelled.load()) {
-            dir_order_mutex_[dir].unlock();
-            mod->dir_bytes[dir].fetch_sub(len);
-            mod->pending[dir].fetch_sub(1);
+            nogap_mutex_[dir].unlock();
+            _inflight_bytes[dir].fetch_sub(len);
             check_backpressure(dir);
             free(const_cast<uint8_t*>(data));
             task_done();
@@ -191,12 +189,11 @@ void Chain::enqueue_module(Module *mod, const uint8_t *data, size_t len,
         }
 
         std::lock_guard<std::mutex> lock(mod->dir_mutex[dir]);
-        dir_order_mutex_[dir].unlock();
+        nogap_mutex_[dir].unlock();
 
         int ret = mod->base->process_fn(mod->ctx, dir, src_idx);
 
-        mod->dir_bytes[dir].fetch_sub(len);
-        mod->pending[dir].fetch_sub(1);
+        _inflight_bytes[dir].fetch_sub(len);
         check_backpressure(dir);
 
         if (ret < 0) {
@@ -216,18 +213,16 @@ void Chain::task_done() {
 }
 
 void Chain::check_backpressure(int dir) {
-    uint64_t max_bytes = 0;
-    for (auto &m : _modules)
-        if (auto v = m->dir_bytes[dir].load(); v > max_bytes) max_bytes = v;
+    uint64_t bytes = _inflight_bytes[dir].load();
 
-    if (max_bytes > BACKPRESSURE_HIGH && !_backpressure_paused[dir].load()) {
+    if (bytes > BACKPRESSURE_HIGH && !_backpressure_paused[dir].load()) {
         _backpressure_paused[dir].store(true);
-        TRACE("CHAIN BP PAUSE dir=%d max_bytes=%zu inflight=%d", dir, (size_t)max_bytes, _inflight.load());
+        TRACE("CHAIN BP PAUSE dir=%d bytes=%zu inflight=%d", dir, (size_t)bytes, _inflight.load());
         if (_pause_cb[dir]) _pause_cb[dir](true);
     }
-    if (max_bytes <= BACKPRESSURE_LOW && _backpressure_paused[dir].load()) {
+    if (bytes <= BACKPRESSURE_LOW && _backpressure_paused[dir].load()) {
         _backpressure_paused[dir].store(false);
-        TRACE("CHAIN BP RESUME dir=%d max_bytes=%zu inflight=%d", dir, (size_t)max_bytes, _inflight.load());
+        TRACE("CHAIN BP RESUME dir=%d bytes=%zu inflight=%d", dir, (size_t)bytes, _inflight.load());
         if (_pause_cb[dir]) _pause_cb[dir](false);
     }
 }

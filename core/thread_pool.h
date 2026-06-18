@@ -11,7 +11,6 @@
 
 struct WorkTask {
     std::function<void()> fn;
-    std::mutex *order_mutex = nullptr;
     WorkTask() = default;
     template<typename F> WorkTask(F &&f) : fn(std::forward<F>(f)) {}
 };
@@ -29,17 +28,6 @@ public:
         {
             std::lock_guard<std::mutex> lock(mtx_);
             queue_.push_back(WorkTask(std::forward<F>(f)));
-        }
-        cv_.notify_one();
-    }
-
-    template<typename F>
-    void enqueue(F &&f, std::mutex *om) {
-        WorkTask task(std::forward<F>(f));
-        task.order_mutex = om;
-        {
-            std::lock_guard<std::mutex> lock(mtx_);
-            queue_.push_back(std::move(task));
         }
         cv_.notify_one();
     }
