@@ -200,8 +200,13 @@ void Client::register_data_connection_reader(size_t idx) {
                         if (dump_sz > 64) dump_sz = 64;
                         for (size_t i = 0; i < dump_sz && i*3 < 255; i++)
                             snprintf(hexbuf + i*3, 4, "%02x ", (unsigned char)buf.data()[off+i]);
-                        log_error("client: wire protocol violation type=%u off=%zu buf_sz=%zu avail=%zu val=%zu pos=%zu hex=%s, disconnecting",
-                                  type, off, buf.size(), avail, val, pos, hexbuf);
+                        // Dump last 32 bytes before the violation to see previous frame boundary
+                        char prehex[128] = {0};
+                        size_t predump = off > 32 ? 32 : off;
+                        for (size_t i = 0; i < predump; i++)
+                            snprintf(prehex + i*3, 4, "%02x ", (unsigned char)buf.data()[off - predump + i]);
+                        log_error("client: wire protocol violation type=%u off=%zu buf_sz=%zu avail=%zu val=%zu pos=%zu pre_hex=%s vio_hex=%s, disconnecting",
+                                  type, off, buf.size(), avail, val, pos, prehex, hexbuf);
                         buf.clear(); off = 0;
                         Kernel::request_stop();
                         break;

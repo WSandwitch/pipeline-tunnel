@@ -122,8 +122,8 @@ struct WriteBuffer {
     }
 
     bool flush_unlocked(int fd) {
-        if (!flush_priority_unlocked(fd))
-            return false;
+        // First finish current data chunk, THEN flush priority between frames.
+        // Never interleave priority inside a partially-written frame.
         while (!chunks.empty()) {
             auto &front = chunks.front();
             size_t remaining = front.size() - read_offset;
@@ -134,6 +134,7 @@ struct WriteBuffer {
                 if (read_offset >= front.size()) {
                     chunks.pop_front();
                     read_offset = 0;
+                    // Only flush priority at clean frame boundaries
                     if (!flush_priority_unlocked(fd))
                         return false;
                 }
@@ -144,7 +145,8 @@ struct WriteBuffer {
                 return true;
             }
         }
-        return true;
+        // All normal chunks flushed — flush remaining priority
+        return flush_priority_unlocked(fd);
     }
 
     void clear() {

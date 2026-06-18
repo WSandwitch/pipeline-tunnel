@@ -1052,8 +1052,12 @@ void Session::register_data_connection_reader(size_t idx) {
                             for (size_t i = 0; i < dump_sz && i*3 < 255; i++)
                                 snprintf(hexbuf + i*3, 4, "%02x ", (unsigned char)dc.read_buf.data()[dc.read_offset+i]);
                         }
-                        log_error("session %llx: wire protocol violation type=%u off=%zu buf_sz=%zu avail=%zu val=%zu pos=%zu hex=%s",
-                                  (unsigned long long)session_id_, type, dc.read_offset, dc.read_buf.size(), avail, val, pos, hexbuf);
+                        char prehex[128] = {0};
+                        size_t predump = dc.read_offset > 32 ? 32 : dc.read_offset;
+                        for (size_t i = 0; i < predump; i++)
+                            snprintf(prehex + i*3, 4, "%02x ", (unsigned char)dc.read_buf.data()[dc.read_offset - predump + i]);
+                        log_error("session %llx: wire protocol violation type=%u off=%zu buf_sz=%zu avail=%zu val=%zu pos=%zu pre_hex=%s vio_hex=%s",
+                                  (unsigned long long)session_id_, type, dc.read_offset, dc.read_buf.size(), avail, val, pos, prehex, hexbuf);
                         dc.read_buf.clear(); dc.read_offset = 0;
                         break;
                     }
