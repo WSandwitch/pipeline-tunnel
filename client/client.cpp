@@ -105,7 +105,7 @@ void Client::send_control(const Packet &pkt) {
         size_t idx = (size_t)((start + i) % (int)n);
         if (data_connections_[idx].fd < 0) continue;
         auto &dc = data_connections_[idx];
-        dc.priority_buf.insert(dc.priority_buf.end(), framed.data(), framed.data() + framed.size());
+        dc.writer.write_priority(framed.data(), framed.size());
         if (!dc.writer.registered)
             register_data_conn_epollout(idx, dc.fd);
         return;
@@ -124,6 +124,7 @@ void Client::register_data_connection_reader(size_t idx) {
             dc.read_buf.resize(old + MAX_PACKET_SIZE);
             ssize_t n = read(dc.fd, dc.read_buf.data() + old, MAX_PACKET_SIZE);
             if (n > 0) {
+
                 last_wire_activity_ = std::chrono::steady_clock::now();
                 heartbeating_ = false;
                 dc.read_buf.resize(old + (size_t)n);
@@ -341,51 +342,21 @@ void Client::register_data_conn_epollout(size_t idx, int fd) {
     data_connections_[idx].writer.registered = true;
     kernel_->add_fd_handler(fd, [this, idx](int ev_fd, uint32_t events) {
         (void)ev_fd;
-        if (events & EPOLLOUT) {
-            if (idx >= data_connections_.size()) return;
-            auto &dc = data_connections_[idx];
+            if (events & EPOLLOUT) {
+                if (idx >= data_connections_.size()) return;
+                auto &dc = data_connections_[idx];
 
-            // Flush writer — after each complete chunk, flush priority messages
-            bool drained = dc.writer.flush(dc.fd);
+                // Flush writer — priority chunks are flushed between data chunks
+                bool drained = dc.writer.flush(dc.fd);
+                if (!drained)
+                    dc.writer.flush(dc.fd);
 
-            if (dc.writer.read_offset == 0) {
-                while (!dc.priority_buf.empty()) {
-                    ssize_t n = ::write(dc.fd, dc.priority_buf.data(), dc.priority_buf.size());
-                    if (n > 0) {
-                        if ((size_t)n >= dc.priority_buf.size())
-                            dc.priority_buf.clear();
-                        else
-                            dc.priority_buf.erase(dc.priority_buf.begin(),
-                                                  dc.priority_buf.begin() + (size_t)n);
-                    }
-                    if (n < 0 && (errno == EAGAIN || errno == EWOULDBLOCK)) break;
+                // Deregister EPOLLOUT if everything flushed
+                if (dc.writer.empty()) {
+                    dc.writer.registered = false;
+                    kernel_->mod_fd_events(dc.fd, 0, EPOLLOUT);
                 }
             }
-
-            if (!drained)
-                dc.writer.flush(dc.fd);
-
-            // Step 4: resume paused ext connections if buffer drained below low_water
-            if (dc.writer.size() <= dc.writer.low_water) {
-                for (auto &[cid, ext] : conns_) {
-                    if (ext.ext_overflow_paused) {
-                        ext.ext_overflow_paused = false;
-                        log_debug("client: data_conn_epollout resume conn=%u attempt", cid);
-                        if (!ext.writer_paused && !ext.chain_paused)
-                            kernel_->mod_fd_events(ext.fd, EPOLLIN, 0);
-                        else
-                            log_debug("client: data_conn_epollout resume conn=%u blocked writer_paused=%d chain_paused=%d", cid, ext.writer_paused, ext.chain_paused);
-                        log_debug("client: BW resume ext conn_id=%u (flush)", cid);
-                    }
-                }
-            }
-
-            // Step 5: deregister EPOLLOUT if everything flushed
-            if (dc.writer.empty() && dc.priority_buf.empty()) {
-                dc.writer.registered = false;
-                kernel_->mod_fd_events(dc.fd, 0, EPOLLOUT);
-            }
-        }
         if (events & (EPOLLERR | EPOLLHUP)) {
             if (idx < data_connections_.size())
                 data_connections_[idx].writer.clear();
@@ -760,36 +731,13 @@ void Client::handle_auth2_challenge(const Packet &pkt) {
             self->pending_io_.push_back([self, dc_idx]() {
                 auto &w = self->data_connections_[dc_idx].writer;
                 log_debug("client: wire_write PAUSE check w.size=%zu high_water=%zu", w.size(), w.high_water);
-                if (w.size() > w.high_water) {
-                    self->dc_paused_ = true;
-                    for (auto &[cid, ext] : self->conns_) {
-                        if (!ext.ext_overflow_paused) {
-                            ext.ext_overflow_paused = true;
-                            self->kernel_->mod_fd_events(ext.fd, 0, EPOLLIN);
-                            log_debug("client: BW pause ext conn_id=%u", cid);
-                        }
-                    }
-                }
             });
             self->kernel_->wakeup();
         } else {
             std::lock_guard<std::mutex> lock(self->data_mtx_);
             self->pending_io_.push_back([self, dc_idx]() {
                 auto &w = self->data_connections_[dc_idx].writer;
-                if (w.size() <= w.low_water) {
-                    log_debug("client: wire_write RESUME clear ext_overflow_paused w.size=%zu", w.size());
-                    for (auto &[cid, ext] : self->conns_) {
-                        if (ext.ext_overflow_paused) {
-                            ext.ext_overflow_paused = false;
-                            log_debug("client: wire_write RESUME conn=%u attempt", cid);
-                            if (!ext.writer_paused && !ext.chain_paused)
-                                self->kernel_->mod_fd_events(ext.fd, EPOLLIN, 0);
-                            else
-                                log_debug("client: wire_write RESUME conn=%u blocked writer_paused=%d chain_paused=%d", cid, ext.writer_paused, ext.chain_paused);
-                            log_debug("client: BW resume ext conn_id=%u", cid);
-                        }
-                    }
-                }
+                (void)w;
             });
             self->kernel_->wakeup();
         }
@@ -1116,7 +1064,6 @@ void Client::handle_writer_pause(const Packet &pkt) {
     auto it = conns_.find(conn_id);
     if (it == conns_.end()) return;
     it->second.writer_paused = true;
-    TRACE("CLI PAUSE recv conn_id=%u fd=%d", conn_id, it->second.fd);
     log_debug("client: WRITER_PAUSE conn_id=%u (external %s)", conn_id, it->second.fd >= 0 ? "paused" : "nofd");
     if (it->second.fd >= 0)
         kernel_->mod_fd_events(it->second.fd, 0, EPOLLIN);
@@ -1128,14 +1075,9 @@ void Client::handle_writer_resume(const Packet &pkt) {
     auto it = conns_.find(conn_id);
     if (it == conns_.end()) return;
     it->second.writer_paused = false;
-    TRACE("CLI RESUME recv conn_id=%u fd=%d wp=%d cp=%d eop=%d", conn_id, it->second.fd, (int)it->second.writer_paused, (int)it->second.chain_paused, (int)it->second.ext_overflow_paused);
     log_debug("client: WRITER_RESUME conn_id=%u", conn_id);
-    if (it->second.fd >= 0) {
-        if (!it->second.chain_paused && !it->second.ext_overflow_paused)
-            kernel_->mod_fd_events(it->second.fd, EPOLLIN, 0);
-        else
-            log_debug("client: WRITER_RESUME conn=%u blocked chain_paused=%d ext_overflow_paused=%d", conn_id, it->second.chain_paused, it->second.ext_overflow_paused);
-    }
+    if (it->second.fd >= 0 && !it->second.chain_paused && !it->second.ext_overflow_paused)
+        kernel_->mod_fd_events(it->second.fd, EPOLLIN, 0);
 }
 
 void Client::handle_chain_pause(const Packet &pkt) {
@@ -1155,12 +1097,8 @@ void Client::handle_chain_resume(const Packet &pkt) {
     for (auto &[cid, conn] : conns_) {
         (void)cid;
         conn.chain_paused = false;
-        if (conn.fd >= 0) {
-            if (!conn.writer_paused && !conn.ext_overflow_paused)
-                kernel_->mod_fd_events(conn.fd, EPOLLIN, 0);
-            else
-                log_debug("client: CHAIN_RESUME conn=%u blocked writer_paused=%d ext_overflow_paused=%d", cid, conn.writer_paused, conn.ext_overflow_paused);
-        }
+        if (conn.fd >= 0 && !conn.writer_paused && !conn.ext_overflow_paused)
+            kernel_->mod_fd_events(conn.fd, EPOLLIN, 0);
     }
 }
 
@@ -1193,10 +1131,8 @@ void Client::handle_connect_ok(const Packet &pkt) {
             ssize_t n = read(fd, buf + 1, MAX_PACKET_SIZE - 1);
             if (n > 0) {
                 buf[0] = conn_id;
-                TRACE("CLI EXT read conn_id=%u n=%zd", conn_id, n);
                 chain_->push_packet(buf, (size_t)n + 1, 0, 0);
             } else {
-                TRACE("CLI EXT read conn_id=%u n=%zd events=0x%x", conn_id, n, events);
                 free(buf);
             }
             if (n == 0) {
@@ -1294,32 +1230,31 @@ void Client::process_pending_io() {
               data_connections_.size()>0?data_connections_[0].writer.size():0,
               data_connections_.size()>1?data_connections_[1].writer.size():0);
     } }
-    // Backpressure: pause target readers when data connection writer grows too large
+    // Backpressure: pause ext readers when data connection writer grows too large
     {
         size_t dc_size = 0;
         for (auto &dc : data_connections_) dc_size += dc.writer.size();
-        if (dc_size > 1024 * 1024 && !dc_paused_) {
-            dc_paused_ = true;
-            TRACE("CLI DC ext_overflow PAUSE dc_size=%zuKB", dc_size / 1024);
-            for (auto &[id, conn] : conns_) {
-                (void)id;
-                conn.ext_overflow_paused = true;
-                if (conn.fd >= 0)
-                    kernel_->mod_fd_events(conn.fd, 0, EPOLLIN);
+        if (dc_size > 1024 * 1024) {
+            if (!dc_paused_dir_) {
+                dc_paused_dir_ = 1;  // bit 0 = dir0 congested
+                for (auto &[id, conn] : conns_) {
+                    (void)id;
+                    conn.ext_overflow_paused = true;
+                    if (conn.fd >= 0)
+                        kernel_->mod_fd_events(conn.fd, 0, EPOLLIN);
+                }
             }
-        } else if (dc_size < 256 * 1024 && dc_paused_) {
-            dc_paused_ = false;
-            TRACE("CLI DC ext_overflow RESUME dc_size=%zuKB", dc_size / 1024);
+        } else if (dc_size < 256 * 1024 && dc_paused_dir_) {
+            dc_paused_dir_ = 0;
             for (auto &[id, conn] : conns_) {
                 (void)id;
                 conn.ext_overflow_paused = false;
-                if (conn.fd >= 0) {
-                    if (!conn.writer_paused && !conn.chain_paused)
-                        kernel_->mod_fd_events(conn.fd, EPOLLIN, 0);
-                }
+                if (conn.fd >= 0 && !conn.writer_paused && !conn.chain_paused)
+                    kernel_->mod_fd_events(conn.fd, EPOLLIN, 0);
             }
         }
     }
+
     std::vector<std::function<void()>> batch;
     {
         std::lock_guard<std::mutex> lock(data_mtx_);
@@ -1357,13 +1292,11 @@ void Client::process_pending_io() {
         if (should_pause) {
             if (!conn.epollin_removed) {
                 conn.epollin_removed = true;
-                TRACE("CLI GATE rm EPOLLIN id=%u wp=%d cp=%d eop=%d bp0=%d", id, (int)conn.writer_paused, (int)conn.chain_paused, (int)conn.ext_overflow_paused, (int)bp0);
                 kernel_->mod_fd_events(conn.fd, 0, EPOLLIN);
             }
         } else {
             if (conn.epollin_removed) {
                 conn.epollin_removed = false;
-                TRACE("CLI GATE add EPOLLIN id=%u wp=%d cp=%d eop=%d bp0=%d", id, (int)conn.writer_paused, (int)conn.chain_paused, (int)conn.ext_overflow_paused, (int)bp0);
                 kernel_->mod_fd_events(conn.fd, EPOLLIN, 0);
             }
         }
