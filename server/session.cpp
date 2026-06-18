@@ -71,6 +71,7 @@ static std::string hex_sha256(const std::string &data) {
 }
 
 void Session::on_data(const uint8_t *data, size_t len) {
+    TRACE("SVR ON_DATA len=%zu state=%d", len, (int)state_);
     std::lock_guard<std::mutex> lock(io_mutex_);
     if (state_ < AUTH_DONE) {
         // Auth phase — parse Protocol serialized format
@@ -171,6 +172,7 @@ void Session::on_data(const uint8_t *data, size_t len) {
                 }
                 break;
             case MSG_CHAIN_PAUSE:
+                TRACE("SVR RECV CHAIN_PAUSE");
                 if (state_ == RUNNING || state_ == AWAIT_CHAIN_CREATE) {
                     for (auto &[cid, tgt] : targets_) {
                         (void)cid;
@@ -181,6 +183,7 @@ void Session::on_data(const uint8_t *data, size_t len) {
                 }
                 break;
             case MSG_CHAIN_RESUME:
+                TRACE("SVR RECV CHAIN_RESUME");
                 if (state_ == RUNNING || state_ == AWAIT_CHAIN_CREATE) {
                     for (auto &[cid, tgt] : targets_) {
                         (void)cid;
@@ -199,6 +202,7 @@ void Session::on_data(const uint8_t *data, size_t len) {
 }
 
 void Session::handle_auth_challenge_response(const Packet &pkt) {
+    TRACE("SVR HANDLE AUTH CHALLENGE RESP");
     std::string expected = hex_sha256(challenge1_ + password_);
     std::string got((const char *)pkt.payload.data(), pkt.payload.size());
     if (got != expected) {
@@ -219,6 +223,7 @@ void Session::handle_auth_challenge_response(const Packet &pkt) {
 }
 
 void Session::handle_auth2_challenge(const Packet &pkt) {
+    TRACE("SVR HANDLE AUTH2 CHALLENGE");
     std::string challenge((const char *)pkt.payload.data(), pkt.payload.size());
     std::string resp = hex_sha256(challenge + password_);
     Packet response = Protocol::make_msg(MSG_AUTH_RESPONSE, resp.data(), resp.size());
@@ -227,6 +232,7 @@ void Session::handle_auth2_challenge(const Packet &pkt) {
 }
 
 void Session::handle_auth2_response(const Packet &pkt) {
+    TRACE("SVR HANDLE AUTH2 RESP payload[0]=%d", (int)pkt.payload.size() >= 1 ? pkt.payload[0] : -1);
     if (pkt.payload.size() >= 1 && pkt.payload[0] == 0x01) {
         log_info("session %llx: mutual auth done", (unsigned long long)session_id_);
 
@@ -403,6 +409,7 @@ void Session::handle_auth2_response(const Packet &pkt) {
 }
 
 void Session::handle_module_list_req(const Packet &pkt) {
+    TRACE("SVR HANDLE MODULE LIST REQ payload_size=%zu", pkt.payload.size());
     log_debug("session %llx: MSG_MODULE_LIST_REQ received (payload_size=%zu)",
               (unsigned long long)session_id_, pkt.payload.size());
     // Parse: [count:u8][mid_32bytes]...
@@ -640,6 +647,8 @@ void Session::handle_connect_req(const Packet &pkt) {
                     if (!rbuf) return;
                     ssize_t n = read(fd, rbuf + 1, MAX_PACKET_SIZE - 1);
                     if (n > 0) {
+                        static int ext_read_cnt = 0;
+                        if (++ext_read_cnt % 100 == 0) TRACE("SVR EXTREAD cid=%u n=%d", conn_id, (int)n);
                         if (chain_ && state_ == RUNNING) {
                              rbuf[0] = conn_id;
                              chain_->push_packet(rbuf, 1 + (size_t)n, 0, 0);
@@ -664,6 +673,8 @@ void Session::handle_connect_req(const Packet &pkt) {
                       if (!tmp) return;
                       ssize_t n = read(fd, tmp + 1, MAX_PACKET_SIZE - 1);
                       if (n > 0) {
+                          static int ext_read2_cnt = 0;
+                          if (++ext_read2_cnt % 100 == 0) TRACE("SVR EXTREAD2 cid=%u n=%d", conn_id, (int)n);
                           if (chain_ && state_ == RUNNING) {
                               tmp[0] = conn_id;
                               chain_->push_packet(tmp, 1 + (size_t)n, 0, 0);
@@ -764,15 +775,18 @@ void Session::process_pending_data_conns() {
 
 void Session::send_control(const Packet &pkt) {
     auto serialized = proto_.serialize(pkt);
-    // Wire format: [varint(1+proto_len)][WIRE_CONTROL][proto_data]
+    // Wire format: [varint(2+proto_len)][WIRE_CONTROL][seq:1][proto_data]
     std::vector<uint8_t> framed;
-    size_t val = 1 + serialized.size(); // type byte + proto
+    uint8_t seq = control_seq_++;
+    TRACE("SVR SEND CONTROL seq=%u type=%d len=%zu", seq, (int)pkt.type, serialized.size());
+    size_t val = 2 + serialized.size(); // type + seq + proto
     while (val > 0x7F) {
         framed.push_back((uint8_t)((val & 0x7F) | 0x80));
         val >>= 7;
     }
     framed.push_back((uint8_t)(val & 0x7F));
     framed.push_back(WIRE_CONTROL);
+    framed.push_back(seq);
     framed.insert(framed.end(), serialized.begin(), serialized.end());
     if (data_connections_.empty()) return;
     // Round-robin across all connections
@@ -812,11 +826,10 @@ void Session::process_wire_buffer(const uint8_t *data, size_t len) {
             break;
         }
         uint8_t type = data[pos];
-        log_debug("session %llx: process_wire_buffer type=%u val=%zu at pos=%zu",
-                  (unsigned long long)session_id_, type, val, save);
         if (type == WIRE_CONTROL) {
+            if (val < 2) { pos += val; continue; }
             Packet pkt;
-            size_t consumed = proto_.try_parse(data + pos + 1, val - 1, pkt);
+            size_t consumed = proto_.try_parse(data + pos + 2, val - 2, pkt);
             if (consumed > 0) {
                 switch (pkt.type) {
                     case MSG_CONNECT_REQ:
@@ -873,7 +886,7 @@ void Session::process_wire_buffer(const uint8_t *data, size_t len) {
                             tgt.chain_paused = false;
                             if (tgt.fd >= 0) {
                                 log_debug("session %llx: CHAIN_RESUME conn=%u attempt", (unsigned long long)session_id_, cid);
-                                if (!tgt.writer_paused)
+                                if (!tgt.writer_paused && !tgt.ext_overflow_paused)
                                     kernel_->mod_fd_events(tgt.fd, EPOLLIN, 0);
                             }
                         }
@@ -930,6 +943,11 @@ void Session::register_data_connection_reader(size_t idx) {
             size_t old = dc.read_buf.size();
             dc.read_buf.resize(old + MAX_PACKET_SIZE);
             ssize_t n = read(dc.fd, dc.read_buf.data() + old, MAX_PACKET_SIZE);
+            if (n > 0) {
+                static int wire_read_cnt = 0;
+                if (++wire_read_cnt % 10 == 0) TRACE("SVR DCREAD idx=%zu n=%d", idx, (int)n);
+                TRACE("SVR DC READ n=%zd", n);
+            }
             if (n == 0) {
                 kernel_->del_fd(dc.fd);
                 dc.read_buf.clear();
@@ -1012,75 +1030,12 @@ void Session::register_data_connection_reader(size_t idx) {
                         continue;
                     }
                     if (type == WIRE_CONTROL) {
-                        // Control message — parse proto directly, bypass Chain
+                        uint8_t recv_seq = ptr[pos + 1];
                         Packet pkt;
-                        size_t consumed = proto_.try_parse(ptr + pos + 1, val - 1, pkt);
+                        size_t consumed = proto_.try_parse(ptr + pos + 2, val - 2, pkt);
+                        TRACE("SVR DC RECV CONTROL seq=%u consumed=%zu val=%zu", recv_seq, consumed, val);
                         if (consumed > 0) {
-                            switch (pkt.type) {
-                                case MSG_CONNECT_REQ:
-                                    handle_connect_req(pkt);
-                                    break;
-                                case MSG_DISCONNECT:
-                                    handle_disconnect(pkt);
-                                    break;
-                                case MSG_MODULE_LIST_REQ:
-                                    handle_module_list_req(pkt);
-                                    break;
-                                case MSG_CHAIN_CREATE:
-                                    handle_chain_create(pkt);
-                                    break;
-                                case MSG_WRITER_PAUSE:
-                                case MSG_WRITER_RESUME: {
-                                    uint8_t cid = pkt.payload.empty() ? 0 : pkt.payload[0];
-                                    if (pkt.type == MSG_WRITER_PAUSE) {
-                                        log_debug("session %llx: WRITER_PAUSE conn_id=%u",
-                                                  (unsigned long long)session_id_, cid);
-                                        auto it = targets_.find(cid);
-                                        if (it != targets_.end()) {
-                                            it->second.writer_paused = true;
-                                            kernel_->mod_fd_events(it->second.fd, 0, EPOLLIN);
-                                        }
-                                    } else {
-                                        log_debug("session %llx: WRITER_RESUME conn_id=%u",
-                                                  (unsigned long long)session_id_, cid);
-                                        auto it = targets_.find(cid);
-                                        if (it != targets_.end()) {
-                                            it->second.writer_paused = false;
-                                            log_debug("session %llx: WRITER_RESUME(2) conn=%u attempt", (unsigned long long)session_id_, cid);
-                                if (it->second.fd >= 0 && !it->second.chain_paused && !it->second.ext_overflow_paused)
-                                    kernel_->mod_fd_events(it->second.fd, EPOLLIN, 0);
-                                        }
-                                    }
-                                    break;
-                                }
-                                case MSG_CHAIN_PAUSE:
-                                    log_debug("session %llx: CHAIN_PAUSE",
-                                              (unsigned long long)session_id_);
-                                    for (auto &[cid, tgt] : targets_) {
-                                        (void)cid;
-                                        tgt.chain_paused = true;
-                                        if (tgt.fd >= 0)
-                                            kernel_->mod_fd_events(tgt.fd, 0, EPOLLIN);
-                                    }
-                                    break;
-                                case MSG_CHAIN_RESUME:
-                                    log_debug("session %llx: CHAIN_RESUME",
-                                              (unsigned long long)session_id_);
-                                    for (auto &[cid, tgt] : targets_) {
-                                        (void)cid;
-                                        tgt.chain_paused = false;
-                                        if (tgt.fd >= 0) {
-                                            log_debug("session %llx: CHAIN_RESUME(2) conn=%u attempt", (unsigned long long)session_id_, cid);
-                                                if (!tgt.writer_paused && !tgt.ext_overflow_paused)
-                                                    kernel_->mod_fd_events(tgt.fd, EPOLLIN, 0);
-                                        }
-                                    }
-                                    break;
-                                default:
-                                    log_debug("session %llx: unexpected control msg %d",
-                                              (unsigned long long)session_id_, (int)pkt.type);
-                                    break;
-                            }
+                            deliver_control(recv_seq, pkt);
                         }
                         {
                             auto &dc = data_connections_[idx];
@@ -1140,13 +1095,15 @@ void Session::register_data_conn_epollout(size_t idx, int fd) {
             if (events & EPOLLOUT) {
                 if (idx >= data_connections_.size()) return;
                 auto &dc = data_connections_[idx];
-
-                // Flush writer — priority chunks are flushed between data chunks
+                bool was_nonempty = !dc.writer.empty();
                 bool drained = dc.writer.flush(dc.fd);
-                if (!drained)
+                if (!drained) {
+                    TRACE("SVR DCW FLUSH EAGAIN idx=%zu size=%zu", idx, dc.writer.size());
                     dc.writer.flush(dc.fd);
-
-                // Deregister EPOLLOUT if everything flushed
+                }
+                if (drained && was_nonempty) {
+                    TRACE("SVR DCW FLUSH OK idx=%zu", idx);
+                }
                 if (dc.writer.empty()) {
                     dc.writer.registered = false;
                     kernel_->mod_fd_events(dc.fd, 0, EPOLLOUT);
@@ -1424,7 +1381,14 @@ void Session::register_target_epollout(uint8_t conn_id, int tfd) {
         if (events & EPOLLOUT) {
             auto it2 = targets_.find(conn_id);
             if (it2 == targets_.end()) return;
+            bool was_nonempty = !it2->second.writer.empty();
             bool drained = it2->second.writer.flush(fd);
+            if (!drained) {
+                TRACE("SVR TGTW FLUSH EAGAIN cid=%u size=%zu", conn_id, it2->second.writer.size());
+            }
+            if (drained && was_nonempty) {
+                TRACE("SVR TGTW FLUSH OK cid=%u", conn_id);
+            }
             if (drained) {
                 it2->second.writer.registered = false;
                 kernel_->mod_fd_events(fd, 0, EPOLLOUT);
@@ -1464,14 +1428,99 @@ void Session::send_chain_resume() {
     send_control(pkt);
 }
 
+void Session::deliver_control(uint8_t seq, const Packet &pkt) {
+    if (seq == exp_control_seq_) {
+        apply_control(pkt);
+        exp_control_seq_++;
+        while (pending_control_valid_[exp_control_seq_]) {
+            apply_control(pending_control_[exp_control_seq_]);
+            pending_control_valid_[exp_control_seq_] = false;
+            exp_control_seq_++;
+        }
+    } else {
+        pending_control_[seq] = pkt;
+        pending_control_valid_[seq] = true;
+    }
+}
+
+void Session::apply_control(const Packet &pkt) {
+    switch (pkt.type) {
+        case MSG_CONNECT_REQ:
+            handle_connect_req(pkt);
+            break;
+        case MSG_DISCONNECT:
+            handle_disconnect(pkt);
+            break;
+        case MSG_MODULE_LIST_REQ:
+            handle_module_list_req(pkt);
+            break;
+        case MSG_CHAIN_CREATE:
+            handle_chain_create(pkt);
+            break;
+        case MSG_WRITER_PAUSE:
+        case MSG_WRITER_RESUME: {
+            uint8_t cid = pkt.payload.empty() ? 0 : pkt.payload[0];
+            if (pkt.type == MSG_WRITER_PAUSE) {
+                log_debug("session %llx: WRITER_PAUSE conn_id=%u",
+                          (unsigned long long)session_id_, cid);
+                auto it = targets_.find(cid);
+                if (it != targets_.end()) {
+                    it->second.writer_paused = true;
+                    kernel_->mod_fd_events(it->second.fd, 0, EPOLLIN);
+                }
+            } else {
+                log_debug("session %llx: WRITER_RESUME conn_id=%u",
+                          (unsigned long long)session_id_, cid);
+                auto it = targets_.find(cid);
+                if (it != targets_.end()) {
+                    it->second.writer_paused = false;
+                    log_debug("session %llx: WRITER_RESUME(2) conn=%u attempt", (unsigned long long)session_id_, cid);
+                    if (it->second.fd >= 0 && !it->second.chain_paused && !it->second.ext_overflow_paused)
+                        kernel_->mod_fd_events(it->second.fd, EPOLLIN, 0);
+                }
+            }
+            break;
+        }
+        case MSG_CHAIN_PAUSE:
+            log_debug("session %llx: CHAIN_PAUSE",
+                      (unsigned long long)session_id_);
+            for (auto &[cid, tgt] : targets_) {
+                (void)cid;
+                tgt.chain_paused = true;
+                if (tgt.fd >= 0)
+                    kernel_->mod_fd_events(tgt.fd, 0, EPOLLIN);
+            }
+            break;
+        case MSG_CHAIN_RESUME:
+            log_debug("session %llx: CHAIN_RESUME",
+                      (unsigned long long)session_id_);
+            for (auto &[cid, tgt] : targets_) {
+                (void)cid;
+                tgt.chain_paused = false;
+                if (tgt.fd >= 0) {
+                    log_debug("session %llx: CHAIN_RESUME(2) conn=%u attempt", (unsigned long long)session_id_, cid);
+                    if (!tgt.writer_paused && !tgt.ext_overflow_paused)
+                        kernel_->mod_fd_events(tgt.fd, EPOLLIN, 0);
+                }
+            }
+            break;
+        default:
+            log_debug("session %llx: unexpected control msg %d",
+                      (unsigned long long)session_id_, (int)pkt.type);
+            break;
+    }
+}
+
 void Session::process_pending_io() {
     { static int ppi_cnt = 0; if (++ppi_cnt % 100 == 0) TRACE("SVR PPI tick %d", ppi_cnt); }
     { static int stats_cnt = 0; stats_cnt++; if (chain_ && stats_cnt % 10 == 0) {
-        TRACE("SVR STATS: bp0=%d bp1=%d maxdb0=%lu maxdb1=%lu dc0=%zu dc1=%zu",
+        int infl = chain_ ? chain_->get_inflight() : -1;
+        TRACE("SVR STATS: bp0=%d bp1=%d maxdb0=%lu maxdb1=%lu inf=%d dc0=%zu dc1=%zu",
               chain_->is_backpressure_paused(0),
               chain_->is_backpressure_paused(1),
               (unsigned long)chain_->get_max_dir_bytes(0),
               (unsigned long)chain_->get_max_dir_bytes(1),
+              infl,
               data_connections_.size()>0?data_connections_[0].writer.size():0,
               data_connections_.size()>1?data_connections_[1].writer.size():0);
     } }
@@ -1480,8 +1529,8 @@ void Session::process_pending_io() {
         size_t dc_size = 0;
         for (auto &dc : data_connections_) dc_size += dc.writer.size();
         if (dc_size > 1024 * 1024) {
-            if (!dc_paused_dir_) {
-                dc_paused_dir_ = 2;  // bit 1 = dir1 congested
+            if (!dc_paused_) {
+                dc_paused_ = true;
                 std::lock_guard<std::mutex> lock(targets_mtx_);
                 for (auto &[cid, tgt] : targets_) {
                     (void)cid;
@@ -1490,8 +1539,8 @@ void Session::process_pending_io() {
                         kernel_->mod_fd_events(tgt.fd, 0, EPOLLIN);
                 }
             }
-        } else if (dc_size < 256 * 1024 && dc_paused_dir_) {
-            dc_paused_dir_ = 0;
+        } else if (dc_size < 256 * 1024 && dc_paused_) {
+            dc_paused_ = false;
             std::lock_guard<std::mutex> lock(targets_mtx_);
             for (auto &[cid, tgt] : targets_) {
                 (void)cid;
@@ -1514,23 +1563,36 @@ void Session::process_pending_io() {
     bool bp0 = chain_ ? chain_->is_backpressure_paused(0) : false;
     bool bp1 = chain_ ? chain_->is_backpressure_paused(1) : false;
 
-    // Self-heal MSG_CHAIN_PAUSE/RESUME: if actual chain state doesn't match
-    // what we've told the client, send a correction.
+    // Debounced MSG_CHAIN_PAUSE/RESUME: send only when bp1 sustained > 50ms.
+    // Prevents cascade on transient BP (~5ms) in bidir shared-fd scenario.
     // Combined with EPOLLIN gating under a single lock.
     {
         std::lock_guard<std::mutex> tlock(targets_mtx_);
         {
+            auto now = std::chrono::steady_clock::now();
             bool local_sent = false;
             for (auto &[id, tgt] : targets_) {
                 (void)id;
                 if (tgt.local_chain_sent) { local_sent = true; break; }
             }
-            if (bp1 && !local_sent) {
-                for (auto &[id, tgt] : targets_) { (void)id; tgt.local_chain_sent = true; }
-                send_chain_pause();
-            } else if (!bp1 && local_sent) {
-                for (auto &[id, tgt] : targets_) { (void)id; tgt.local_chain_sent = false; }
-                send_chain_resume();
+            if (bp1) {
+                if (bp1_since_ == std::chrono::steady_clock::time_point::min())
+                    bp1_since_ = now;
+                if (!local_sent) {
+                    auto elapsed = std::chrono::duration_cast<std::chrono::milliseconds>(now - bp1_since_).count();
+                    if (elapsed >= 50) {
+                        for (auto &[id, tgt] : targets_) { (void)id; tgt.local_chain_sent = true; }
+                        TRACE("SVR CHAIN PAUSE send (bp1=1)");
+                        send_chain_pause();
+                    }
+                }
+            } else {
+                bp1_since_ = std::chrono::steady_clock::time_point::min();
+                if (local_sent) {
+                    for (auto &[id, tgt] : targets_) { (void)id; tgt.local_chain_sent = false; }
+                    TRACE("SVR CHAIN RESUME send");
+                    send_chain_resume();
+                }
             }
         }
 
@@ -1542,11 +1604,13 @@ void Session::process_pending_io() {
             if (should_pause) {
                 if (!tgt.epollin_removed) {
                     tgt.epollin_removed = true;
+                    TRACE("SVR GATE PAUSE cid=%u bp0=%d wp=%d cp=%d eop=%d", id, bp0, tgt.writer_paused, tgt.chain_paused, tgt.ext_overflow_paused);
                     kernel_->mod_fd_events(tgt.fd, 0, EPOLLIN);
                 }
             } else {
                 if (tgt.epollin_removed) {
                     tgt.epollin_removed = false;
+                    TRACE("SVR GATE RESUME cid=%u bp0=%d wp=%d cp=%d eop=%d", id, bp0, tgt.writer_paused, tgt.chain_paused, tgt.ext_overflow_paused);
                     kernel_->mod_fd_events(tgt.fd, EPOLLIN, 0);
                 }
             }

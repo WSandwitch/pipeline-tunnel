@@ -87,15 +87,18 @@ void Client::send_packet(const Packet &pkt) {
 
 void Client::send_control(const Packet &pkt) {
     auto serialized = proto_.serialize(pkt);
-    // Wire format: [varint(1+proto_len)][WIRE_CONTROL][proto_data]
+    // Wire format: [varint(2+proto_len)][WIRE_CONTROL][seq:1][proto_data]
     std::vector<uint8_t> framed;
-    size_t val = 1 + serialized.size(); // type byte + proto
+    uint8_t seq = control_seq_++;
+    TRACE("CLI SEND CONTROL seq=%u type=%d len=%zu", seq, (int)pkt.type, serialized.size());
+    size_t val = 2 + serialized.size(); // type + seq + proto
     while (val > 0x7F) {
         framed.push_back((uint8_t)((val & 0x7F) | 0x80));
         val >>= 7;
     }
     framed.push_back((uint8_t)(val & 0x7F));
     framed.push_back(WIRE_CONTROL);
+    framed.push_back(seq);
     framed.insert(framed.end(), serialized.begin(), serialized.end());
     if (data_connections_.empty()) return;
     // Round-robin across all connections
@@ -124,6 +127,8 @@ void Client::register_data_connection_reader(size_t idx) {
             dc.read_buf.resize(old + MAX_PACKET_SIZE);
             ssize_t n = read(dc.fd, dc.read_buf.data() + old, MAX_PACKET_SIZE);
             if (n > 0) {
+                static int wire_read_cnt = 0;
+                if (++wire_read_cnt % 10 == 0) TRACE("CLI DCREAD idx=%zu n=%d", idx, (int)n);
 
                 last_wire_activity_ = std::chrono::steady_clock::now();
                 heartbeating_ = false;
@@ -179,45 +184,12 @@ void Client::register_data_connection_reader(size_t idx) {
                         continue;
                     }
                     if (type == WIRE_CONTROL) {
-                        // Control message — parse proto directly, bypass Chain
+                        uint8_t recv_seq = ptr[pos + 1];
                         Packet pkt;
-                        size_t consumed = proto_.try_parse(ptr + pos + 1, val - 1, pkt);
+                        size_t consumed = proto_.try_parse(ptr + pos + 2, val - 2, pkt);
+                        TRACE("CLI DC RECV CONTROL seq=%u consumed=%zu val=%zu", recv_seq, consumed, val);
                         if (consumed > 0) {
-                            switch (pkt.type) {
-                                case MSG_MODULE_LIST_RES:
-                                    handle_module_list_res(pkt);
-                                    break;
-                                case MSG_CONNECT_OK:
-                                    handle_connect_ok(pkt);
-                                    break;
-                                case MSG_CONNECT_FAIL:
-                                    handle_connect_fail(pkt);
-                                    break;
-                                case MSG_DISCONNECT:
-                                    handle_disconnect(pkt);
-                                    break;
-                                case MSG_WRITER_PAUSE:
-                                    handle_writer_pause(pkt);
-                                    break;
-                                case MSG_WRITER_RESUME:
-                                    handle_writer_resume(pkt);
-                                    break;
-                                case MSG_CHAIN_PAUSE:
-                                    handle_chain_pause(pkt);
-                                    break;
-                                case MSG_CHAIN_RESUME:
-                                    handle_chain_resume(pkt);
-                                    break;
-                                case MSG_CHAIN_READY:
-                                    handle_chain_ready(pkt);
-                                    break;
-                                case MSG_TRANSMIT_READY:
-                                    handle_transmit_ready(pkt);
-                                    break;
-                                default:
-                                    log_debug("client: unexpected control msg %d", (int)pkt.type);
-                                    break;
-                            }
+                            deliver_control(recv_seq, pkt);
                         }
                         off += pos + val;
                         continue;
@@ -289,8 +261,9 @@ void Client::process_wire_buffer(const uint8_t *data, size_t len) {
         if (pos + val > len || val < 1) break;
         uint8_t type = data[pos];
         if (type == WIRE_CONTROL) {
+            if (val < 2) { pos += val; continue; }
             Packet pkt;
-            size_t consumed = proto_.try_parse(data + pos + 1, val - 1, pkt);
+            size_t consumed = proto_.try_parse(data + pos + 2, val - 2, pkt);
             if (consumed > 0) {
                 switch (pkt.type) {
                     case MSG_MODULE_LIST_RES:
@@ -345,13 +318,15 @@ void Client::register_data_conn_epollout(size_t idx, int fd) {
             if (events & EPOLLOUT) {
                 if (idx >= data_connections_.size()) return;
                 auto &dc = data_connections_[idx];
-
-                // Flush writer — priority chunks are flushed between data chunks
+                bool was_nonempty = !dc.writer.empty();
                 bool drained = dc.writer.flush(dc.fd);
-                if (!drained)
+                if (!drained) {
+                    TRACE("CLI DCW FLUSH EAGAIN idx=%zu size=%zu", idx, dc.writer.size());
                     dc.writer.flush(dc.fd);
-
-                // Deregister EPOLLOUT if everything flushed
+                }
+                if (drained && was_nonempty) {
+                    TRACE("CLI DCW FLUSH OK idx=%zu", idx);
+                }
                 if (dc.writer.empty()) {
                     dc.writer.registered = false;
                     kernel_->mod_fd_events(dc.fd, 0, EPOLLOUT);
@@ -998,8 +973,15 @@ void Client::register_external_epollout(uint8_t conn_id, int fd) {
             bool drained;
             do {
                 size_t old_ro = it2->second.writer.read_offset;
+                bool was_nonempty = !it2->second.writer.empty();
                 drained = it2->second.writer.flush(it2->second.fd);
-                if (it2->second.writer.read_offset == old_ro) break;
+                if (it2->second.writer.read_offset == old_ro) {
+                    if (!drained && was_nonempty)
+                        TRACE("CLI EXTW FLUSH EAGAIN cid=%u size=%zu", conn_id, it2->second.writer.size());
+                    break;
+                }
+                if (drained && was_nonempty)
+                    TRACE("CLI EXTW FLUSH OK cid=%u", conn_id);
             } while (!drained);
             if (it2->second.writer.empty()) {
                 it2->second.writer.registered = false;
@@ -1058,6 +1040,61 @@ void Client::resume_paused_dcfds() {
     }
 }
 
+void Client::deliver_control(uint8_t seq, const Packet &pkt) {
+    TRACE("CLI DELIVER seq=%u exp=%u type=%d", seq, exp_control_seq_, (int)pkt.type);
+    if (seq == exp_control_seq_) {
+        apply_control(pkt);
+        exp_control_seq_++;
+        while (pending_control_valid_[exp_control_seq_]) {
+            TRACE("CLI DELIVER drain seq=%u type=%d", exp_control_seq_, (int)pending_control_[exp_control_seq_].type);
+            apply_control(pending_control_[exp_control_seq_]);
+            pending_control_valid_[exp_control_seq_] = false;
+            exp_control_seq_++;
+        }
+    } else {
+        pending_control_[seq] = pkt;
+        pending_control_valid_[seq] = true;
+    }
+}
+
+void Client::apply_control(const Packet &pkt) {
+    switch (pkt.type) {
+        case MSG_MODULE_LIST_RES:
+            handle_module_list_res(pkt);
+            break;
+        case MSG_CONNECT_OK:
+            handle_connect_ok(pkt);
+            break;
+        case MSG_CONNECT_FAIL:
+            handle_connect_fail(pkt);
+            break;
+        case MSG_DISCONNECT:
+            handle_disconnect(pkt);
+            break;
+        case MSG_WRITER_PAUSE:
+            handle_writer_pause(pkt);
+            break;
+        case MSG_WRITER_RESUME:
+            handle_writer_resume(pkt);
+            break;
+        case MSG_CHAIN_PAUSE:
+            handle_chain_pause(pkt);
+            break;
+        case MSG_CHAIN_RESUME:
+            handle_chain_resume(pkt);
+            break;
+        case MSG_CHAIN_READY:
+            handle_chain_ready(pkt);
+            break;
+        case MSG_TRANSMIT_READY:
+            handle_transmit_ready(pkt);
+            break;
+        default:
+            log_debug("client: unexpected control msg %d", (int)pkt.type);
+            break;
+    }
+}
+
 void Client::handle_writer_pause(const Packet &pkt) {
     if (pkt.payload.size() < 1) return;
     uint8_t conn_id = pkt.payload[0];
@@ -1082,7 +1119,7 @@ void Client::handle_writer_resume(const Packet &pkt) {
 
 void Client::handle_chain_pause(const Packet &pkt) {
     (void)pkt;
-    log_debug("client: CHAIN_PAUSE");
+    TRACE("CLI RECV CHAIN_PAUSE");
     for (auto &[cid, conn] : conns_) {
         (void)cid;
         conn.chain_paused = true;
@@ -1093,7 +1130,7 @@ void Client::handle_chain_pause(const Packet &pkt) {
 
 void Client::handle_chain_resume(const Packet &pkt) {
     (void)pkt;
-    log_debug("client: CHAIN_RESUME");
+    TRACE("CLI RECV CHAIN_RESUME");
     for (auto &[cid, conn] : conns_) {
         (void)cid;
         conn.chain_paused = false;
@@ -1130,6 +1167,8 @@ void Client::handle_connect_ok(const Packet &pkt) {
             if (!buf) { log_error("client: OOM in ext handler"); return; }
             ssize_t n = read(fd, buf + 1, MAX_PACKET_SIZE - 1);
             if (n > 0) {
+                static int ext_read_cnt = 0;
+                if (++ext_read_cnt % 100 == 0) TRACE("CLI EXTREAD cid=%u n=%d", conn_id, (int)n);
                 buf[0] = conn_id;
                 chain_->push_packet(buf, (size_t)n + 1, 0, 0);
             } else {
@@ -1222,11 +1261,13 @@ void Client::check_heartbeat() {
 void Client::process_pending_io() {
     { static int ppi_cnt = 0; ppi_cnt++; if (ppi_cnt % 100 == 0) TRACE("CLI PPI tick %d", ppi_cnt); }
     { static int stats_cnt = 0; stats_cnt++; if (chain_ && stats_cnt % 10 == 0) {
-        TRACE("CLI STATS: bp0=%d bp1=%d maxdb0=%lu maxdb1=%lu dc0=%zu dc1=%zu",
+        int infl = chain_ ? chain_->get_inflight() : -1;
+        TRACE("CLI STATS: bp0=%d bp1=%d maxdb0=%lu maxdb1=%lu inf=%d dc0=%zu dc1=%zu",
               chain_->is_backpressure_paused(0),
               chain_->is_backpressure_paused(1),
               (unsigned long)chain_->get_max_dir_bytes(0),
               (unsigned long)chain_->get_max_dir_bytes(1),
+              infl,
               data_connections_.size()>0?data_connections_[0].writer.size():0,
               data_connections_.size()>1?data_connections_[1].writer.size():0);
     } }
@@ -1235,8 +1276,8 @@ void Client::process_pending_io() {
         size_t dc_size = 0;
         for (auto &dc : data_connections_) dc_size += dc.writer.size();
         if (dc_size > 1024 * 1024) {
-            if (!dc_paused_dir_) {
-                dc_paused_dir_ = 1;  // bit 0 = dir0 congested
+            if (!dc_paused_) {
+                dc_paused_ = true;
                 for (auto &[id, conn] : conns_) {
                     (void)id;
                     conn.ext_overflow_paused = true;
@@ -1244,8 +1285,8 @@ void Client::process_pending_io() {
                         kernel_->mod_fd_events(conn.fd, 0, EPOLLIN);
                 }
             }
-        } else if (dc_size < 256 * 1024 && dc_paused_dir_) {
-            dc_paused_dir_ = 0;
+        } else if (dc_size < 256 * 1024 && dc_paused_) {
+            dc_paused_ = false;
             for (auto &[id, conn] : conns_) {
                 (void)id;
                 conn.ext_overflow_paused = false;
@@ -1267,19 +1308,33 @@ void Client::process_pending_io() {
     bool bp0 = chain_ ? chain_->is_backpressure_paused(0) : false;
     bool bp1 = chain_ ? chain_->is_backpressure_paused(1) : false;
 
-    // Self-heal MSG_CHAIN_PAUSE/RESUME for dir=1 (wire→ext full → tell server to pause)
+    // Debounced MSG_CHAIN_PAUSE/RESUME: send only when bp1 sustained > 50ms.
+    // Prevents cascade on transient BP (~5ms) in bidir shared-fd scenario.
     {
+        auto now = std::chrono::steady_clock::now();
         bool local_sent = false;
         for (auto &[id, conn] : conns_) {
             (void)id;
             if (conn.local_chain_sent) { local_sent = true; break; }
         }
-        if (bp1 && !local_sent) {
-            for (auto &[id, conn] : conns_) { (void)id; conn.local_chain_sent = true; }
-            send_chain_pause();
-        } else if (!bp1 && local_sent) {
-            for (auto &[id, conn] : conns_) { (void)id; conn.local_chain_sent = false; }
-            send_chain_resume();
+        if (bp1) {
+            if (bp1_since_ == std::chrono::steady_clock::time_point::min())
+                bp1_since_ = now;
+            if (!local_sent) {
+                auto elapsed = std::chrono::duration_cast<std::chrono::milliseconds>(now - bp1_since_).count();
+                if (elapsed >= 50) {
+                    for (auto &[id, conn] : conns_) { (void)id; conn.local_chain_sent = true; }
+                    TRACE("CLI CHAIN PAUSE send (bp1=1)");
+                    send_chain_pause();
+                }
+            }
+        } else {
+            bp1_since_ = std::chrono::steady_clock::time_point::min();
+            if (local_sent) {
+                for (auto &[id, conn] : conns_) { (void)id; conn.local_chain_sent = false; }
+                TRACE("CLI CHAIN RESUME send");
+                send_chain_resume();
+            }
         }
     }
 
@@ -1287,16 +1342,19 @@ void Client::process_pending_io() {
     for (auto &[id, conn] : conns_) {
         (void)id;
         if (conn.fd < 0) continue;
+        bool prev_pause = conn.epollin_removed;
         bool should_pause = conn.writer_paused || conn.chain_paused
                          || conn.ext_overflow_paused || bp0;
         if (should_pause) {
             if (!conn.epollin_removed) {
                 conn.epollin_removed = true;
+                TRACE("CLI GATE PAUSE cid=%u bp0=%d wp=%d cp=%d eop=%d", id, bp0, conn.writer_paused, conn.chain_paused, conn.ext_overflow_paused);
                 kernel_->mod_fd_events(conn.fd, 0, EPOLLIN);
             }
         } else {
             if (conn.epollin_removed) {
                 conn.epollin_removed = false;
+                TRACE("CLI GATE RESUME cid=%u bp0=%d wp=%d cp=%d eop=%d", id, bp0, conn.writer_paused, conn.chain_paused, conn.ext_overflow_paused);
                 kernel_->mod_fd_events(conn.fd, EPOLLIN, 0);
             }
         }

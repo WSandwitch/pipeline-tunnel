@@ -233,7 +233,9 @@ void Chain::wait_drain() {
 }
 
 int Chain::total_extra_outputs() const {
-    return _wire_entries.empty() ? 0 : (int)(_wire_entries.size() - 1);
+    // _wire_entries[0] = nullptr (unused), [1] = primary wire module, [2+] = extra split outputs
+    if (_wire_entries.size() < 2) return 0;
+    return (int)(_wire_entries.size() - 2);
 }
 
 // --- static API stubs ---

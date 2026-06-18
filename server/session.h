@@ -143,6 +143,11 @@ private:
     int total_extra_outputs_ = 0;
     // RR counter for send_control
     std::atomic<int> control_rr_counter_{0};
+    // Control message sequencing (prevents reorder via round-robin)
+    std::atomic<uint8_t> control_seq_{0};
+    uint8_t exp_control_seq_ = 0;
+    Packet pending_control_[256];
+    bool pending_control_valid_[256] = {};
 
     // Heartbeat
     std::chrono::steady_clock::time_point last_wire_activity_;
@@ -150,6 +155,7 @@ private:
     int heartbeat_interval_ms_;
 
     bool dc_paused_ = false;
+    std::chrono::steady_clock::time_point bp1_since_{std::chrono::steady_clock::time_point::min()};
     std::mutex data_mtx_;
     std::vector<std::function<void()>> pending_io_;
 
@@ -167,6 +173,8 @@ public:
 private:
     void send_disconnect_now(uint8_t conn_id);
     void send_pending_disconnects();
+    void deliver_control(uint8_t seq, const Packet &pkt);
+    void apply_control(const Packet &pkt);
 };
 
 #endif

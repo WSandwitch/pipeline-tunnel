@@ -22,6 +22,7 @@ public:
 
     bool valid() const { return true; }
     bool is_drained() const { return _inflight.load() == 0; }
+    int get_inflight() const { return _inflight.load(); }
     bool is_backpressure_paused(int dir) const { return _backpressure_paused[dir].load(); }
     uint64_t get_max_dir_bytes(int dir) const {
         return _inflight_bytes[dir].load();

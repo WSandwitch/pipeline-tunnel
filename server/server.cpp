@@ -151,7 +151,9 @@ bool Server::start() {
                 if (session->client_fd() < 0) return;
                 uint8_t buf[65536];
                 ssize_t n;
+                TRACE("SVR OLD HANDLER events=0x%x", events);
                 while ((n = read(session->client_fd(), buf, sizeof(buf))) > 0) {
+                    TRACE("SVR OLD READ n=%zd state=%d", n, (int)session->state());
                     session->on_data(buf, (size_t)n);
                     if (session->client_fd() < 0) break;
                     if (session->state() >= Session::AUTH_DONE) break;

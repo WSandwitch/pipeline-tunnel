@@ -102,6 +102,7 @@ private:
 
     std::shared_ptr<Kernel> kernel_;
     std::shared_ptr<void> chain_guard_;
+    std::chrono::steady_clock::time_point bp1_since_{std::chrono::steady_clock::time_point::min()};
 
     bool dc_paused_ = false;
     std::mutex data_mtx_;
@@ -127,6 +128,11 @@ private:
     int secondary_conns_established_ = 0;
     // RR counter for send_control
     std::atomic<int> control_rr_counter_{0};
+    // Control message sequencing (prevents reorder via round-robin)
+    std::atomic<uint8_t> control_seq_{0};
+    uint8_t exp_control_seq_ = 0;
+    Packet pending_control_[256];
+    bool pending_control_valid_[256] = {};
 
     // Heartbeat
     std::chrono::steady_clock::time_point last_wire_activity_;
@@ -176,6 +182,8 @@ private:
 
     // Heartbeat check — called from kernel tick
     void check_heartbeat();
+    void deliver_control(uint8_t seq, const Packet &pkt);
+    void apply_control(const Packet &pkt);
 };
 
 #endif
