@@ -53,6 +53,7 @@ public:
 
     static constexpr uint64_t BACKPRESSURE_HIGH = 1048576; // 1MB
     static constexpr uint64_t BACKPRESSURE_LOW  = 262144;  // 256KB
+    static constexpr int MAX_WIRE_CONNECTIONS = 200;
 
 private:
     KernelAPI *_kapi = nullptr;

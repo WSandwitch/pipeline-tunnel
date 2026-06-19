@@ -757,6 +757,13 @@ void Client::handle_auth2_challenge(const Packet &pkt) {
         Kernel::request_stop();
         return;
     }
+    if (chain_->total_extra_outputs() > Chain::MAX_WIRE_CONNECTIONS) {
+        log_error("client: too many wire connections (%d, max %d), terminating",
+                  chain_->total_extra_outputs(), Chain::MAX_WIRE_CONNECTIONS);
+        state_ = DISCONNECTED;
+        Kernel::request_stop();
+        return;
+    }
 
     // Register backpressure callbacks.
     // Callbacks only wake the event loop — the centralized check in process_pending_io

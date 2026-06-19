@@ -498,6 +498,13 @@ void Session::handle_chain_create(const Packet &pkt) {
         state_ = DISCONNECTED;
         return;
     }
+    if (chain_->total_extra_outputs() > Chain::MAX_WIRE_CONNECTIONS) {
+        log_error("session %llx: too many wire connections (%d, max %d), disconnecting",
+                  (unsigned long long)session_id_, chain_->total_extra_outputs(),
+                  Chain::MAX_WIRE_CONNECTIONS);
+        state_ = DISCONNECTED;
+        return;
+    }
     log_info("session %llx: chain created with %zu module(s)",
              (unsigned long long)session_id_, mods.size());
 
