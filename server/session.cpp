@@ -343,6 +343,7 @@ void Session::handle_auth2_response(const Packet &pkt) {
             TRACE("SVR WIREWRITE dst=%d fd=%d len=%zu ret=%d", dst, fd, len, ret);
             // Buffer for retransmit (discard oldest if at limit)
             {
+                std::lock_guard<std::mutex> lock(self->data_mtx_);
                 auto &u = self->data_connections_[dc_idx].unacked;
                 if (u.size() >= (size_t)WIRE_MAX_UNACKED)
                     u.pop_front();
@@ -1081,8 +1082,11 @@ void Session::register_data_connection_reader(size_t idx) {
                     if (type == WIRE_DATA_ACK) {
                         auto &dc = data_connections_[idx];
                         uint16_t ack_seq = (uint16_t)(ptr[pos+1]) | ((uint16_t)(ptr[pos+2]) << 8);
-                        while (!dc.unacked.empty() && dc.unacked.front().seq <= ack_seq)
-                            dc.unacked.pop_front();
+                        {
+                            std::lock_guard<std::mutex> lock(data_mtx_);
+                            while (!dc.unacked.empty() && dc.unacked.front().seq <= ack_seq)
+                                dc.unacked.pop_front();
+                        }
                         off += pos + val;
                         continue;
                     }
@@ -1621,6 +1625,7 @@ void Session::process_pending_io() {
         auto now = std::chrono::steady_clock::now();
         for (auto &dc : data_connections_) {
             if (dc.fd < 0) continue;
+            std::lock_guard<std::mutex> lock(data_mtx_);
             while (!dc.unacked.empty()) {
                 auto &oldest = dc.unacked.front();
                 if (now - oldest.sent_at > std::chrono::milliseconds(WIRE_RETRANSMIT_MS)) {

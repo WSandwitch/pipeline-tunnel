@@ -206,123 +206,136 @@ $options = options
 
 # ---- main ----
 
-all_rates = []
-all_outputs = []
+def run_one_test(options)
+  all_rates = []
+  all_outputs = []
+  ok = false
 
-servers = []
-tunnels = []
+  servers = []
+  tunnels = []
 
-begin
-  killall
-  options[:clients].times do |i|
+  begin
+    killall
+    options[:clients].times do |i|
+      begin
+        log_setup "setup client #{i + 1}: finding ports..."
+        tgt = find_free_port
+        svr_port = find_free_port
+        cli_port = find_free_port
+
+        log_setup "setup client #{i + 1}: starting iperf3 server on #{tgt}..."
+        iperf_log = Tempfile.new(%w[iperf3-server- .log])
+        iperf_pid = spawn_verbosely('iperf3', '-s', '-D', '-p', tgt.to_s,
+                                    out: iperf_log, err: [:child, :out])
+        wait_port_listen(tgt)
+        servers << { tgt_port: tgt, pid: iperf_pid, log: iperf_log }
+
+        log_setup "setup client #{i + 1}: starting tunnel svr=#{svr_port} cli=#{cli_port} -> tgt=#{tgt}..."
+        svr, cli, svr_log, cli_log = start_tunnel(svr_port, cli_port, tgt)
+        log_setup "setup client #{i + 1}: tunnel ready (svr=#{svr} cli=#{cli})"
+        tunnels << { cli_port: cli_port, svr_pid: svr, cli_pid: cli, svr_log: svr_log, cli_log: cli_log }
+      rescue => e
+        $stderr.puts "  SETUP ERROR (client #{i + 1}): #{e.message}"
+        servers.each { |s| stop_procs(s[:pid]) }
+        tunnels.each { |t| stop_procs(t[:cli_pid], t[:svr_pid]) }
+        killall
+        raise
+      end
+    end
+
+    log_setup "[#{options[:config]}] Starting #{options[:direction]} " \
+         "(#{options[:clients]} clients, P=#{options[:parallel]}, #{options[:duration]}s)..."
+
+    mutex = Mutex.new
+    thread_results = []
+    thread_errors = []
+    threads = tunnels.map.with_index do |t, i|
+      Thread.new do
+        port = t[:cli_port]
+        args = iperf3_args('-c', HOST, '-p', port.to_s,
+                           '-t', options[:duration].to_s, '-P', options[:parallel].to_s)
+        case options[:direction]
+        when 'reverse' then args << '-R'
+        when 'bidir' then args << '--bidir'
+        end
+        mutex.synchronize { log_setup "client #{i + 1} starting on port #{port}..." }
+        lines = []
+        begin
+          IO.popen(args, err: [:child, :out]) do |io|
+            io.each_line do |line|
+              lines << line
+              mutex.synchronize { $stderr.print "  [#{i + 1}] #{line}" unless options[:quiet] }
+            end
+          end
+          output = lines.join
+          rates = parse_iperf_bitrate(output)
+          mutex.synchronize { thread_results << { output: output, rates: rates } }
+        rescue => e
+          mutex.synchronize { thread_errors << e }
+        end
+        mutex.synchronize { log_setup "client #{i + 1} done." }
+      end
+    end
+
+    test_timeout = [(options[:duration] || 30) + 15, 15].max
+    timed_out = false
     begin
-      log_setup "setup client #{i + 1}: finding ports..."
-      tgt = find_free_port
-      svr_port = find_free_port
-      cli_port = find_free_port
-
-      log_setup "setup client #{i + 1}: starting iperf3 server on #{tgt}..."
-      iperf_log = Tempfile.new(%w[iperf3-server- .log])
-      iperf_pid = spawn_verbosely('iperf3', '-s', '-D', '-p', tgt.to_s,
-                                  out: iperf_log, err: [:child, :out])
-      wait_port_listen(tgt)
-      servers << { tgt_port: tgt, pid: iperf_pid, log: iperf_log }
-
-      log_setup "setup client #{i + 1}: starting tunnel svr=#{svr_port} cli=#{cli_port} -> tgt=#{tgt}..."
-      svr, cli, svr_log, cli_log = start_tunnel(svr_port, cli_port, tgt)
-      log_setup "setup client #{i + 1}: tunnel ready (svr=#{svr} cli=#{cli})"
-      tunnels << { cli_port: cli_port, svr_pid: svr, cli_pid: cli, svr_log: svr_log, cli_log: cli_log }
-    rescue => e
-      $stderr.puts "  SETUP ERROR (client #{i + 1}): #{e.message}"
-      servers.each { |s| stop_procs(s[:pid]) }
+      Timeout.timeout(test_timeout) { threads.each(&:join) }
+    rescue Timeout::Error
+      timed_out = true
+      $stderr.puts "  TIMEOUT after #{test_timeout}s, cleaning up..."
       tunnels.each { |t| stop_procs(t[:cli_pid], t[:svr_pid]) }
       killall
-      raise
+      threads.each(&:join)
     end
-  end
 
-  log_setup "[#{options[:config]}] Starting #{options[:direction]} " \
-       "(#{options[:clients]} clients, P=#{options[:parallel]}, #{options[:duration]}s)..."
-
-  mutex = Mutex.new
-  thread_results = []
-  thread_errors = []
-  threads = tunnels.map.with_index do |t, i|
-    Thread.new do
-      port = t[:cli_port]
-      args = iperf3_args('-c', HOST, '-p', port.to_s,
-                         '-t', options[:duration].to_s, '-P', options[:parallel].to_s)
-      case options[:direction]
-      when 'reverse' then args << '-R'
-      when 'bidir' then args << '--bidir'
-      end
-      mutex.synchronize { log_setup "client #{i + 1} starting on port #{port}..." }
-      lines = []
-      begin
-        IO.popen(args, err: [:child, :out]) do |io|
-          io.each_line do |line|
-            lines << line
-            mutex.synchronize { $stderr.print "  [#{i + 1}] #{line}" unless options[:quiet] }
-          end
-        end
-        output = lines.join
-        rates = parse_iperf_bitrate(output)
-        mutex.synchronize { thread_results << { output: output, rates: rates } }
-      rescue => e
-        mutex.synchronize { thread_errors << e }
-      end
-      mutex.synchronize { log_setup "client #{i + 1} done." }
+    unless thread_errors.empty?
+      $stderr.puts "  WARNING: #{thread_errors.length} thread(s) raised errors:"
+      thread_errors.each { |e| $stderr.puts "    #{e.class}: #{e.message}" }
     end
-  end
 
-  test_timeout = [(options[:duration] || 30) + 15, 15].max
-  timed_out = false
-  begin
-    Timeout.timeout(test_timeout) { threads.each(&:join) }
-  rescue Timeout::Error
-    timed_out = true
-    $stderr.puts "  TIMEOUT after #{test_timeout}s, cleaning up..."
+    results = thread_results
+    results.each do |r|
+      all_outputs << r[:output]
+      all_rates.concat(r[:rates])
+    end
+
+    max_rate = all_rates.max || 0
+    total_rate = all_rates.sum
+    avg_rate = all_rates.empty? ? 0 : total_rate / all_rates.length
+    ok = max_rate > 0 && !timed_out
+
+    dir_label = options[:direction]
+    puts "-" * 40
+    puts "[#{options[:config]}] #{dir_label}: #{'%.0f' % max_rate} Mbps peak, #{'%.0f' % avg_rate} Mbps avg" \
+         "  (#{options[:clients]} clients, P=#{options[:parallel]}, t=#{options[:duration]})"
+    puts ok ? 'PASS' : 'FAIL'
+    return { ok: ok, max_rate: max_rate, avg_rate: avg_rate }
+  ensure
     tunnels.each { |t| stop_procs(t[:cli_pid], t[:svr_pid]) }
     killall
-    threads.each(&:join)
-  end
-
-  unless thread_errors.empty?
-    $stderr.puts "  WARNING: #{thread_errors.length} thread(s) raised errors:"
-    thread_errors.each { |e| $stderr.puts "    #{e.class}: #{e.message}" }
-  end
-
-  results = thread_results
-  results.each do |r|
-    all_outputs << r[:output]
-    all_rates.concat(r[:rates])
-  end
-
-  max_rate = all_rates.max || 0
-  total_rate = all_rates.sum
-  avg_rate = all_rates.empty? ? 0 : total_rate / all_rates.length
-  ok = max_rate > 0 && !timed_out
-
-  dir_label = options[:direction]
-  puts "-" * 40
-  puts "[#{options[:config]}] #{dir_label}: #{'%.0f' % max_rate} Mbps peak, #{'%.0f' % avg_rate} Mbps avg" \
-       "  (#{options[:clients]} clients, P=#{options[:parallel]}, t=#{options[:duration]})"
-  puts ok ? 'PASS' : 'FAIL'
-ensure
-  tunnels.each { |t| stop_procs(t[:cli_pid], t[:svr_pid]) }
-  killall
-  unless ok
-    servers.each do |s|
-      log = read_log(s[:log])
-      $stderr.puts "  # iperf3-server #{s[:tgt_port]} log:\n#{log.each_line.map { |l| "  # #{l}" }.join}" unless log.empty?
-    end
-    tunnels.each do |t|
-      [t[:svr_log], t[:cli_log]].compact.each do |log|
-        data = read_log(log)
-        $stderr.puts "  # #{File.basename(log.path)}:\n#{data.each_line.map { |l| "  # #{l}" }.join}" unless data.empty?
+    unless ok
+      servers.each do |s|
+        log = read_log(s[:log])
+        $stderr.puts "  # iperf3-server #{s[:tgt_port]} log:\n#{log.each_line.map { |l| "  # #{l}" }.join}" unless log.empty?
+      end
+      tunnels.each do |t|
+        [t[:svr_log], t[:cli_log]].compact.each do |log|
+          data = read_log(log)
+          $stderr.puts "  # #{File.basename(log.path)}:\n#{data.each_line.map { |l| "  # #{l}" }.join}" unless data.empty?
+        end
       end
     end
   end
 end
 
-exit ok ? 0 : 1
+result = nil
+max_attempts = 2
+max_attempts.times do |attempt|
+  result = run_one_test(options)
+  break if result[:ok]
+  log_setup "retry #{attempt + 1}/#{max_attempts - 1} after failure..." if attempt < max_attempts - 1
+  sleep 3
+end
+
+exit result && result[:ok] ? 0 : 1

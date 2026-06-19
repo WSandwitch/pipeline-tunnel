@@ -196,8 +196,11 @@ void Client::register_data_connection_reader(size_t idx) {
                     if (type == WIRE_DATA_ACK) {
                         uint16_t ack_seq = (uint16_t)(ptr[pos+1]) | ((uint16_t)(ptr[pos+2]) << 8);
                         auto &dc = data_connections_[idx];
-                        while (!dc.unacked.empty() && dc.unacked.front().seq <= ack_seq)
-                            dc.unacked.pop_front();
+                        {
+                            std::lock_guard<std::mutex> lock(data_mtx_);
+                            while (!dc.unacked.empty() && dc.unacked.front().seq <= ack_seq)
+                                dc.unacked.pop_front();
+                        }
                         off += pos + val;
                         continue;
                     }
@@ -745,6 +748,7 @@ void Client::handle_auth2_challenge(const Packet &pkt) {
         int wret = self->data_connections_[dc_idx].writer.write(fd, frame.data(), frame.size());
         // Buffer for retransmit (discard oldest if at limit)
         {
+            std::lock_guard<std::mutex> lock(self->data_mtx_);
             auto &u = self->data_connections_[dc_idx].unacked;
             if (u.size() >= (size_t)WIRE_MAX_UNACKED)
                 u.pop_front();
@@ -1394,9 +1398,12 @@ void Client::process_pending_io() {
         dc.writer.clear();
         register_data_connection_reader(i);
         // Retransmit all unacked frames
-        for (auto &pf : dc.unacked) {
-            dc.writer.write(new_fd, pf.frame.data(), pf.frame.size());
-            pf.sent_at = std::chrono::steady_clock::now();
+        {
+            std::lock_guard<std::mutex> lock(data_mtx_);
+            for (auto &pf : dc.unacked) {
+                dc.writer.write(new_fd, pf.frame.data(), pf.frame.size());
+                pf.sent_at = std::chrono::steady_clock::now();
+            }
         }
         if (dc.writer.size() > 0)
             register_data_conn_epollout(i, new_fd);
@@ -1408,6 +1415,7 @@ void Client::process_pending_io() {
         auto now = std::chrono::steady_clock::now();
         for (auto &dc : data_connections_) {
             if (dc.fd < 0) continue;
+            std::lock_guard<std::mutex> lock(data_mtx_);
             while (!dc.unacked.empty()) {
                 auto &oldest = dc.unacked.front();
                 if (now - oldest.sent_at > std::chrono::milliseconds(WIRE_RETRANSMIT_MS)) {

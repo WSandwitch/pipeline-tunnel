@@ -333,5 +333,6 @@ int Chain::write_packet_impl(Module *mod, int dst, const uint8_t *data, size_t l
         enqueue_module(mod->near[dst], data, len, g_ctx.src_idx, g_ctx.dir);
         return 0;
     }
-    return _kapi->wire_write(_kapi->ctx, mod->wire_dst, data, len);
+    // dst=0 always means ext side. dst>=1 uses wire_dst (handles sub-chains).
+    return _kapi->wire_write(_kapi->ctx, dst == 0 ? 0 : mod->wire_dst, data, len);
 }
