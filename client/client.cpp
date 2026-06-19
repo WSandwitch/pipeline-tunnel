@@ -238,7 +238,7 @@ void Client::register_data_connection_reader(size_t idx) {
                         // Send ACK (even for duplicates)
                         uint8_t ack[8];
                         size_t apos = 0;
-                        uint64_t aval = 2;
+                        uint64_t aval = 3;
                         while (aval > 0x7F) { ack[apos++] = (uint8_t)((aval & 0x7F) | 0x80); aval >>= 7; }
                         ack[apos++] = (uint8_t)(aval & 0x7F);
                         ack[apos++] = WIRE_DATA_ACK;
