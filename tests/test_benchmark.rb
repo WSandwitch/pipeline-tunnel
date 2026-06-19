@@ -99,6 +99,10 @@ def spawn_verbosely(*args)
   Process.spawn(*args)
 end
 
+def log_setup(msg)
+  $stderr.puts "  #{msg}" unless $options[:quiet]
+end
+
 def killall
   system('killall', '-9', 'ppltunnel-server', 'ppltunnel-client', 'iperf3', %i[out err] => File::NULL)
 end
@@ -149,19 +153,19 @@ def client_thread_args
 end
 
 def start_tunnel(svr_port, cli_port, tgt_port)
-  $stderr.puts "    start_tunnel: spawning server on #{svr_port}..."
+  log_setup "start_tunnel: spawning server on #{svr_port}..."
   svr_log = Tempfile.new(%w[ppltunnel-server- .log])
   svr = spawn_verbosely(SERVER, "-l#{HOST}:#{svr_port}", "-A#{PASS}",
                         "-M#{MPATH}", '-H60',
                         *server_thread_args,
                         out: svr_log, err: [:child, :out])
   alive_check(svr, 'ppltunnel-server', svr_log)
-  $stderr.puts "    start_tunnel: waiting for server port #{svr_port}..."
+  log_setup "start_tunnel: waiting for server port #{svr_port}..."
   wait_port_or_die(svr, svr_port, svr_log)
-  $stderr.puts "    start_tunnel: server ready"
+  log_setup "start_tunnel: server ready"
 
   chain = $options[:config]&.start_with?(';') ? $options[:config] : ";#{$options[:config]}"
-  $stderr.puts "    start_tunnel: spawning client (chain='#{chain}')..."
+  log_setup "start_tunnel: spawning client (chain='#{chain}')..."
   cli_log = Tempfile.new(%w[ppltunnel-client- .log])
   cli = spawn_verbosely(CLIENT, "-L#{HOST}:#{cli_port}:#{HOST}:#{tgt_port}",
                         "-M#{MPATH}", '-H60',
@@ -169,9 +173,9 @@ def start_tunnel(svr_port, cli_port, tgt_port)
                         *client_thread_args,
                         out: cli_log, err: [:child, :out])
   alive_check(cli, 'ppltunnel-client', cli_log)
-  $stderr.puts "    start_tunnel: waiting for client port #{cli_port}..."
+  log_setup "start_tunnel: waiting for client port #{cli_port}..."
   wait_port_or_die(cli, cli_port, cli_log)
-  $stderr.puts "    start_tunnel: client ready"
+  log_setup "start_tunnel: client ready"
 
   [svr, cli, svr_log, cli_log]
 end
@@ -212,21 +216,21 @@ begin
   killall
   options[:clients].times do |i|
     begin
-      $stderr.puts "  setup client #{i + 1}: finding ports..."
+      log_setup "setup client #{i + 1}: finding ports..."
       tgt = find_free_port
       svr_port = find_free_port
       cli_port = find_free_port
 
-      $stderr.puts "  setup client #{i + 1}: starting iperf3 server on #{tgt}..."
+      log_setup "setup client #{i + 1}: starting iperf3 server on #{tgt}..."
       iperf_log = Tempfile.new(%w[iperf3-server- .log])
       iperf_pid = spawn_verbosely('iperf3', '-s', '-D', '-p', tgt.to_s,
                                   out: iperf_log, err: [:child, :out])
       wait_port_listen(tgt)
       servers << { tgt_port: tgt, pid: iperf_pid, log: iperf_log }
 
-      $stderr.puts "  setup client #{i + 1}: starting tunnel svr=#{svr_port} cli=#{cli_port} -> tgt=#{tgt}..."
+      log_setup "setup client #{i + 1}: starting tunnel svr=#{svr_port} cli=#{cli_port} -> tgt=#{tgt}..."
       svr, cli, svr_log, cli_log = start_tunnel(svr_port, cli_port, tgt)
-      $stderr.puts "  setup client #{i + 1}: tunnel ready (svr=#{svr} cli=#{cli})"
+      log_setup "setup client #{i + 1}: tunnel ready (svr=#{svr} cli=#{cli})"
       tunnels << { cli_port: cli_port, svr_pid: svr, cli_pid: cli, svr_log: svr_log, cli_log: cli_log }
     rescue => e
       $stderr.puts "  SETUP ERROR (client #{i + 1}): #{e.message}"
@@ -237,7 +241,7 @@ begin
     end
   end
 
-  $stderr.puts "[#{options[:config]}] Starting #{options[:direction]} " \
+  log_setup "[#{options[:config]}] Starting #{options[:direction]} " \
        "(#{options[:clients]} clients, P=#{options[:parallel]}, #{options[:duration]}s)..."
 
   mutex = Mutex.new
@@ -252,7 +256,7 @@ begin
       when 'reverse' then args << '-R'
       when 'bidir' then args << '--bidir'
       end
-      mutex.synchronize { $stderr.puts "  client #{i + 1} starting on port #{port}..." }
+      mutex.synchronize { log_setup "client #{i + 1} starting on port #{port}..." }
       lines = []
       begin
         IO.popen(args, err: [:child, :out]) do |io|
@@ -267,7 +271,7 @@ begin
       rescue => e
         mutex.synchronize { thread_errors << e }
       end
-      mutex.synchronize { $stderr.puts "  client #{i + 1} done." }
+      mutex.synchronize { log_setup "client #{i + 1} done." }
     end
   end
 
