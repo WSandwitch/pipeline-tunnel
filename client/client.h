@@ -79,8 +79,6 @@ private:
     // External connections from listener
     struct ExternalConn {
         int fd = -1;
-        struct sockaddr_in addr;
-        bool connected = false;
         WriteBuffer writer;
         bool writer_paused = false;        // received MSG_WRITER_PAUSE — remote socket full
         bool local_writer_sent = false;    // sent MSG_WRITER_PAUSE
@@ -124,7 +122,6 @@ private:
         WriteBuffer writer;
         std::vector<uint8_t> read_buf;
         size_t read_offset = 0;
-        bool paused = false;
         // Reliable delivery per data connection
         std::deque<PendingFrame> unacked;
         uint16_t send_seq = 0;
@@ -173,7 +170,6 @@ private:
     void send_writer_resume(uint8_t conn_id);
     void send_chain_pause();
     void send_chain_resume();
-    void resume_paused_dcfds();
 
     void handle_auth1_challenge(const Packet &pkt);
     void handle_auth1_ok(const Packet &pkt);

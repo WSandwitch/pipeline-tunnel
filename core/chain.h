@@ -20,7 +20,6 @@ public:
           ThreadPool *pool, std::shared_ptr<void> owner_guard);
     ~Chain();
 
-    bool valid() const { return true; }
     bool is_drained() const { return _inflight.load() == 0; }
     int get_inflight() const { return _inflight.load(); }
     bool is_backpressure_paused(int dir) const { return _backpressure_paused[dir].load(); }
@@ -58,7 +57,6 @@ public:
 private:
     KernelAPI *_kapi = nullptr;
     std::vector<std::unique_ptr<Module>> _modules;
-    ChainConfig _cfg;
     std::atomic<uint64_t> _inflight_bytes[2]{0, 0};
 
     Module *_entry_ext = nullptr;           // ext-side copy, entry для dir=0

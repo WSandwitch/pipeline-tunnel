@@ -150,11 +150,6 @@ int main(int argc, char *argv[]) {
     cfg_b.valid = true;
     auto chain_b = std::make_shared<Chain>(cfg_b, &kapi_b, &pool, guard_b);
 
-    if (!chain_a->valid() || !chain_b->valid()) {
-        fprintf(stderr, "Chain build failed\n");
-        return 1;
-    }
-
     // Generate random test data (malloc'd — push_packet takes ownership)
     uint8_t *test_data = (uint8_t *)malloc(data_size);
     std::vector<uint8_t> original(data_size);

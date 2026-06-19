@@ -12,8 +12,6 @@
 #include <algorithm>
 #include <fcntl.h>
 #include <openssl/sha.h>
-#include <sys/syscall.h>
-static pid_t my_gettid() { return (pid_t)syscall(SYS_gettid); }
 
 static std::string hex_sha256(const std::string &data) {
     unsigned char hash[SHA256_DIGEST_LENGTH];
@@ -804,7 +802,7 @@ void Client::handle_auth2_challenge(const Packet &pkt) {
     chain_guard_ = std::make_shared<bool>(true);
     chain_ = std::make_unique<Chain>(chain_config_, &chain_kapi_,
                                      &kernel_->pool(), chain_guard_);
-    if (!chain_ || !chain_->valid()) {
+    if (!chain_) {
         log_error("client: chain creation failed or empty");
         state_ = DISCONNECTED;
         Kernel::request_stop();
@@ -1095,16 +1093,6 @@ void Client::send_chain_resume() {
     send_control(pkt);
 }
 
-void Client::resume_paused_dcfds() {
-    for (size_t i = 0; i < data_connections_.size(); i++) {
-        auto &dc = data_connections_[i];
-        if (dc.paused) {
-            dc.paused = false;
-            kernel_->mod_fd_events(dc.fd, EPOLLIN, 0);
-        }
-    }
-}
-
 void Client::deliver_control(uint8_t seq, const Packet &pkt) {
     TRACE("CLI DELIVER seq=%u exp=%u type=%d", seq, exp_control_seq_, (int)pkt.type);
     if (seq == exp_control_seq_) {
@@ -1220,7 +1208,7 @@ void Client::handle_connect_ok(const Packet &pkt) {
     pending_ext_.pop_front();
     int cfd = pc.fd;
 
-    conns_.emplace(conn_id, ExternalConn{cfd, pc.addr, true});
+    conns_.emplace(conn_id, ExternalConn{cfd});
     chain_ref_.in_fd[conn_id] = cfd;
     chain_ref_.in_writer[conn_id] = &conns_[conn_id].writer;
     chain_ref_.in_paused[conn_id] = false;

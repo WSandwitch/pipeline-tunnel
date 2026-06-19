@@ -3,13 +3,10 @@
 #include "common/logger.h"
 #include "common/utils.h"
 #include <deque>
-#include <sys/syscall.h>
-#include <unistd.h>
-static pid_t my_gettid() { return (pid_t)syscall(SYS_gettid); }
 
 Chain::Chain(const ChainConfig &cfg, KernelAPI *kapi,
              ThreadPool *pool, std::shared_ptr<void> owner_guard)
-    : _kapi(kapi), _pool(pool), _owner(owner_guard), _cfg(cfg)
+    : _kapi(kapi), _pool(pool), _owner(owner_guard)
 {
     auto create_one = [&](const ModuleSpec &spec, size_t cidx) -> std::unique_ptr<Module> {
         auto base = ModuleBase::find(spec.name);

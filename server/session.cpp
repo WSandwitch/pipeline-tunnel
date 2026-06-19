@@ -12,8 +12,6 @@
 #include <netdb.h>
 #include <fcntl.h>
 #include <openssl/sha.h>
-#include <sys/syscall.h>
-static pid_t my_gettid() { return (pid_t)syscall(SYS_gettid); }
 
 extern std::unordered_map<uint64_t, std::weak_ptr<Session>> g_session_registry;
 extern std::unordered_map<uint64_t, std::shared_ptr<Session>> g_paused_sessions;
@@ -505,7 +503,7 @@ void Session::handle_chain_create(const Packet &pkt) {
     chain_config_.modules = mods;
     chain_ = std::make_unique<Chain>(chain_config_, &chain_kapi_,
                                      &kernel_->pool(), shared_from_this());
-    if (!chain_ || !chain_->valid()) {
+    if (!chain_) {
         log_error("session %llx: chain creation failed or empty, disconnecting",
                   (unsigned long long)session_id_);
         state_ = DISCONNECTED;

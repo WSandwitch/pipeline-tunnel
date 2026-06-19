@@ -133,10 +133,6 @@ private:
     void handle_reconnect(const Packet &pkt);
     void handle_connect_req(const Packet &pkt);
     void handle_disconnect(const Packet &pkt);
-    void handle_writer_pause(const Packet &pkt);
-    void handle_writer_resume(const Packet &pkt);
-    void handle_chain_pause(const Packet &pkt);
-    void handle_chain_resume(const Packet &pkt);
     void handle_module_list_req(const Packet &pkt);
     void handle_chain_create(const Packet &pkt);
     bool setup_tunnel_target(const std::string &target_addr, uint8_t conn_id);
