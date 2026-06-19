@@ -13,25 +13,14 @@ services:
     image: pppltunnel:latest
     environment:
       MODE: client
-      LISTEN: "127.0.0.1:9999:10.0.0.1:80"
-      CHAIN: "server:34443,changeme;base64"
+      LISTEN: "0.0.0.0:5201:iperf3:5201"
+      CHAIN: "server:34443,changeme;copy"
       THREADS: 4
     ports:
-      - "9999:9999"
+      - "5201:5201"
     depends_on:
       - server
 
-  # Example: iperf3 through tunnel
-  iperf3-server:
+  iperf3:
     image: networkstatic/iperf3
     command: -s -p 5201
-
-  tunnel-client:
-    image: pppltunnel:latest
-    environment:
-      MODE: client
-      LISTEN: "5201:iperf3-server:5201"
-      CHAIN: "server:34443,changeme;copy"
-    depends_on:
-      - server
-      - iperf3-server
