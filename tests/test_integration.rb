@@ -139,6 +139,16 @@ def client_thread_args
   ['-t', n.to_s]
 end
 
+def wait_port_listen(port, timeout = 10)
+  deadline = Process.clock_gettime(Process::CLOCK_MONOTONIC) + timeout
+  while Process.clock_gettime(Process::CLOCK_MONOTONIC) < deadline
+    out = `ss -tln sport = #{port} 2>/dev/null`
+    return if out.include?(":#{port}")
+    sleep 0.05
+  end
+  raise "port #{port} not ready after #{timeout}s"
+end
+
 def start_tunnel(svr_port, cli_port, tgt_port)
   svr_log = Tempfile.new(%w[ppltunnel-server- .log])
   cli_log = Tempfile.new(%w[ppltunnel-client- .log])
