@@ -61,33 +61,33 @@ target_include_directories(base64 PRIVATE
 
 target_compile_definitions(base64 PRIVATE BASE64_STATIC_DEFINE)
 
+target_sources(base64 PRIVATE ${AKLOMP_DIR}/lib/arch/ssse3/codec.c)
 if(BASE64_WITH_SSSE3)
-    target_sources(base64 PRIVATE ${AKLOMP_DIR}/lib/arch/ssse3/codec.c)
     set_source_files_properties(${AKLOMP_DIR}/lib/arch/ssse3/codec.c PROPERTIES
         COMPILE_FLAGS "-mssse3")
 endif()
+target_sources(base64 PRIVATE ${AKLOMP_DIR}/lib/arch/sse41/codec.c)
 if(BASE64_WITH_SSE41)
-    target_sources(base64 PRIVATE ${AKLOMP_DIR}/lib/arch/sse41/codec.c)
     set_source_files_properties(${AKLOMP_DIR}/lib/arch/sse41/codec.c PROPERTIES
         COMPILE_FLAGS "-msse4.1")
 endif()
+target_sources(base64 PRIVATE ${AKLOMP_DIR}/lib/arch/sse42/codec.c)
 if(BASE64_WITH_SSE42)
-    target_sources(base64 PRIVATE ${AKLOMP_DIR}/lib/arch/sse42/codec.c)
     set_source_files_properties(${AKLOMP_DIR}/lib/arch/sse42/codec.c PROPERTIES
         COMPILE_FLAGS "-msse4.2")
 endif()
+target_sources(base64 PRIVATE ${AKLOMP_DIR}/lib/arch/avx/codec.c)
 if(BASE64_WITH_AVX)
-    target_sources(base64 PRIVATE ${AKLOMP_DIR}/lib/arch/avx/codec.c)
     set_source_files_properties(${AKLOMP_DIR}/lib/arch/avx/codec.c PROPERTIES
         COMPILE_FLAGS "-mavx")
 endif()
+target_sources(base64 PRIVATE ${AKLOMP_DIR}/lib/arch/avx2/codec.c)
 if(BASE64_WITH_AVX2)
-    target_sources(base64 PRIVATE ${AKLOMP_DIR}/lib/arch/avx2/codec.c)
     set_source_files_properties(${AKLOMP_DIR}/lib/arch/avx2/codec.c PROPERTIES
         COMPILE_FLAGS "-mavx2")
 endif()
+target_sources(base64 PRIVATE ${AKLOMP_DIR}/lib/arch/avx512/codec.c)
 if(BASE64_WITH_AVX512)
-    target_sources(base64 PRIVATE ${AKLOMP_DIR}/lib/arch/avx512/codec.c)
     set_source_files_properties(${AKLOMP_DIR}/lib/arch/avx512/codec.c PROPERTIES
         COMPILE_FLAGS "-mavx512vl -mavx512vbmi")
 endif()
