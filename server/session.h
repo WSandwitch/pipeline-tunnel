@@ -4,6 +4,7 @@
 #include <cstdint>
 #include <memory>
 #include <vector>
+#include <deque>
 #include <string>
 #include <atomic>
 #include <mutex>
@@ -68,11 +69,20 @@ private:
     ChainConfig chain_config_;
 
     // Data connections for split outputs (index 0 = primary)
+    struct PendingFrame {
+        uint16_t seq;
+        std::vector<uint8_t> frame;
+        std::chrono::steady_clock::time_point sent_at;
+    };
     struct DataConnection {
         int fd = -1;
         WriteBuffer writer;
         std::vector<uint8_t> read_buf;
         size_t read_offset = 0;
+        // Reliable delivery per data connection
+        std::deque<PendingFrame> unacked;
+        uint16_t send_seq = 0;
+        uint16_t recv_seq = 0;
         // Note: DC fds are never gated — gating one connection kills merge
         // which needs chunks from all connections to reassemble packets.
     };

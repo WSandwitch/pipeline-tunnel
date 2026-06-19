@@ -191,7 +191,10 @@ void Chain::enqueue_module(Module *mod, const uint8_t *data, size_t len,
         std::lock_guard<std::mutex> lock(mod->dir_mutex[dir]);
         nogap_mutex_[dir].unlock();
 
+        TRACE("CHAIN WRITE_PACKET_IMPL entering dir=%d src=%d len=%zu mod=%s",
+              dir, src_idx, len, mod->base ? mod->base->name.c_str() : "?");
         int ret = mod->base->process_fn(mod->ctx, dir, src_idx);
+        TRACE("CHAIN WRITE_PACKET_IMPL done dir=%d ret=%d", dir, ret);
 
         _inflight_bytes[dir].fetch_sub(len);
         check_backpressure(dir);

@@ -321,9 +321,11 @@ void Session::handle_auth2_response(const Packet &pkt) {
             }
             int fd = self->data_connections_[dst-1].fd;
             int dc_idx = dst - 1;
+            auto &dc = self->data_connections_[dc_idx];
+            uint16_t seq = dc.send_seq++;
             uint8_t varint_buf[10];
             size_t varint_len = 0;
-            uint64_t total = 1 + len; // type + data (no sub-stream)
+            uint64_t total = 3 + len; // type + seq(2) + data
             while (total > 0x7F) {
                 varint_buf[varint_len++] = (uint8_t)((total & 0x7F) | 0x80);
                 total >>= 7;
@@ -331,11 +333,21 @@ void Session::handle_auth2_response(const Packet &pkt) {
             varint_buf[varint_len++] = (uint8_t)(total & 0x7F);
             // Assemble full frame in one buffer to avoid partial-frame flush
             std::vector<uint8_t> frame;
-            frame.reserve(varint_len + 1 + len);
+            frame.reserve(varint_len + 3 + len);
             frame.insert(frame.end(), varint_buf, varint_buf + varint_len);
             frame.push_back(0); // type=0 (WIRE_DATA)
+            frame.push_back((uint8_t)(seq & 0xFF));        // seq LE low
+            frame.push_back((uint8_t)((seq >> 8) & 0xFF)); // seq LE high
             frame.insert(frame.end(), data, data + len);
             int ret = self->data_connections_[dc_idx].writer.write(fd, frame.data(), frame.size());
+            TRACE("SVR WIREWRITE dst=%d fd=%d len=%zu ret=%d", dst, fd, len, ret);
+            // Buffer for retransmit (discard oldest if at limit)
+            {
+                auto &u = self->data_connections_[dc_idx].unacked;
+                if (u.size() >= (size_t)WIRE_MAX_UNACKED)
+                    u.pop_front();
+                u.push_back({seq, std::move(frame), std::chrono::steady_clock::now()});
+            }
             if (ret > 0) {
                 std::lock_guard<std::mutex> lock(self->data_mtx_);
                 self->pending_io_.push_back([self, dc_idx, fd]() {
@@ -645,34 +657,39 @@ void Session::handle_connect_req(const Packet &pkt) {
 
     // Register target read handler
     int tfd = targets_[conn_id].fd;
+    TRACE("SVR TARGET REG cid=%u fd=%d", conn_id, tfd);
     auto self = shared_from_this();
     kernel_->add_fd_handler(tfd, [this, self, conn_id](int fd, uint32_t events) {
+        TRACE("SVR TARGET EV cid=%u fd=%d events=0x%x", conn_id, fd, events);
         try {
             if (events & EPOLLIN) {
-                {
-                    uint8_t *rbuf = (uint8_t*)malloc(MAX_PACKET_SIZE);
-                    if (!rbuf) return;
-                    ssize_t n = read(fd, rbuf + 1, MAX_PACKET_SIZE - 1);
-                    if (n > 0) {
-                        static int ext_read_cnt = 0;
-                        if (++ext_read_cnt % 100 == 0) TRACE("SVR EXTREAD cid=%u n=%d", conn_id, (int)n);
-                        if (chain_ && state_ == RUNNING) {
-                             rbuf[0] = conn_id;
-                             chain_->push_packet(rbuf, 1 + (size_t)n, 0, 0);
-                         } else {
-                             free(rbuf);
-                         }
-                     } else {
-                         free(rbuf);
-                         if (n == 0) {
-                             handle_target_eof(conn_id);
-                         } else {
-                             if (errno != EAGAIN && errno != EWOULDBLOCK)
-                                 handle_target_eof(conn_id);
-                         }
-                     }
-                 }
-             }
+                uint8_t *rbuf = (uint8_t*)malloc(MAX_PACKET_SIZE);
+                if (!rbuf) return;
+                ssize_t n = read(fd, rbuf + 1, MAX_PACKET_SIZE - 1);
+                TRACE("SVR EXTREAD cid=%u n=%zd errno=%d", conn_id, n, n < 0 ? errno : 0);
+                if (n > 0) {
+                    if (n <= 64) {
+                        char hx[256] = {0};
+                        for (size_t i = 0; i < (size_t)n; i++)
+                            snprintf(hx + i*3, 4, "%02x ", (unsigned char)rbuf[1+i]);
+                        TRACE("SVR EXT HEX: %s", hx);
+                    }
+                    if (chain_ && state_ == RUNNING) {
+                        rbuf[0] = conn_id;
+                        chain_->push_packet(rbuf, 1 + (size_t)n, 0, 0);
+                    } else {
+                        free(rbuf);
+                    }
+                } else {
+                    free(rbuf);
+                    if (n == 0) {
+                        handle_target_eof(conn_id);
+                    } else {
+                        if (errno != EAGAIN && errno != EWOULDBLOCK)
+                            handle_target_eof(conn_id);
+                    }
+                }
+            }
             if (events & (EPOLLERR | EPOLLHUP)) {
                 // Drain remaining data then detect EOF
                 while (true) {
@@ -729,9 +746,16 @@ void Session::add_data_connection(uint8_t output_idx, int fd) {
     }
     // Replace existing fd (handles reconnect)
     if (data_connections_[output_idx].fd >= 0) {
+        // Preserve reliable-delivery state across reconnect
+        auto saved_unacked = std::move(data_connections_[output_idx].unacked);
+        auto saved_send_seq = data_connections_[output_idx].send_seq;
+        auto saved_recv_seq = data_connections_[output_idx].recv_seq;
         kernel_->del_fd(data_connections_[output_idx].fd);
         close(data_connections_[output_idx].fd);
         data_connections_[output_idx] = DataConnection{};
+        data_connections_[output_idx].unacked = std::move(saved_unacked);
+        data_connections_[output_idx].send_seq = saved_send_seq;
+        data_connections_[output_idx].recv_seq = saved_recv_seq;
     }
     data_connections_[output_idx].fd = fd;
     register_data_connection_reader(output_idx);
@@ -928,6 +952,7 @@ void Session::process_wire_buffer(const uint8_t *data, size_t len) {
 }
 
 void Session::dispatch_data_conn_packet(const uint8_t *payload, size_t len, int src_idx) {
+    TRACE("SVR DISPATCH DATA len=%zu src_idx=%d chain=%p state=%d", len, src_idx, (void*)chain_.get(), (int)state_);
     if (len < 1) return;
     if (chain_ && state_ == RUNNING) {
         uint8_t *blob = (uint8_t*)malloc(len);
@@ -1050,7 +1075,18 @@ void Session::register_data_connection_reader(size_t idx) {
                         }
                         continue;
                     }
-                    if (type > WIRE_CONTROL) {
+                    if (type == 0) {
+                        TRACE("SVR WIRE DATA seq=%u len=%d", (unsigned)(ptr[pos+1]|(ptr[pos+2]<<8)), (int)(val-3));
+                    }
+                    if (type == WIRE_DATA_ACK) {
+                        auto &dc = data_connections_[idx];
+                        uint16_t ack_seq = (uint16_t)(ptr[pos+1]) | ((uint16_t)(ptr[pos+2]) << 8);
+                        while (!dc.unacked.empty() && dc.unacked.front().seq <= ack_seq)
+                            dc.unacked.pop_front();
+                        off += pos + val;
+                        continue;
+                    }
+                    if (type > WIRE_DATA_ACK) {
                         char hexbuf[256] = {0};
                         {
                             auto &dc = data_connections_[idx];
@@ -1069,9 +1105,28 @@ void Session::register_data_connection_reader(size_t idx) {
                         break;
                     }
 
-                    // type == 0: data — src_idx = idx+1 (1-based output port)
-                    if (val < 1) { off += pos + val; continue; }
-                    dispatch_data_conn_packet(ptr + pos + 1, val - 1, (int)(idx + 1));
+                    // type == 0: data with 2-byte seq
+                    {
+                        if (val < 3) { off += pos + val; continue; }
+                        auto &dc = data_connections_[idx];
+                        uint16_t seq = (uint16_t)(ptr[pos+1]) | ((uint16_t)(ptr[pos+2]) << 8);
+                        if (seq == dc.recv_seq) {
+                            dc.recv_seq++;
+                            dispatch_data_conn_packet(ptr + pos + 3, val - 3, (int)(idx + 1));
+                        }
+                        // Send ACK (even for duplicates)
+                        uint8_t ack[8];
+                        size_t apos = 0;
+                        uint64_t aval = 2;
+                        while (aval > 0x7F) { ack[apos++] = (uint8_t)((aval & 0x7F) | 0x80); aval >>= 7; }
+                        ack[apos++] = (uint8_t)(aval & 0x7F);
+                        ack[apos++] = WIRE_DATA_ACK;
+                        ack[apos++] = (uint8_t)(seq & 0xFF);
+                        ack[apos++] = (uint8_t)((seq >> 8) & 0xFF);
+                        dc.writer.write_priority(ack, apos);
+                        if (dc.writer.size() > 0 && !dc.writer.registered)
+                            register_data_conn_epollout(idx, dc.fd);
+                    }
                     off += pos + val;
                 }
                 {
@@ -1171,7 +1226,6 @@ bool Session::setup_tunnel_target(const std::string &target_addr, uint8_t conn_i
 
     int flags = fcntl(fd, F_GETFL, 0);
     fcntl(fd, F_SETFL, flags | O_NONBLOCK);
-
     targets_[conn_id] = {fd, target_addr};
     log_info("session %llx: connected to target %s:%s (fd=%d, conn_id=%u)",
              (unsigned long long)session_id_, host.c_str(), port.c_str(), fd, conn_id);
@@ -1558,6 +1612,23 @@ void Session::process_pending_io() {
                 tgt.ext_overflow_paused = false;
                 if (tgt.fd >= 0 && !tgt.writer_paused && !tgt.chain_paused)
                     kernel_->mod_fd_events(tgt.fd, EPOLLIN, 0);
+            }
+        }
+    }
+
+    // Retransmit unacked frames on timeout
+    {
+        auto now = std::chrono::steady_clock::now();
+        for (auto &dc : data_connections_) {
+            if (dc.fd < 0) continue;
+            while (!dc.unacked.empty()) {
+                auto &oldest = dc.unacked.front();
+                if (now - oldest.sent_at > std::chrono::milliseconds(WIRE_RETRANSMIT_MS)) {
+                    dc.writer.write(dc.fd, oldest.frame.data(), oldest.frame.size());
+                    oldest.sent_at = now;
+                } else {
+                    break;
+                }
             }
         }
     }

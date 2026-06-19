@@ -34,8 +34,13 @@ private:
 
 #define log_error(...)   Logger::instance().log(LOG_ERROR, __VA_ARGS__)
 #define log_info(...)    Logger::instance().log(LOG_INFO, __VA_ARGS__)
+#ifdef DEBUG
 #define log_debug(...)   Logger::instance().log(LOG_DEBUG, __VA_ARGS__)
 #define log_trace(...)   Logger::instance().log(LOG_TRACE, __VA_ARGS__)
+#else
+#define log_debug(...)   ((void)0)
+#define log_trace(...)   ((void)0)
+#endif
 #define log_hex_dump(p, d, l) Logger::instance().hex_dump(p, d, l)
 
 #endif

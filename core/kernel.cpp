@@ -1,5 +1,6 @@
 #include "kernel.h"
 #include "common/logger.h"
+#include "common/utils.h"
 #include <sys/epoll.h>
 #include <sys/eventfd.h>
 #include <unistd.h>
@@ -135,6 +136,7 @@ void Kernel::event_loop() {
         for (int i = 0; i < nfds; i++) {
             int fd = (int)events[i].data.u64;
             uint32_t e = events[i].events;
+            { static int ecnt = 0; if (++ecnt % 10 == 0) TRACE("KERNEL EV fd=%d events=0x%x", fd, e); }
 
             // Consume eventfd wakeup
             if (fd == wake_fd_) {

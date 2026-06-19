@@ -3,7 +3,6 @@
 #include "common/logger.h"
 #include "common/utils.h"
 #include <sys/socket.h>
-#include <netinet/in.h>
 #include <arpa/inet.h>
 #include <unistd.h>
 #include <fcntl.h>
@@ -78,7 +77,6 @@ bool Server::start() {
 
             int fl = fcntl(cfd, F_GETFL, 0);
             if (fl >= 0) fcntl(cfd, F_SETFL, fl | O_NONBLOCK);
-            // Let kernel auto-tune socket buffers
 
             // Try to read up to 9 bytes — data connections send 9-byte handshake immediately
             uint8_t header[9];

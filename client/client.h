@@ -114,12 +114,22 @@ private:
     // Data frames that arrived before state_ == RUNNING (buf by secondary connections)
     std::vector<std::pair<std::vector<uint8_t>, int>> pending_data_frames_;
 
+    struct PendingFrame {
+        uint16_t seq;
+        std::vector<uint8_t> frame;
+        std::chrono::steady_clock::time_point sent_at;
+    };
     struct DataConnection {
         int fd = -1;
         WriteBuffer writer;
         std::vector<uint8_t> read_buf;
         size_t read_offset = 0;
         bool paused = false;
+        // Reliable delivery per data connection
+        std::deque<PendingFrame> unacked;
+        uint16_t send_seq = 0;
+        uint16_t recv_seq = 0;
+        bool reconnect_pending = false;  // for idx>=1
     };
     std::vector<DataConnection> data_connections_;
 

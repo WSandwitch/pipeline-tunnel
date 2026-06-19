@@ -26,6 +26,11 @@ enum MessageType : uint8_t {
     MSG_CHAIN_RESUME    = 0x55,
 };
 
+// ACK-based reliable delivery on data connections
+const uint8_t WIRE_DATA_ACK = 6;
+constexpr int WIRE_MAX_UNACKED = 200;
+constexpr int WIRE_RETRANSMIT_MS = 200;
+
 struct Packet {
     MessageType type;
     std::vector<uint8_t> payload;

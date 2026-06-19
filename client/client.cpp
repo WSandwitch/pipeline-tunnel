@@ -74,7 +74,6 @@ bool Client::connect_to_server() {
         return false;
     }
     set_nonblock(tcp_fd_);
-    // Let kernel auto-tune socket buffers
     log_info("client connected to %s:%d", server_host_.c_str(), server_port_);
     return true;
 }
@@ -194,7 +193,15 @@ void Client::register_data_connection_reader(size_t idx) {
                         off += pos + val;
                         continue;
                     }
-                    if (type > WIRE_CONTROL) {
+                    if (type == WIRE_DATA_ACK) {
+                        uint16_t ack_seq = (uint16_t)(ptr[pos+1]) | ((uint16_t)(ptr[pos+2]) << 8);
+                        auto &dc = data_connections_[idx];
+                        while (!dc.unacked.empty() && dc.unacked.front().seq <= ack_seq)
+                            dc.unacked.pop_front();
+                        off += pos + val;
+                        continue;
+                    }
+                    if (type > WIRE_DATA_ACK) {
                         char hexbuf[256] = {0};
                         size_t dump_sz = buf.size() - off;
                         if (dump_sz > 64) dump_sz = 64;
@@ -212,14 +219,34 @@ void Client::register_data_connection_reader(size_t idx) {
                         break;
                     }
 
-                    // type == 0: data — src_idx = idx+1 (1-based output port)
-                    if (val < 1) { off += pos + val; continue; }
-                    try {
-                        dispatch_data_conn_packet(ptr + pos + 1, val - 1, (int)(idx + 1));
-                    } catch (const std::exception &e) {
-                        log_error("client: dispatch exception: %s (val=%zu, buf_sz=%zu)", e.what(), val, buf.size());
-                        buf.clear(); off = 0;
-                        break;
+                    // type == 0: data with 2-byte seq
+                    {
+                        if (val < 3) { off += pos + val; continue; }
+                        auto &dc = data_connections_[idx];
+                        uint16_t seq = (uint16_t)(ptr[pos+1]) | ((uint16_t)(ptr[pos+2]) << 8);
+                        TRACE("CLI DC WIRE DATA val=%zu seq=%u recv_seq=%u", val, seq, dc.recv_seq);
+                        if (seq == dc.recv_seq) {
+                            dc.recv_seq++;
+                            try {
+                                dispatch_data_conn_packet(ptr + pos + 3, val - 3, (int)(idx + 1));
+                            } catch (const std::exception &e) {
+                                log_error("client: dispatch exception: %s (val=%zu, buf_sz=%zu)", e.what(), val, buf.size());
+                                buf.clear(); off = 0;
+                                break;
+                            }
+                        }
+                        // Send ACK (even for duplicates)
+                        uint8_t ack[8];
+                        size_t apos = 0;
+                        uint64_t aval = 2;
+                        while (aval > 0x7F) { ack[apos++] = (uint8_t)((aval & 0x7F) | 0x80); aval >>= 7; }
+                        ack[apos++] = (uint8_t)(aval & 0x7F);
+                        ack[apos++] = WIRE_DATA_ACK;
+                        ack[apos++] = (uint8_t)(seq & 0xFF);
+                        ack[apos++] = (uint8_t)((seq >> 8) & 0xFF);
+                        dc.writer.write_priority(ack, apos);
+                        if (dc.writer.size() > 0 && !dc.writer.registered)
+                            register_data_conn_epollout(idx, dc.fd);
                     }
                     off += pos + val;
                 }
@@ -230,12 +257,23 @@ void Client::register_data_connection_reader(size_t idx) {
             }
         }
         if (events & (EPOLLERR | EPOLLHUP)) {
-            log_debug("client: data connection %zu closed", idx);
+            if (idx == 0) {
+                log_error("client: primary data connection %zu closed, terminating", idx);
+                Kernel::request_stop();
+            } else {
+                log_info("client: secondary data connection %zu closed, reconnecting...", idx);
+                auto &dc = data_connections_[idx];
+                kernel_->del_fd(dc.fd);
+                close(dc.fd);
+                dc.fd = -1;
+                dc.reconnect_pending = true;
+            }
         }
     }, EPOLLIN);
 }
 
 void Client::dispatch_data_conn_packet(const uint8_t *payload, size_t len, int src_idx) {
+    TRACE("CLI DISPATCH DATA len=%zu src_idx=%d state=%d", len, src_idx, (int)state_);
     if (len < 1) return;
     if (state_ < RUNNING) {
         std::vector<uint8_t> buf(payload, payload + len);
@@ -685,10 +723,12 @@ void Client::handle_auth2_challenge(const Packet &pkt) {
         }
         int fd = self->data_connections_[dst-1].fd;
         int dc_idx = dst - 1;
+        auto &dc = self->data_connections_[dc_idx];
+        uint16_t seq = dc.send_seq++;
 
         uint8_t varint_buf[10];
         size_t varint_len = 0;
-        uint64_t total = 1 + len; // type + data (no sub-stream)
+        uint64_t total = 3 + len; // type + seq(2) + data
         while (total > 0x7F) {
             varint_buf[varint_len++] = (uint8_t)((total & 0x7F) | 0x80);
             total >>= 7;
@@ -696,11 +736,20 @@ void Client::handle_auth2_challenge(const Packet &pkt) {
         varint_buf[varint_len++] = (uint8_t)(total & 0x7F);
         // Assemble full frame in one buffer to avoid partial-frame flush
         std::vector<uint8_t> frame;
-        frame.reserve(varint_len + 1 + len);
+        frame.reserve(varint_len + 3 + len);
         frame.insert(frame.end(), varint_buf, varint_buf + varint_len);
         frame.push_back(0); // type=0 (WIRE_DATA)
+        frame.push_back((uint8_t)(seq & 0xFF));        // seq LE low
+        frame.push_back((uint8_t)((seq >> 8) & 0xFF)); // seq LE high
         frame.insert(frame.end(), data, data + len);
         int wret = self->data_connections_[dc_idx].writer.write(fd, frame.data(), frame.size());
+        // Buffer for retransmit (discard oldest if at limit)
+        {
+            auto &u = self->data_connections_[dc_idx].unacked;
+            if (u.size() >= (size_t)WIRE_MAX_UNACKED)
+                u.pop_front();
+            u.push_back({seq, std::move(frame), std::chrono::steady_clock::now()});
+        }
         if (wret > 0) {
             std::lock_guard<std::mutex> lock(self->data_mtx_);
             self->pending_io_.push_back([self, dc_idx]() {
@@ -1173,14 +1222,24 @@ void Client::handle_connect_ok(const Packet &pkt) {
     chain_ref_.in_paused[conn_id] = false;
 
     // EPOLLIN handler for external fd
+    TRACE("CLI EXT REG cid=%u fd=%d chain=%p", conn_id, cfd, (void*)chain_.get());
     kernel_->add_fd_handler(cfd, [this, conn_id](int fd, uint32_t events) {
+        TRACE("CLI EXT EV cid=%u fd=%d events=0x%x", conn_id, fd, events);
         if (events & EPOLLIN) {
             uint8_t *buf = (uint8_t*)malloc(MAX_PACKET_SIZE);
             if (!buf) { log_error("client: OOM in ext handler"); return; }
             ssize_t n = read(fd, buf + 1, MAX_PACKET_SIZE - 1);
+            TRACE("CLI EXT READ cid=%u n=%zd errno=%d", conn_id, n, n < 0 ? errno : 0);
             if (n > 0) {
-                static int ext_read_cnt = 0;
-                if (++ext_read_cnt % 100 == 0) TRACE("CLI EXTREAD cid=%u n=%d", conn_id, (int)n);
+                static int hexdump = 1;
+                if (hexdump) {
+                    hexdump = 0;
+                    char hx[256] = {0};
+                    size_t show = (size_t)n > 64 ? 64 : (size_t)n;
+                    for (size_t i = 0; i < show; i++)
+                        snprintf(hx + i*3, 4, "%02x ", (unsigned char)buf[1+i]);
+                    TRACE("CLI EXT HEX: %s", hx);
+                }
                 buf[0] = conn_id;
                 chain_->push_packet(buf, (size_t)n + 1, 0, 0);
             } else {
@@ -1308,6 +1367,59 @@ void Client::process_pending_io() {
         }
     }
 
+    // Reconnect broken secondary data connections
+    for (size_t i = 1; i < data_connections_.size(); i++) {
+        auto &dc = data_connections_[i];
+        if (!dc.reconnect_pending) continue;
+        dc.reconnect_pending = false;
+        int new_fd = socket(AF_INET, SOCK_STREAM, 0);
+        if (new_fd < 0) { dc.reconnect_pending = true; continue; }
+        struct sockaddr_in addr;
+        memset(&addr, 0, sizeof(addr));
+        addr.sin_family = AF_INET;
+        addr.sin_port = htons(server_port_);
+        inet_pton(AF_INET, server_host_.c_str(), &addr.sin_addr);
+        if (connect(new_fd, (struct sockaddr *)&addr, sizeof(addr)) < 0) {
+            close(new_fd);
+            dc.reconnect_pending = true;
+            continue;
+        }
+        set_nonblock(new_fd);
+        uint8_t handshake[9];
+        memcpy(handshake, &session_id_, 8);
+        handshake[8] = (uint8_t)i;
+        ssize_t nw = write(new_fd, handshake, 9);
+        if (nw != 9) { close(new_fd); dc.reconnect_pending = true; continue; }
+        dc.fd = new_fd;
+        dc.writer.clear();
+        register_data_connection_reader(i);
+        // Retransmit all unacked frames
+        for (auto &pf : dc.unacked) {
+            dc.writer.write(new_fd, pf.frame.data(), pf.frame.size());
+            pf.sent_at = std::chrono::steady_clock::now();
+        }
+        if (dc.writer.size() > 0)
+            register_data_conn_epollout(i, new_fd);
+        log_info("client: secondary connection %zu reconnected (fd=%d, %zu unacked)", i, new_fd, dc.unacked.size());
+    }
+
+    // Retransmit unacked frames on timeout
+    {
+        auto now = std::chrono::steady_clock::now();
+        for (auto &dc : data_connections_) {
+            if (dc.fd < 0) continue;
+            while (!dc.unacked.empty()) {
+                auto &oldest = dc.unacked.front();
+                if (now - oldest.sent_at > std::chrono::milliseconds(WIRE_RETRANSMIT_MS)) {
+                    dc.writer.write(dc.fd, oldest.frame.data(), oldest.frame.size());
+                    oldest.sent_at = now;
+                } else {
+                    break;
+                }
+            }
+        }
+    }
+
     std::vector<std::function<void()>> batch;
     {
         std::lock_guard<std::mutex> lock(data_mtx_);
@@ -1360,13 +1472,17 @@ void Client::process_pending_io() {
         if (should_pause) {
             if (!conn.epollin_removed) {
                 conn.epollin_removed = true;
-                TRACE("CLI GATE PAUSE cid=%u bp0=%d wp=%d cp=%d eop=%d", id, bp0, conn.writer_paused, conn.chain_paused, conn.ext_overflow_paused);
+                TRACE("CLI GATE PAUSE cid=%u bp0=%d wp=%d cp=%d eop=%d epollin_removed=%d",
+                      id, bp0, conn.writer_paused, conn.chain_paused,
+                      conn.ext_overflow_paused, conn.epollin_removed);
                 kernel_->mod_fd_events(conn.fd, 0, EPOLLIN);
             }
         } else {
             if (conn.epollin_removed) {
                 conn.epollin_removed = false;
-                TRACE("CLI GATE RESUME cid=%u bp0=%d wp=%d cp=%d eop=%d", id, bp0, conn.writer_paused, conn.chain_paused, conn.ext_overflow_paused);
+                TRACE("CLI GATE RESUME cid=%u bp0=%d wp=%d cp=%d eop=%d epollin_removed=%d",
+                      id, bp0, conn.writer_paused, conn.chain_paused,
+                      conn.ext_overflow_paused, conn.epollin_removed);
                 kernel_->mod_fd_events(conn.fd, EPOLLIN, 0);
             }
         }
