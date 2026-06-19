@@ -34,7 +34,7 @@ private:
 
 #define log_error(...)   Logger::instance().log(LOG_ERROR, __VA_ARGS__)
 #define log_info(...)    Logger::instance().log(LOG_INFO, __VA_ARGS__)
-#ifdef DEBUG
+#if defined(TRACE_ON)
 #define log_debug(...)   Logger::instance().log(LOG_DEBUG, __VA_ARGS__)
 #define log_trace(...)   Logger::instance().log(LOG_TRACE, __VA_ARGS__)
 #else

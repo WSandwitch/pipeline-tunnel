@@ -4,8 +4,10 @@ project(modtunnel C CXX)
 if(NOT CMAKE_BUILD_TYPE)
     set(CMAKE_BUILD_TYPE Release)
 endif()
-if(CMAKE_BUILD_TYPE STREQUAL "Debug")
-    add_definitions(-DDEBUG)
+
+option(TRACE_ON "Enable TRACE/debug prints (off by default)" OFF)
+if(TRACE_ON)
+    add_definitions(-DTRACE_ON)
 endif()
 
 set(CMAKE_CXX_STANDARD 20)

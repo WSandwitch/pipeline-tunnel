@@ -35,8 +35,8 @@ inline double now_sec() {
     return std::chrono::duration<double>(now).count();
 }
 
-// Debug trace with timestamp — only in DEBUG builds
-#ifdef DEBUG
+// Debug trace with timestamp — only when TRACE_ON is defined
+#if defined(TRACE_ON)
 #define TRACE(fmt, ...) do { \
     fprintf(stderr, "[%.3f " fmt "\n", now_sec(), ##__VA_ARGS__); \
 } while(0)
