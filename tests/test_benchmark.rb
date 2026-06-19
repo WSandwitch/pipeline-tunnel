@@ -15,6 +15,7 @@ require 'optparse'
 require 'socket'
 require 'timeout'
 require 'tempfile'
+require 'fileutils'
 
 HOST = '127.0.0.1'
 PASS = 'testpass'
@@ -31,6 +32,7 @@ options = {
   clients: 1,
   quiet: false,
   verbose: false,
+  save_logs: false,
 }
 
 op = OptionParser.new do |o|
@@ -46,6 +48,7 @@ op = OptionParser.new do |o|
   o.on('-n', '--clients N', Integer, 'Concurrent iperf3 processes') { |v| options[:clients] = v }
   o.on('-q', '--quiet', 'Suppress iperf3 output') { options[:quiet] = true }
   o.on('-v', '--verbose', 'Show output from all spawned processes') { options[:verbose] = true }
+  o.on('--save-logs', 'Always save tunnel logs to /tmp/bidir_diag/') { options[:save_logs] = true }
 end
 def find_bin(dir, name)
   [File.join(dir, name), File.join(dir, 'server', name), File.join(dir, 'client', name)].find { |f| File.exist?(f) }
@@ -314,28 +317,32 @@ def run_one_test(options)
   ensure
     tunnels.each { |t| stop_procs(t[:cli_pid], t[:svr_pid]) }
     killall
-    unless ok
+    if !ok || options[:save_logs]
+      diag_dir = "/tmp/bidir_diag"
+      FileUtils.mkdir_p(diag_dir)
+      ts = Time.now.strftime("%Y%m%d_%H%M%S")
       servers.each do |s|
         log = read_log(s[:log])
-        $stderr.puts "  # iperf3-server #{s[:tgt_port]} log:\n#{log.each_line.map { |l| "  # #{l}" }.join}" unless log.empty?
+        unless log.empty?
+          $stderr.puts "  # iperf3-server #{s[:tgt_port]} log:\n#{log.each_line.map { |l| "  # #{l}" }.join}"
+          File.write(File.join(diag_dir, "#{ts}_iperf3_server_#{s[:tgt_port]}.log"), log)
+        end
       end
       tunnels.each do |t|
         [t[:svr_log], t[:cli_log]].compact.each do |log|
           data = read_log(log)
-          $stderr.puts "  # #{File.basename(log.path)}:\n#{data.each_line.map { |l| "  # #{l}" }.join}" unless data.empty?
+          unless data.empty?
+            base = File.basename(log.path)
+            $stderr.puts "  # #{base}:\n#{data.each_line.map { |l| "  # #{l}" }.join}"
+            File.write(File.join(diag_dir, "#{ts}_#{base}"), data)
+          end
         end
       end
+      $stderr.puts "  # Logs saved to #{diag_dir}/"
     end
   end
 end
 
-result = nil
-max_attempts = 2
-max_attempts.times do |attempt|
-  result = run_one_test(options)
-  break if result[:ok]
-  log_setup "retry #{attempt + 1}/#{max_attempts - 1} after failure..." if attempt < max_attempts - 1
-  sleep 3
-end
+result = run_one_test(options)
 
 exit result && result[:ok] ? 0 : 1

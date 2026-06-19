@@ -30,7 +30,6 @@ struct SplitContext {
     uint32_t exp_pkt = 0;
     uint32_t exp_chunk = 0;
     int trace = 0;
-    int node_id = -1;
     int chunk_size_min = DEF_CHUNK_SIZE;
     int chunk_size_max = DEF_CHUNK_SIZE;
     uint64_t chunks_created = 0;    // split: total chunks output
@@ -72,7 +71,6 @@ static int process_split(SplitContext *ctx, int trigger_idx) {
     }
 
     if (ctx->trace) std::fprintf(stderr, "[SPLIT] dir=0 IN sz=%d trigger=%d pkt=%u chunk=%u outputs=%d\n", sz, trigger_idx, ctx->pkt_seq, ctx->chunk_idx, ctx->num_outputs);
-
     int offset = 0;
     int chunks = 0;
 
@@ -276,7 +274,6 @@ void *init(ModuleChain *api, const char *config) {
     }
 
     ctx->trace = (config && std::strstr(config, "trace") != NULL) ? 1 : 0;
-    ctx->node_id = (api && api->get_node_id) ? api->get_node_id(api->ctx) : -1;
 
     if (ctx->chunk_size_min < ctx->chunk_size_max)
         std::srand((unsigned)(std::time(nullptr) ^ (uintptr_t)ctx));

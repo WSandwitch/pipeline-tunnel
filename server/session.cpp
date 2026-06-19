@@ -662,6 +662,7 @@ void Session::handle_connect_req(const Packet &pkt) {
         TRACE("SVR TARGET EV cid=%u fd=%d events=0x%x", conn_id, fd, events);
         try {
             if (events & EPOLLIN) {
+                if (chain_ && chain_->is_backpressure_paused(0)) return;
                 uint8_t *rbuf = (uint8_t*)malloc(MAX_PACKET_SIZE);
                 if (!rbuf) return;
                 ssize_t n = read(fd, rbuf + 1, MAX_PACKET_SIZE - 1);
@@ -692,6 +693,7 @@ void Session::handle_connect_req(const Packet &pkt) {
             if (events & (EPOLLERR | EPOLLHUP)) {
                 // Drain remaining data then detect EOF
                 while (true) {
+                      if (chain_ && chain_->is_backpressure_paused(0)) break;
                       uint8_t *tmp = (uint8_t*)malloc(MAX_PACKET_SIZE);
                       if (!tmp) return;
                       ssize_t n = read(fd, tmp + 1, MAX_PACKET_SIZE - 1);
@@ -1391,6 +1393,7 @@ void Session::process_pending_reconnect_targets() {
         int tfd = targets_[conn_id].fd;
         kernel_->add_fd_handler(tfd, [this, self, conn_id](int fd, uint32_t events) {
             if (events & EPOLLIN) {
+                if (chain_ && chain_->is_backpressure_paused(0)) return;
                 {
                     uint8_t *rbuf = (uint8_t*)malloc(MAX_PACKET_SIZE);
                     if (!rbuf) return;
@@ -1415,6 +1418,7 @@ void Session::process_pending_reconnect_targets() {
              }
             if (events & (EPOLLERR | EPOLLHUP)) {
                 while (true) {
+                    if (chain_ && chain_->is_backpressure_paused(0)) break;
                     uint8_t *tmp = (uint8_t*)malloc(MAX_PACKET_SIZE);
                     if (!tmp) return;
                     ssize_t n = read(fd, tmp + 1, MAX_PACKET_SIZE - 1);
@@ -1598,6 +1602,7 @@ void Session::process_pending_io() {
         if (dc_size > 1024 * 1024) {
             if (!dc_paused_) {
                 dc_paused_ = true;
+                TRACE("SVR DC PAUSE size=%zu", dc_size);
                 std::lock_guard<std::mutex> lock(targets_mtx_);
                 for (auto &[cid, tgt] : targets_) {
                     (void)cid;
@@ -1608,6 +1613,7 @@ void Session::process_pending_io() {
             }
         } else if (dc_size < 256 * 1024 && dc_paused_) {
             dc_paused_ = false;
+            TRACE("SVR DC RESUME size=%zu", dc_size);
             std::lock_guard<std::mutex> lock(targets_mtx_);
             for (auto &[cid, tgt] : targets_) {
                 (void)cid;

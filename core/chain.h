@@ -50,8 +50,8 @@ public:
 
     void check_module_heartbeats(int system_interval_ms);
 
-    static constexpr uint64_t BACKPRESSURE_HIGH = 1048576; // 1MB
-    static constexpr uint64_t BACKPRESSURE_LOW  = 262144;  // 256KB
+    static constexpr uint64_t BACKPRESSURE_HIGH = 524288; // 512KB
+    static constexpr uint64_t BACKPRESSURE_LOW  = 131072; // 128KB
     static constexpr int MAX_WIRE_CONNECTIONS = 200;
 
 private:

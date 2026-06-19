@@ -1218,6 +1218,7 @@ void Client::handle_connect_ok(const Packet &pkt) {
     kernel_->add_fd_handler(cfd, [this, conn_id](int fd, uint32_t events) {
         TRACE("CLI EXT EV cid=%u fd=%d events=0x%x", conn_id, fd, events);
         if (events & EPOLLIN) {
+            if (chain_ && chain_->is_backpressure_paused(0)) return;
             uint8_t *buf = (uint8_t*)malloc(MAX_PACKET_SIZE);
             if (!buf) { log_error("client: OOM in ext handler"); return; }
             ssize_t n = read(fd, buf + 1, MAX_PACKET_SIZE - 1);
@@ -1233,6 +1234,7 @@ void Client::handle_connect_ok(const Packet &pkt) {
                     TRACE("CLI EXT HEX: %s", hx);
                 }
                 buf[0] = conn_id;
+                TRACE("CLI EXT PUSH cid=%u len=%zu", conn_id, (size_t)n + 1);
                 chain_->push_packet(buf, (size_t)n + 1, 0, 0);
             } else {
                 free(buf);
@@ -1322,8 +1324,8 @@ void Client::check_heartbeat() {
 }
 
 void Client::process_pending_io() {
-    { static int ppi_cnt = 0; ppi_cnt++; if (ppi_cnt % 100 == 0) TRACE("CLI PPI tick %d", ppi_cnt); }
-    { static int stats_cnt = 0; stats_cnt++; if (chain_ && stats_cnt % 10 == 0) {
+    { static int ppi_cnt = 0; ppi_cnt++; TRACE("CLI PPI tick %d", ppi_cnt); }
+    { static int stats_cnt = 0; stats_cnt++;     if (chain_) {
         int infl = chain_ ? chain_->get_inflight() : -1;
         TRACE("CLI STATS: bp0=%d bp1=%d maxdb0=%lu maxdb1=%lu inf=%d dc0=%zu dc1=%zu",
               chain_->is_backpressure_paused(0),
@@ -1341,6 +1343,7 @@ void Client::process_pending_io() {
         if (dc_size > 1024 * 1024) {
             if (!dc_paused_) {
                 dc_paused_ = true;
+                TRACE("CLI DC PAUSE size=%zu", dc_size);
                 for (auto &[id, conn] : conns_) {
                     (void)id;
                     conn.ext_overflow_paused = true;
@@ -1350,6 +1353,7 @@ void Client::process_pending_io() {
             }
         } else if (dc_size < 256 * 1024 && dc_paused_) {
             dc_paused_ = false;
+            TRACE("CLI DC RESUME size=%zu", dc_size);
             for (auto &[id, conn] : conns_) {
                 (void)id;
                 conn.ext_overflow_paused = false;
