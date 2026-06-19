@@ -24,3 +24,10 @@ services:
   iperf3:
     image: networkstatic/iperf3
     command: -s -p 5201
+
+  iperf3-client:
+    image: networkstatic/iperf3
+    command: -c client -p 5201 -t 30
+    depends_on:
+      - client
+      - iperf3
