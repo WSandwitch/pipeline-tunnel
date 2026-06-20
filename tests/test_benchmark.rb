@@ -11,6 +11,8 @@ if KEEP_LOGS
   FileUtils.mkdir_p(SAVE_DIR)
 end
 
+LOGS_DIR=ENV['LOGS_DIR']||"/tmp/modtunnel_logs"
+
 require 'optparse'
 require 'socket'
 require 'timeout'
@@ -48,7 +50,7 @@ op = OptionParser.new do |o|
   o.on('-n', '--clients N', Integer, 'Concurrent iperf3 processes') { |v| options[:clients] = v }
   o.on('-q', '--quiet', 'Suppress iperf3 output') { options[:quiet] = true }
   o.on('-v', '--verbose', 'Show output from all spawned processes') { options[:verbose] = true }
-  o.on('--save-logs', 'Save tunnel logs to /tmp/bidir_diag/') { options[:save_logs] = true }
+  o.on('--save-logs', 'Save tunnel logs to LOGS_DIR, default /tmp/modtunnel_logs') { options[:save_logs] = true }
 end
 def find_bin(dir, name)
   [File.join(dir, name), File.join(dir, 'server', name), File.join(dir, 'client', name)].find { |f| File.exist?(f) }
@@ -318,7 +320,7 @@ def run_one_test(options)
     tunnels.each { |t| stop_procs(t[:cli_pid], t[:svr_pid]) }
     killall
     if !ok && options[:save_logs]
-      diag_dir = "/tmp/bidir_diag"
+      diag_dir = LOGS_DIR
       FileUtils.mkdir_p(diag_dir)
       ts = Time.now.strftime("%Y%m%d_%H%M%S")
       servers.each do |s|

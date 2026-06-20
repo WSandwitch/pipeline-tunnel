@@ -24,7 +24,9 @@ fi
 
 exec docker run --rm \
   --user "$USER_ID:$GROUP_ID" \
+  --name modtunnel-worker \
   -v "$APP_DIR:/app" \
   -v "$BUILD_DIR:/app/build" \
   -v /tmp:/tmp \
+  -e LOGS_DIR \
   "$IMAGE" "$@"
