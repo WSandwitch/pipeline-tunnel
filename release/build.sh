@@ -1,7 +1,8 @@
 #!/bin/sh
 set -e
 
-VERSION=$(cat VERSION)
+cd "$(dirname "$0")"
+VERSION=$(cat ../VERSION)
 BASE=""
 while [ $# -gt 0 ]; do
   case "$1" in
@@ -23,4 +24,4 @@ exec docker buildx build \
   -t "pppltunnel:${VERSION}" \
   -t ppltunnel:latest \
   --load \
-  .
+  ..

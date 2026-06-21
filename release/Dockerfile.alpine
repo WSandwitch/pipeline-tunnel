@@ -17,7 +17,7 @@ RUN apk add --no-cache \
     libcrypto3 \
     libstdc++
 COPY --from=builder /src/out/ /app/
-COPY entrypoint.sh /app/entrypoint.sh
+COPY release/entrypoint.sh /app/entrypoint.sh
 RUN chmod +x /app/entrypoint.sh
 WORKDIR /app
 ENTRYPOINT ["/app/entrypoint.sh"]

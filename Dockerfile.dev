@@ -9,6 +9,7 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     curl \
     python3 \
     gdb \
+    procps \
     ca-certificates \
     net-tools \
     && rm -rf /var/lib/apt/lists/*
