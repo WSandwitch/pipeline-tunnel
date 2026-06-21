@@ -1,16 +1,15 @@
-FROM alpine:3.19
-RUN apk add --no-cache \
-    build-base \
+FROM ubuntu:22.04
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    build-essential \
     cmake \
-    openssl-dev \
-    linux-headers \
-    musl-dev \
-    procps-ng \
-    coreutils \
+    libssl-dev \
     ruby \
     iperf3 \
     iproute2 \
     curl \
     python3 \
-    gdb
+    gdb \
+    ca-certificates \
+    net-tools \
+    && rm -rf /var/lib/apt/lists/*
 WORKDIR /app

@@ -1,0 +1,23 @@
+FROM ubuntu:22.04 AS builder
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    build-essential \
+    cmake \
+    libssl-dev \
+    && rm -rf /var/lib/apt/lists/*
+COPY . /src
+WORKDIR /src
+RUN cmake -B /build -DCMAKE_BUILD_TYPE=Release \
+    && cmake --build /build -j"$(nproc)" \
+    && cmake --build /build --target pack
+
+FROM ubuntu:22.04
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    libssl3 \
+    libstdc++6 \
+    ca-certificates \
+    && rm -rf /var/lib/apt/lists/*
+COPY --from=builder /src/out/ /app/
+COPY entrypoint.sh /app/entrypoint.sh
+RUN chmod +x /app/entrypoint.sh
+WORKDIR /app
+ENTRYPOINT ["/app/entrypoint.sh"]

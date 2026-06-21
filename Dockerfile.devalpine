@@ -1,0 +1,16 @@
+FROM alpine:3.19
+RUN apk add --no-cache \
+    build-base \
+    cmake \
+    openssl-dev \
+    linux-headers \
+    musl-dev \
+    procps-ng \
+    coreutils \
+    ruby \
+    iperf3 \
+    iproute2 \
+    curl \
+    python3 \
+    gdb
+WORKDIR /app
