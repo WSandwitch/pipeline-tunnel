@@ -1,3 +1,4 @@
+# Legacy dev image (musl, ~10% slower than ubuntu)
 FROM alpine:3.19
 RUN apk add --no-cache \
     build-base \

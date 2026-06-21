@@ -1,3 +1,4 @@
+# Legacy release image (smaller size, ~10% slower)
 FROM alpine:3.19 AS builder
 RUN apk add --no-cache \
     build-base \

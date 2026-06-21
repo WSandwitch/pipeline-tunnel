@@ -15,6 +15,7 @@ while [ $# -gt 0 ]; do
 done
 
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
+# Primary: ubuntu (fast, host-compatible). Legacy: alpine (musl, slower).
 [ -z "$BASE" ] && BASE="ubuntu"
 case "$BASE" in
   ubuntu) DOCKERFILE="Dockerfile.dev" ;;

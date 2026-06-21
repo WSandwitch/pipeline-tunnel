@@ -11,11 +11,12 @@ while [ $# -gt 0 ]; do
     *) echo "Usage: $0 [--base alpine|ubuntu]" >&2; exit 1 ;;
   esac
 done
-[ -z "$BASE" ] && BASE="alpine"
+# Primary: ubuntu (fast, host-compatible). Legacy: alpine (musl, smaller).
+[ -z "$BASE" ] && BASE="ubuntu"
 case "$BASE" in
   alpine) DOCKERFILE="Dockerfile.alpine" ;;
   ubuntu) DOCKERFILE="Dockerfile.ubuntu" ;;
-  *) echo "Error: --base must be alpine or ubuntu (default: alpine)" >&2; exit 1 ;;
+  *) echo "Error: --base must be alpine or ubuntu (default: ubuntu)" >&2; exit 1 ;;
 esac
 
 exec docker buildx build \
