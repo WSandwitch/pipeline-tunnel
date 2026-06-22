@@ -38,7 +38,7 @@ inline double now_sec() {
 // Debug trace with timestamp — only when TRACE_ON is defined
 #if defined(TRACE_ON)
 #define TRACE(fmt, ...) do { \
-    fprintf(stderr, "[%.3f " fmt "\n", now_sec(), ##__VA_ARGS__); \
+    fprintf(stderr, "[%.6f " fmt "\n", now_sec(), ##__VA_ARGS__); \
 } while(0)
 #else
 #define TRACE(fmt, ...) ((void)0)

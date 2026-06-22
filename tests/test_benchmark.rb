@@ -4,7 +4,7 @@
 $stdout.sync = true
 $stderr.sync = true
 SAVED_LOGS = []
-KEEP_LOGS = ENV['KEEP_LOGS'] == '1'
+KEEP_LOGS = false#ENV['KEEP_LOGS'] == '1'
 if KEEP_LOGS
   require 'fileutils'
   SAVE_DIR = File.join('/tmp', "saved_logs_#{Time.now.to_i}_#{rand(1000)}")
@@ -89,14 +89,18 @@ def find_free_port(low = 30_000, high = 34_000)
   raise 'no free port found'
 end
 
-def wait_port_listen(port, timeout = 10)
+def wait_port_connect(host, port, timeout = 10)
   deadline = Process.clock_gettime(Process::CLOCK_MONOTONIC) + timeout
-  while Process.clock_gettime(Process::CLOCK_MONOTONIC) < deadline
-    out = `ss -tln sport = #{port} 2>/dev/null`
-    return if out.include?(":#{port}")
-    sleep 0.05
+  loop do
+    begin
+      s = TCPSocket.new(host, port)
+      s.close
+      return
+    rescue Errno::ECONNREFUSED, Errno::ECONNRESET
+      raise "timeout connecting #{host}:#{port}" if Process.clock_gettime(Process::CLOCK_MONOTONIC) > deadline
+      sleep 0.05
+    end
   end
-  raise "port #{port} not ready after #{timeout}s"
 end
 
 def spawn_verbosely(*args)
@@ -232,7 +236,7 @@ def run_one_test(options)
         iperf_log = Tempfile.new(%w[iperf3-server- .log])
         iperf_pid = spawn_verbosely('iperf3', '-s', '-D', '-p', tgt.to_s,
                                     out: iperf_log, err: [:child, :out])
-        wait_port_listen(tgt)
+        wait_port_connect(HOST, tgt)
         servers << { tgt_port: tgt, pid: iperf_pid, log: iperf_log }
 
         log_setup "setup client #{i + 1}: starting tunnel svr=#{svr_port} cli=#{cli_port} -> tgt=#{tgt}..."
@@ -323,11 +327,12 @@ def run_one_test(options)
       diag_dir = LOGS_DIR
       FileUtils.mkdir_p(diag_dir)
       ts = Time.now.strftime("%Y%m%d_%H%M%S")
+      params = "#{options[:config].tr(';|', '_')}_c#{options[:client_threads]}_s#{options[:server_threads]}_#{options[:direction]}"
+      prefix = "#{ts}_#{params}"
       servers.each do |s|
         log = read_log(s[:log])
         unless log.empty?
-          $stderr.puts "  # iperf3-server #{s[:tgt_port]} log:\n#{log.each_line.map { |l| "  # #{l}" }.join}"
-          File.write(File.join(diag_dir, "#{ts}_iperf3_server_#{s[:tgt_port]}.log"), log)
+          File.write(File.join(diag_dir, "#{prefix}_iperf3_server_#{s[:tgt_port]}.log"), log)
         end
       end
       tunnels.each do |t|
@@ -335,12 +340,10 @@ def run_one_test(options)
           data = read_log(log)
           unless data.empty?
             base = File.basename(log.path)
-            $stderr.puts "  # #{base}:\n#{data.each_line.map { |l| "  # #{l}" }.join}"
-            File.write(File.join(diag_dir, "#{ts}_#{base}"), data)
+            File.write(File.join(diag_dir, "#{prefix}_#{base}"), data)
           end
         end
       end
-      $stderr.puts "  # Logs saved to #{diag_dir}/"
     end
   end
 end

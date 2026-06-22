@@ -278,7 +278,24 @@ void Session::handle_auth2_response(const Packet &pkt) {
                     if (tit == self->targets_.end()) {
                         free(const_cast<uint8_t*>(data)); return 0;
                     }
-                    ret = tit->second.writer.write(tit->second.fd, data + 1, len - 1);
+                    uint64_t seq_id = 0;
+                    const uint8_t *payload = data + 1;
+                    size_t payload_len = len - 1;
+                    if (payload_len >= 4) {
+                        seq_id = (uint64_t)payload[0] | ((uint64_t)payload[1] << 8) |
+                                 ((uint64_t)payload[2] << 16) | ((uint64_t)payload[3] << 24);
+                        payload += 4;
+                        payload_len -= 4;
+                    }
+                    ret = tit->second.writer.write(tit->second.fd, payload, payload_len);
+                    TRACE("SVR TARGET WRITE cid=%u fd=%d len=%zu ret=%d eseq=%lu", conn_id, tit->second.fd, payload_len, ret, seq_id);
+                    {
+                        char hx[256] = {0};
+                        size_t show = payload_len > 64 ? 64 : payload_len;
+                        for (size_t i = 0; i < show; i++)
+                            snprintf(hx + i*3, 4, "%02x ", (unsigned)payload[i]);
+                        TRACE("SVR TARGET HEX: %s", hx);
+                    }
                     if (ret > 0) need_epollout = true;
                     if (ret > 0 && !ref->in_paused[conn_id]) {
                         need_pause = true;
@@ -338,7 +355,7 @@ void Session::handle_auth2_response(const Packet &pkt) {
             frame.push_back((uint8_t)((seq >> 8) & 0xFF)); // seq LE high
             frame.insert(frame.end(), data, data + len);
             int ret = self->data_connections_[dc_idx].writer.write(fd, frame.data(), frame.size());
-            TRACE("SVR WIREWRITE dst=%d fd=%d len=%zu ret=%d", dst, fd, len, ret);
+            TRACE("SVR WIREWRITE dst=%d fd=%d len=%zu ret=%d wseq=%u", dst, fd, len, ret, seq);
             // Buffer for retransmit (discard oldest if at limit)
             {
                 std::lock_guard<std::mutex> lock(self->data_mtx_);
@@ -668,9 +685,10 @@ void Session::handle_connect_req(const Packet &pkt) {
                 ssize_t n = read(fd, rbuf + 1, MAX_PACKET_SIZE - 1);
                 TRACE("SVR EXTREAD cid=%u n=%zd errno=%d", conn_id, n, n < 0 ? errno : 0);
                 if (n > 0) {
-                    if (n <= 64) {
+                    {
                         char hx[256] = {0};
-                        for (size_t i = 0; i < (size_t)n; i++)
+                        size_t show = (size_t)n > 64 ? 64 : (size_t)n;
+                        for (size_t i = 0; i < show; i++)
                             snprintf(hx + i*3, 4, "%02x ", (unsigned char)rbuf[1+i]);
                         TRACE("SVR EXT HEX: %s", hx);
                     }
@@ -1066,7 +1084,7 @@ void Session::register_data_connection_reader(size_t idx) {
                         uint8_t recv_seq = ptr[pos + 1];
                         Packet pkt;
                         size_t consumed = proto_.try_parse(ptr + pos + 2, val - 2, pkt);
-                        TRACE("SVR DC RECV CONTROL seq=%u consumed=%zu val=%zu", recv_seq, consumed, val);
+                        TRACE("SVR DC RECV CONTROL wseq=%u consumed=%zu val=%zu", recv_seq, consumed, val);
                         if (consumed > 0) {
                             deliver_control(recv_seq, pkt);
                         }
@@ -1077,7 +1095,16 @@ void Session::register_data_connection_reader(size_t idx) {
                         continue;
                     }
                     if (type == 0) {
-                        TRACE("SVR WIRE DATA seq=%u len=%d", (unsigned)(ptr[pos+1]|(ptr[pos+2]<<8)), (int)(val-3));
+                        TRACE("SVR WIRE DATA wseq=%u len=%d", (unsigned)(ptr[pos+1]|(ptr[pos+2]<<8)), (int)(val-3));
+                        {
+                            size_t payload_len = (size_t)(val - 3);
+                            const uint8_t *payload = ptr + pos + 3;
+                            char hx[256] = {0};
+                            size_t show = payload_len > 64 ? 64 : payload_len;
+                            for (size_t i = 0; i < show; i++)
+                                snprintf(hx + i*3, 4, "%02x ", (unsigned)payload[i]);
+                            TRACE("SVR WIRE HEX: %s", hx);
+                        }
                     }
                     if (type == WIRE_DATA_ACK) {
                         auto &dc = data_connections_[idx];

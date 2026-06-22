@@ -166,8 +166,11 @@ void Chain::enqueue_module(Module *mod, const uint8_t *data, size_t len,
     _inflight_bytes[dir].fetch_add(len);
     check_backpressure(dir);
 
+    TRACE("CHAIN ENQ dir=%d src=%d len=%zu mod=%s", dir, src_idx, len, mod->base ? mod->base->name.c_str() : "?");
+
     _pool->enqueue([this, data, len, src_idx, dir, mod, owner]() {
         nogap_mutex_[dir].lock();
+        TRACE("CHAIN DEQ dir=%d src=%d len=%zu mod=%s", dir, src_idx, len, mod->base ? mod->base->name.c_str() : "?");
 
         if (_cancelled.load()) {
             nogap_mutex_[dir].unlock();

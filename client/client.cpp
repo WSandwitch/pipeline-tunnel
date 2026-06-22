@@ -184,7 +184,7 @@ void Client::register_data_connection_reader(size_t idx) {
                         uint8_t recv_seq = ptr[pos + 1];
                         Packet pkt;
                         size_t consumed = proto_.try_parse(ptr + pos + 2, val - 2, pkt);
-                        TRACE("CLI DC RECV CONTROL seq=%u consumed=%zu val=%zu", recv_seq, consumed, val);
+                        TRACE("CLI DC RECV CONTROL wseq=%u consumed=%zu val=%zu", recv_seq, consumed, val);
                         if (consumed > 0) {
                             deliver_control(recv_seq, pkt);
                         }
@@ -225,7 +225,7 @@ void Client::register_data_connection_reader(size_t idx) {
                         if (val < 3) { off += pos + val; continue; }
                         auto &dc = data_connections_[idx];
                         uint16_t seq = (uint16_t)(ptr[pos+1]) | ((uint16_t)(ptr[pos+2]) << 8);
-                        TRACE("CLI DC WIRE DATA val=%zu seq=%u recv_seq=%u", val, seq, dc.recv_seq);
+                        TRACE("CLI DC WIRE DATA val=%zu wseq=%u rseq=%u", val, seq, dc.recv_seq);
                         if (seq == dc.recv_seq) {
                             dc.recv_seq++;
                             try {
@@ -683,6 +683,7 @@ void Client::handle_auth2_challenge(const Packet &pkt) {
                 }
                 ext_fd = it->second.fd;
                 ret = it->second.writer.write(ext_fd, data + 1, len - 1);
+                TRACE("CLI EXT WRITE cid=%u fd=%d len=%zu ret=%d", conn_id, ext_fd, len - 1, ret);
             }
             if (ret >= 0) {
                 std::lock_guard<std::mutex> lock(self->data_mtx_);
@@ -726,6 +727,7 @@ void Client::handle_auth2_challenge(const Packet &pkt) {
         int dc_idx = dst - 1;
         auto &dc = self->data_connections_[dc_idx];
         uint16_t seq = dc.send_seq++;
+        TRACE("CLI DC WRAW RITE dst=%d len=%zu wseq=%u", dst, len, seq);
 
         uint8_t varint_buf[10];
         size_t varint_len = 0;
@@ -1221,21 +1223,26 @@ void Client::handle_connect_ok(const Packet &pkt) {
             if (chain_ && chain_->is_backpressure_paused(0)) return;
             uint8_t *buf = (uint8_t*)malloc(MAX_PACKET_SIZE);
             if (!buf) { log_error("client: OOM in ext handler"); return; }
-            ssize_t n = read(fd, buf + 1, MAX_PACKET_SIZE - 1);
+            ssize_t n = read(fd, buf + 5, MAX_PACKET_SIZE - 5);
             TRACE("CLI EXT READ cid=%u n=%zd errno=%d", conn_id, n, n < 0 ? errno : 0);
             if (n > 0) {
-                static int hexdump = 1;
-                if (hexdump) {
-                    hexdump = 0;
+                {
                     char hx[256] = {0};
                     size_t show = (size_t)n > 64 ? 64 : (size_t)n;
                     for (size_t i = 0; i < show; i++)
-                        snprintf(hx + i*3, 4, "%02x ", (unsigned char)buf[1+i]);
+                        snprintf(hx + i*3, 4, "%02x ", (unsigned char)buf[5+i]);
                     TRACE("CLI EXT HEX: %s", hx);
                 }
+                static std::atomic<uint64_t> ext_seq{0};
+                uint64_t seq_id = ext_seq++;
                 buf[0] = conn_id;
-                TRACE("CLI EXT PUSH cid=%u len=%zu", conn_id, (size_t)n + 1);
-                chain_->push_packet(buf, (size_t)n + 1, 0, 0);
+                buf[1] = (uint8_t)(seq_id & 0xFF);
+                buf[2] = (uint8_t)((seq_id >> 8) & 0xFF);
+                buf[3] = (uint8_t)((seq_id >> 16) & 0xFF);
+                buf[4] = (uint8_t)((seq_id >> 24) & 0xFF);
+                TRACE("CLI EXT SEQ cid=%u eseq=%lu rlen=%zd", conn_id, seq_id, n);
+                TRACE("CLI EXT PUSH cid=%u len=%zu eseq=%lu", conn_id, (size_t)n + 5, seq_id);
+                chain_->push_packet(buf, (size_t)n + 5, 0, 0);
             } else {
                 free(buf);
             }
