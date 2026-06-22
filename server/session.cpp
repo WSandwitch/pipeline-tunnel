@@ -278,17 +278,10 @@ void Session::handle_auth2_response(const Packet &pkt) {
                     if (tit == self->targets_.end()) {
                         free(const_cast<uint8_t*>(data)); return 0;
                     }
-                    uint64_t seq_id = 0;
                     const uint8_t *payload = data + 1;
                     size_t payload_len = len - 1;
-                    if (payload_len >= 4) {
-                        seq_id = (uint64_t)payload[0] | ((uint64_t)payload[1] << 8) |
-                                 ((uint64_t)payload[2] << 16) | ((uint64_t)payload[3] << 24);
-                        payload += 4;
-                        payload_len -= 4;
-                    }
                     ret = tit->second.writer.write(tit->second.fd, payload, payload_len);
-                    TRACE("SVR TARGET WRITE cid=%u fd=%d len=%zu ret=%d eseq=%lu", conn_id, tit->second.fd, payload_len, ret, seq_id);
+                    TRACE("SVR TARGET WRITE cid=%u fd=%d len=%zu ret=%d", conn_id, tit->second.fd, payload_len, ret);
                     {
                         char hx[256] = {0};
                         size_t show = payload_len > 64 ? 64 : payload_len;

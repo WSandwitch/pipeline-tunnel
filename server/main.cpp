@@ -1,5 +1,6 @@
 #include "server.h"
 #include "core/module_base.h"
+#include "core/modules/modules.h"
 #include "common/logger.h"
 #include "common/utils.h"
 #include <cstring>
@@ -43,6 +44,7 @@ static void print_usage(const char *prog) {
 int main(int argc, char *argv[]) {
     signal(SIGPIPE, SIG_IGN);
     setvbuf(stderr, NULL, _IONBF, 0);
+    register_builtin_modules();
     std::string listen_addr = "0.0.0.0";
     uint16_t listen_port = 0;
     std::string password;
@@ -131,11 +133,8 @@ int main(int argc, char *argv[]) {
     }
 
     if (!module_help_name.empty()) {
-        if (mod_dir.empty()) {
-            fprintf(stderr, "Use -M <modpath> to specify module directory\n");
-            return 1;
-        }
-        ModuleBase::load(mod_dir);
+        if (!mod_dir.empty())
+            ModuleBase::load(mod_dir);
         auto *base = ModuleBase::find(module_help_name);
         if (base) {
             fprintf(stderr, "Module: %s\n", base->name.c_str());
@@ -152,14 +151,13 @@ int main(int argc, char *argv[]) {
     }
 
     if (show_module_list) {
-        if (mod_dir.empty()) {
-            fprintf(stderr, "Use -M <modpath> to specify module directory\n");
-            return 1;
+        if (!mod_dir.empty())
+            ModuleBase::load(mod_dir);
+        fprintf(stderr, "Available modules:\n");
+        for (auto &kv : ModuleBase::bases) {
+            const char *tag = (kv.second.handle == nullptr) ? " (built-in)" : "";
+            fprintf(stderr, "  %-20s %s%s\n", kv.first.c_str(), kv.second.desc_fn(), tag);
         }
-        ModuleBase::load(mod_dir);
-        fprintf(stderr, "Modules in %s:\n", mod_dir.c_str());
-        for (auto &kv : ModuleBase::bases)
-            fprintf(stderr, "  %-20s %s\n", kv.first.c_str(), kv.second.desc_fn());
         return 0;
     }
 

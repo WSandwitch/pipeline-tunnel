@@ -21,6 +21,7 @@ struct ModuleBase {
     static std::unordered_map<std::string, ModuleBase> bases;
     static void load(const std::string &directory);
     static const ModuleBase *find(const std::string &name);
+    static void register_builtin(const ModuleBase &base);
 };
 
 #endif

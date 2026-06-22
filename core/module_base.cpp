@@ -41,6 +41,12 @@ void ModuleBase::load(const std::string &directory) {
 
         std::string mod_name = name_fn();
         if (bases.count(mod_name)) {
+            if (bases[mod_name].handle == nullptr) {
+                log_info("module '%s' is built-in, skipping external %s",
+                         mod_name.c_str(), p.c_str());
+                dlclose(handle);
+                continue;
+            }
             log_error("duplicate module name '%s' (%s conflicts with %s)",
                       mod_name.c_str(), p.c_str(), bases[mod_name].name.c_str());
             dlclose(handle);
@@ -72,4 +78,16 @@ const ModuleBase *ModuleBase::find(const std::string &name) {
     auto it = bases.find(name);
     if (it == bases.end()) return nullptr;
     return &it->second;
+}
+
+void ModuleBase::register_builtin(const ModuleBase &base) {
+    if (bases.count(base.name)) {
+        if (bases[base.name].handle == nullptr)
+            return; // already registered
+        log_error("cannot register builtin module '%s' — name conflicts with loaded .so",
+                  base.name.c_str());
+        std::exit(1);
+    }
+    bases[base.name] = base;
+    log_info("registered builtin module: %s v%s", base.name.c_str(), base.version.c_str());
 }

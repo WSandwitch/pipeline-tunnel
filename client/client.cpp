@@ -1223,26 +1223,18 @@ void Client::handle_connect_ok(const Packet &pkt) {
             if (chain_ && chain_->is_backpressure_paused(0)) return;
             uint8_t *buf = (uint8_t*)malloc(MAX_PACKET_SIZE);
             if (!buf) { log_error("client: OOM in ext handler"); return; }
-            ssize_t n = read(fd, buf + 5, MAX_PACKET_SIZE - 5);
+            ssize_t n = read(fd, buf + 1, MAX_PACKET_SIZE - 1);
             TRACE("CLI EXT READ cid=%u n=%zd errno=%d", conn_id, n, n < 0 ? errno : 0);
             if (n > 0) {
                 {
                     char hx[256] = {0};
                     size_t show = (size_t)n > 64 ? 64 : (size_t)n;
                     for (size_t i = 0; i < show; i++)
-                        snprintf(hx + i*3, 4, "%02x ", (unsigned char)buf[5+i]);
+                        snprintf(hx + i*3, 4, "%02x ", (unsigned char)buf[1+i]);
                     TRACE("CLI EXT HEX: %s", hx);
                 }
-                static std::atomic<uint64_t> ext_seq{0};
-                uint64_t seq_id = ext_seq++;
                 buf[0] = conn_id;
-                buf[1] = (uint8_t)(seq_id & 0xFF);
-                buf[2] = (uint8_t)((seq_id >> 8) & 0xFF);
-                buf[3] = (uint8_t)((seq_id >> 16) & 0xFF);
-                buf[4] = (uint8_t)((seq_id >> 24) & 0xFF);
-                TRACE("CLI EXT SEQ cid=%u eseq=%lu rlen=%zd", conn_id, seq_id, n);
-                TRACE("CLI EXT PUSH cid=%u len=%zu eseq=%lu", conn_id, (size_t)n + 5, seq_id);
-                chain_->push_packet(buf, (size_t)n + 5, 0, 0);
+                chain_->push_packet(buf, (size_t)n + 1, 0, 0);
             } else {
                 free(buf);
             }
