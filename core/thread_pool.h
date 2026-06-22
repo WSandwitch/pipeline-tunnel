@@ -8,11 +8,15 @@
 #include <functional>
 #include <atomic>
 #include <vector>
+#include <cstddef>
+#include <cstdint>
 
 struct WorkTask {
     std::function<void()> fn;
+    int task_dir = -1;
+    size_t task_len = 0;
+    const char *task_mod = nullptr;
     WorkTask() = default;
-    template<typename F> WorkTask(F &&f) : fn(std::forward<F>(f)) {}
 };
 
 class ThreadPool {
@@ -23,14 +27,7 @@ public:
     void start(size_t count);
     void stop();
 
-    template<typename F>
-    void enqueue(F &&f) {
-        {
-            std::lock_guard<std::mutex> lock(mtx_);
-            queue_.push_back(WorkTask(std::forward<F>(f)));
-        }
-        cv_.notify_one();
-    }
+    void enqueue(WorkTask &&task);
 
     size_t pending() const;
 

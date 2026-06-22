@@ -1,5 +1,8 @@
 #include "thread_pool.h"
+#include "common/utils.h"
 #include <cassert>
+#include <cstdio>
+#include <unistd.h>
 
 ThreadPool::~ThreadPool() {
     stop();
@@ -28,6 +31,20 @@ size_t ThreadPool::pending() const {
     return queue_.size();
 }
 
+void ThreadPool::enqueue(WorkTask &&task) {
+    {
+        std::lock_guard<std::mutex> lock(mtx_);
+        queue_.push_back(std::move(task));
+        WorkTask &t = queue_.back();
+        char buf[256];
+        int n = snprintf(buf, sizeof(buf), "[%.6f ENQ POOL dir=%d len=%zu mod=%s]\n",
+                         now_sec(), t.task_dir, t.task_len,
+                         t.task_mod ? t.task_mod : "?");
+        write(STDERR_FILENO, buf, (size_t)n);
+    }
+    cv_.notify_one();
+}
+
 void ThreadPool::worker_loop() {
     while (!shutdown_.load()) {
         WorkTask task;
@@ -39,6 +56,11 @@ void ThreadPool::worker_loop() {
             if (shutdown_.load()) return;
             task = std::move(queue_.front());
             queue_.pop_front();
+            char buf[256];
+            int n = snprintf(buf, sizeof(buf), "[%.6f DEQ POOL dir=%d len=%zu mod=%s]\n",
+                             now_sec(), task.task_dir, task.task_len,
+                             task.task_mod ? task.task_mod : "?");
+            write(STDERR_FILENO, buf, (size_t)n);
         }
         if (task.fn) {
             try { task.fn(); } catch (...) {}
