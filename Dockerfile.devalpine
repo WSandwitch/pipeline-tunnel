@@ -16,7 +16,11 @@ RUN apk add --no-cache \
     gdb \
     zstd-libs \
     snappy \
-    zlib
+    zlib \
+    lz4-libs \
+    brotli-libs \
+    lzo \
+    xz
 
 COPY zig-*.tar.xz /tmp/
 RUN set -eux; \

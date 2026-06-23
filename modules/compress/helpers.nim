@@ -50,7 +50,7 @@ proc atoi_c*(s: cstring): cint {.importc: "atoi", cdecl.}
 
 type
   Algo* {.pure.} = enum
-    Rle, Zstd, Snappy, Gzip
+    Rle, Zstd, Snappy, Gzip, Lz4, Brotli, Lzo, Lzma
 
   CompressCtx* = object
     api*: ptr ModuleChain
@@ -75,6 +75,18 @@ type
     inflateInit2*: proc(strm: pointer, windowBits: cint, zv: cstring, streamSize: cint): cint {.cdecl.}
     inflate*: proc(strm: pointer, flush: cint): cint {.cdecl.}
     inflateEnd*: proc(strm: pointer): cint {.cdecl.}
+    lz4CompressDefault*: proc(src: pointer, dst: pointer, srcSize: cint, dstCapacity: cint): cint {.cdecl.}
+    lz4DecompressSafe*: proc(src: pointer, dst: pointer, compressedSize: cint, dstCapacity: cint): cint {.cdecl.}
+    lz4CompressBound*: proc(inputSize: cint): cint {.cdecl.}
+    brotliEncoderCompress*: proc(quality: cint, lgwin: cint, mode: cint, inputSize: csize_t, inputBuffer: pointer, encodedSize: ptr csize_t, encodedBuffer: pointer): cint {.cdecl.}
+    brotliDecoderDecompress*: proc(encodedSize: csize_t, encodedBuffer: pointer, decodedSize: ptr csize_t, decodedBuffer: pointer): cint {.cdecl.}
+    brotliEncoderMaxCompressedSize*: proc(inputSize: csize_t): csize_t {.cdecl.}
+    lzo1x1Compress*: proc(src: pointer, srcLen: csize_t, dst: pointer, dstLen: ptr csize_t, wrkmem: pointer): cint {.cdecl.}
+    lzo1xDecompress*: proc(src: pointer, srcLen: csize_t, dst: pointer, dstLen: ptr csize_t, wrkmem: pointer): cint {.cdecl.}
+    lzoInitV2*: proc(v: cuint, s1: cint, s2: cint, s3: cint, s4: cint, s5: cint, s6: cint, s7: cint, s8: cint, s9: cint): cint {.cdecl.}
+    lzoWrkmem*: pointer
+    lzmaEasyBufferEncode*: proc(level: cuint, check: cuint, allocator: pointer, src: pointer, srcLen: csize_t, dst: pointer, dstPos: ptr csize_t, dstSize: csize_t): cint {.cdecl.}
+    lzmaStreamBufferDecode*: proc(memlimit: ptr uint64, flags: cuint, allocator: pointer, src: pointer, srcPos: ptr csize_t, srcSize: csize_t, dst: pointer, dstPos: ptr csize_t, dstSize: csize_t): cint {.cdecl.}
 
   z_stream* = object
     next_in*: ptr byte
@@ -157,6 +169,68 @@ proc loadGzip*(ctx: ptr CompressCtx): cint =
     return -1
   return 0
 
+proc loadLz4*(ctx: ptr CompressCtx): cint =
+  let h = dlopen("liblz4.so.1", RTLD_NOW)
+  if h == nil:
+    return -1
+  ctx.dl_handle = h
+  ctx.lz4CompressDefault = cast[typeof(ctx.lz4CompressDefault)](dlsym(h, "LZ4_compress_default"))
+  ctx.lz4DecompressSafe = cast[typeof(ctx.lz4DecompressSafe)](dlsym(h, "LZ4_decompress_safe"))
+  ctx.lz4CompressBound = cast[typeof(ctx.lz4CompressBound)](dlsym(h, "LZ4_compressBound"))
+  if ctx.lz4CompressDefault == nil or ctx.lz4DecompressSafe == nil:
+    discard dlclose(h)
+    ctx.dl_handle = nil
+    return -1
+  return 0
+
+proc loadBrotli*(ctx: ptr CompressCtx): cint =
+  let hEnc = dlopen("libbrotlienc.so.1", RTLD_NOW)
+  if hEnc == nil:
+    return -1
+  let hDec = dlopen("libbrotlidec.so.1", RTLD_NOW)
+  if hDec == nil:
+    discard dlclose(hEnc)
+    return -1
+  ctx.dl_handle = hEnc
+  ctx.brotliEncoderCompress = cast[typeof(ctx.brotliEncoderCompress)](dlsym(hEnc, "BrotliEncoderCompress"))
+  ctx.brotliEncoderMaxCompressedSize = cast[typeof(ctx.brotliEncoderMaxCompressedSize)](dlsym(hEnc, "BrotliEncoderMaxCompressedSize"))
+  ctx.brotliDecoderDecompress = cast[typeof(ctx.brotliDecoderDecompress)](dlsym(hDec, "BrotliDecoderDecompress"))
+  if ctx.brotliEncoderCompress == nil or ctx.brotliDecoderDecompress == nil:
+    discard dlclose(hDec)
+    discard dlclose(hEnc)
+    ctx.dl_handle = nil
+    return -1
+  return 0
+
+proc loadLzo*(ctx: ptr CompressCtx): cint =
+  let h = dlopen("liblzo2.so.2", RTLD_NOW)
+  if h == nil:
+    return -1
+  ctx.dl_handle = h
+  ctx.lzo1x1Compress = cast[typeof(ctx.lzo1x1Compress)](dlsym(h, "lzo1x_1_compress"))
+  ctx.lzo1xDecompress = cast[typeof(ctx.lzo1xDecompress)](dlsym(h, "lzo1x_decompress"))
+  ctx.lzoInitV2 = cast[typeof(ctx.lzoInitV2)](dlsym(h, "__lzo_init_v2"))
+  if ctx.lzo1x1Compress == nil or ctx.lzo1xDecompress == nil:
+    discard dlclose(h)
+    ctx.dl_handle = nil
+    return -1
+  if ctx.lzoInitV2 != nil:
+    discard ctx.lzoInitV2(1, -1, -1, -1, -1, -1, -1, -1, -1, -1)
+  return 0
+
+proc loadLzma*(ctx: ptr CompressCtx): cint =
+  let h = dlopen("liblzma.so.5", RTLD_NOW)
+  if h == nil:
+    return -1
+  ctx.dl_handle = h
+  ctx.lzmaEasyBufferEncode = cast[typeof(ctx.lzmaEasyBufferEncode)](dlsym(h, "lzma_easy_buffer_encode"))
+  ctx.lzmaStreamBufferDecode = cast[typeof(ctx.lzmaStreamBufferDecode)](dlsym(h, "lzma_stream_buffer_decode"))
+  if ctx.lzmaEasyBufferEncode == nil or ctx.lzmaStreamBufferDecode == nil:
+    discard dlclose(h)
+    ctx.dl_handle = nil
+    return -1
+  return 0
+
 proc parseConfig*(config: cstring, algo: ptr Algo, level: ptr cint, trace: ptr bool) =
   if config == nil or config[0] == '\0':
     algo[] = Algo.Rle
@@ -177,6 +251,14 @@ proc parseConfig*(config: cstring, algo: ptr Algo, level: ptr cint, trace: ptr b
     algo[] = Algo.Snappy
   elif strNcmp(algStart, "gzip", 4) == 0 and algLen == 4:
     algo[] = Algo.Gzip
+  elif strNcmp(algStart, "lz4", 3) == 0 and algLen == 3:
+    algo[] = Algo.Lz4
+  elif strNcmp(algStart, "brotli", 6) == 0 and algLen == 6:
+    algo[] = Algo.Brotli
+  elif strNcmp(algStart, "lzo", 3) == 0 and algLen == 3:
+    algo[] = Algo.Lzo
+  elif strNcmp(algStart, "lzma", 4) == 0 and algLen == 4:
+    algo[] = Algo.Lzma
   else:
     algo[] = Algo.Rle
   if c[0] == ':':

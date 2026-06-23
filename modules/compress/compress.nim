@@ -30,13 +30,45 @@ proc init(api: ptr ModuleChain, config: cstring): pointer {.exportc, cdecl, dynl
         fprintf(stderr, "[compress node=%d] gzip not available\n", ctx.node_id)
       c_free(ctx)
       return nil
+  elif ctx.algo == Algo.Lz4:
+    if loadLz4(ctx) != 0:
+      if ctx.trace:
+        fprintf(stderr, "[compress node=%d] lz4 not available\n", ctx.node_id)
+      c_free(ctx)
+      return nil
+  elif ctx.algo == Algo.Brotli:
+    if loadBrotli(ctx) != 0:
+      if ctx.trace:
+        fprintf(stderr, "[compress node=%d] brotli not available\n", ctx.node_id)
+      c_free(ctx)
+      return nil
+  elif ctx.algo == Algo.Lzo:
+    if loadLzo(ctx) != 0:
+      if ctx.trace:
+        fprintf(stderr, "[compress node=%d] lzo not available\n", ctx.node_id)
+      c_free(ctx)
+      return nil
+    ctx.lzoWrkmem = c_malloc(65536)
+    if ctx.lzoWrkmem == nil:
+      c_free(ctx)
+      return nil
+  elif ctx.algo == Algo.Lzma:
+    if loadLzma(ctx) != 0:
+      if ctx.trace:
+        fprintf(stderr, "[compress node=%d] lzma not available\n", ctx.node_id)
+      c_free(ctx)
+      return nil
   if ctx.trace:
     fprintf(stderr, "[compress node=%d init] %s:%d\n", ctx.node_id,
       cast[cstring](case ctx.algo
         of Algo.Zstd: "zstd"
         of Algo.Snappy: "snappy"
         of Algo.Gzip: "gzip"
-        of Algo.Rle: "rle"), ctx.level)
+        of Algo.Rle: "rle"
+        of Algo.Lz4: "lz4"
+        of Algo.Brotli: "brotli"
+        of Algo.Lzo: "lzo"
+        of Algo.Lzma: "lzma"), ctx.level)
   return ctx
 
 proc process(ctxPtr: pointer, dir: cint, triggerIdx: cint): cint {.exportc, cdecl, dynlib.} =
@@ -105,6 +137,47 @@ proc process(ctxPtr: pointer, dir: cint, triggerIdx: cint): cint {.exportc, cdec
         traceWrite(ctx[], "[compress node=%d] rle compress failed\n", ctx.node_id)
         return -1
       outLen = rleLen
+    of Algo.Lz4:
+      maxOut = ctx.lz4CompressBound(srcLen.cint).csize_t
+      outBuf = c_malloc(maxOut)
+      if outBuf == nil: return -1
+      let lz4Ret = ctx.lz4CompressDefault(pkt, outBuf, srcLen.cint, maxOut.cint)
+      if lz4Ret <= 0:
+        c_free(outBuf)
+        traceWrite(ctx[], "[compress node=%d] lz4 compress failed ret=%d\n", ctx.node_id, lz4Ret)
+        return -1
+      outLen = lz4Ret.csize_t
+    of Algo.Brotli:
+      maxOut = ctx.brotliEncoderMaxCompressedSize(srcLen)
+      outBuf = c_malloc(maxOut)
+      if outBuf == nil: return -1
+      var encLen = maxOut
+      if ctx.brotliEncoderCompress(ctx.level, 22, 0, srcLen, pkt, addr encLen, outBuf) == 0:
+        c_free(outBuf)
+        traceWrite(ctx[], "[compress node=%d] brotli compress failed\n", ctx.node_id)
+        return -1
+      outLen = encLen
+    of Algo.Lzo:
+      maxOut = srcLen + srcLen div 16 + 64 + 3
+      outBuf = c_malloc(maxOut)
+      if outBuf == nil: return -1
+      var lzoLen = maxOut
+      if ctx.lzo1x1Compress(pkt, srcLen, outBuf, addr lzoLen, ctx.lzoWrkmem) != 0:
+        c_free(outBuf)
+        traceWrite(ctx[], "[compress node=%d] lzo compress failed\n", ctx.node_id)
+        return -1
+      outLen = lzoLen
+    of Algo.Lzma:
+      maxOut = srcLen + srcLen + 65536
+      outBuf = c_malloc(maxOut)
+      if outBuf == nil: return -1
+      var outPos: csize_t = 0
+      let lzmaRet = ctx.lzmaEasyBufferEncode(ctx.level.cuint, 4, nil, pkt, srcLen, outBuf, addr outPos, maxOut)
+      if lzmaRet != 0:
+        c_free(outBuf)
+        traceWrite(ctx[], "[compress node=%d] lzma compress failed ret=%d\n", ctx.node_id, lzmaRet)
+        return -1
+      outLen = outPos
   else:
     case ctx.algo
     of Algo.Zstd:
@@ -193,6 +266,49 @@ proc process(ctxPtr: pointer, dir: cint, triggerIdx: cint): cint {.exportc, cdec
         traceWrite(ctx[], "[compress node=%d] rle decompress failed\n", ctx.node_id)
         return -1
       outLen = rleLen
+    of Algo.Lz4:
+      var cap = srcLen * 3
+      outBuf = c_malloc(cap)
+      if outBuf == nil: return -1
+      let lz4Ret = ctx.lz4DecompressSafe(pkt, outBuf, srcLen.cint, cap.cint)
+      if lz4Ret < 0:
+        c_free(outBuf)
+        traceWrite(ctx[], "[compress node=%d] lz4 decompress failed ret=%d\n", ctx.node_id, lz4Ret)
+        return -1
+      outLen = lz4Ret.csize_t
+    of Algo.Brotli:
+      var cap = srcLen * 3 + 65536
+      outBuf = c_malloc(cap)
+      if outBuf == nil: return -1
+      var decLen = cap
+      if ctx.brotliDecoderDecompress(srcLen, pkt, addr decLen, outBuf) == 0:
+        c_free(outBuf)
+        traceWrite(ctx[], "[compress node=%d] brotli decompress failed\n", ctx.node_id)
+        return -1
+      outLen = decLen
+    of Algo.Lzo:
+      var cap = srcLen * 3
+      outBuf = c_malloc(cap)
+      if outBuf == nil: return -1
+      var lzoLen = cap
+      if ctx.lzo1xDecompress(pkt, srcLen, outBuf, addr lzoLen, nil) != 0:
+        c_free(outBuf)
+        traceWrite(ctx[], "[compress node=%d] lzo decompress failed\n", ctx.node_id)
+        return -1
+      outLen = lzoLen
+    of Algo.Lzma:
+      var cap = srcLen * 3
+      outBuf = c_malloc(cap)
+      if outBuf == nil: return -1
+      var outPos: csize_t = 0
+      var srcPos: csize_t = 0
+      var memlimit: uint64 = 0xFFFF_FFFF_FFFF_FFFF'u64
+      let lzmaRet = ctx.lzmaStreamBufferDecode(addr memlimit, 0, nil, pkt, addr srcPos, srcLen, outBuf, addr outPos, cap)
+      if lzmaRet != 0:
+        c_free(outBuf)
+        traceWrite(ctx[], "[compress node=%d] lzma decompress failed ret=%d\n", ctx.node_id, lzmaRet)
+        return -1
+      outLen = outPos
   if outLen == 0 or outLen > 0x7FFFFFFF:
     if outBuf != nil: c_free(outBuf)
     traceWrite(ctx[], "[compress node=%d] bad output len=%zu\n", ctx.node_id, outLen)
@@ -205,7 +321,11 @@ proc process(ctxPtr: pointer, dir: cint, triggerIdx: cint): cint {.exportc, cdec
         of Algo.Zstd: "zstd"
         of Algo.Snappy: "snappy"
         of Algo.Gzip: "gzip"
-        of Algo.Rle: "rle"),
+        of Algo.Rle: "rle"
+        of Algo.Lz4: "lz4"
+        of Algo.Brotli: "brotli"
+        of Algo.Lzo: "lzo"
+        of Algo.Lzma: "lzma"),
       srcLen.cint, outLen.cint, ratio)
   let wr = ctx.api.write_packet(ctx.api.ctx, writeDst, outBuf, outLen)
   return wr
@@ -217,10 +337,11 @@ proc moduleversion*(): cstring {.exportc, cdecl, dynlib.} =
   return "1.0.0"
 
 proc moduledesc*(): cstring {.exportc, cdecl, dynlib.} =
-  return "Compression module (rle/zstd/snappy/gzip)"
+  return "Compression module (rle/zstd/snappy/gzip/lz4/brotli/lzo/lzma)"
 
 proc modulehelp*(): cstring {.exportc, cdecl, dynlib.} =
   return "Compresses ext->wire, decompresses wire->ext.\n" &
          "Config: algorithm[:level][,trace]\n" &
-         "  rle (default, built-in), zstd:N, snappy, gzip:N\n" &
+         "  rle (default, built-in), zstd:N, snappy, gzip:N,\n" &
+         "  lz4, brotli:N, lzo, lzma:N\n" &
          "Example: \"zstd:3\" or \"snappy\" or \"\" (default=rle)"

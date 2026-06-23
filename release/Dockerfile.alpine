@@ -46,7 +46,11 @@ RUN apk add --no-cache \
     libstdc++ \
     zstd-libs \
     snappy \
-    zlib
+    zlib \
+    lz4-libs \
+    brotli-libs \
+    lzo \
+    xz
 COPY --from=builder /src/out/ /app/
 COPY release/entrypoint.sh /app/entrypoint.sh
 RUN chmod +x /app/entrypoint.sh

@@ -2,3 +2,7 @@ rle
 zstd:3
 snappy
 gzip:6
+lz4
+brotli:6
+lzo
+lzma:6
