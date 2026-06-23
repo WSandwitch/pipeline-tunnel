@@ -21,6 +21,12 @@ RUN set -eux; \
     ln -sf "/usr/local/zig-${ZIG_ARCH}-linux-0.16.0/zig" /usr/local/bin/zig; \
     rm "/tmp/zig-${ZIG_ARCH}-linux-0.16.0.tar.xz"
 
+COPY nim-*.tar.xz /tmp/
+RUN set -eux; \
+    tar xJf "/tmp/nim-2.2.2-linux_x64.tar.xz" -C /usr/local; \
+    ln -sf "/usr/local/nim-2.2.2/bin/nim" /usr/local/bin/nim; \
+    rm "/tmp/nim-2.2.2-linux_x64.tar.xz"
+
 COPY . /src
 WORKDIR /src
 RUN cmake -B /build -DCMAKE_BUILD_TYPE=Release \
@@ -31,7 +37,10 @@ FROM alpine:3.19
 RUN apk add --no-cache \
     libssl3 \
     libcrypto3 \
-    libstdc++
+    libstdc++ \
+    zstd-libs \
+    snappy \
+    zlib
 COPY --from=builder /src/out/ /app/
 COPY release/entrypoint.sh /app/entrypoint.sh
 RUN chmod +x /app/entrypoint.sh

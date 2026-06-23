@@ -11,3 +11,5 @@ CONTEXT.md
 logs
 zig-*-linux-*.tar.xz
 *.core
+compress.so
+nim-*.tar.xz

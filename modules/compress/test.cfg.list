@@ -1,8 +1,4 @@
-gzip
-gzip:1
-gzip:5
-gzip:9
-zstd
-zstd:1
-zstd:5
-zstd:15
+rle
+zstd:3
+snappy
+gzip:6

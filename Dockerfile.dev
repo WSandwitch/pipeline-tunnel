@@ -13,6 +13,9 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     procps \
     ca-certificates \
     net-tools \
+    libzstd1 \
+    libsnappy1 \
+    zlib1g \
     && rm -rf /var/lib/apt/lists/*
 
 COPY zig-*.tar.xz /tmp/
@@ -26,5 +29,11 @@ RUN set -eux; \
     tar xJf "/tmp/zig-${ZIG_ARCH}-linux-0.16.0.tar.xz" -C /usr/local; \
     ln -sf "/usr/local/zig-${ZIG_ARCH}-linux-0.16.0/zig" /usr/local/bin/zig; \
     rm "/tmp/zig-${ZIG_ARCH}-linux-0.16.0.tar.xz"
+
+COPY nim-*.tar.xz /tmp/
+RUN set -eux; \
+    tar xJf "/tmp/nim-2.2.2-linux_x64.tar.xz" -C /usr/local; \
+    ln -sf "/usr/local/nim-2.2.2/bin/nim" /usr/local/bin/nim; \
+    rm "/tmp/nim-2.2.2-linux_x64.tar.xz"
 
 WORKDIR /app
