@@ -225,7 +225,7 @@ begin
   svr_log = Tempfile.new(%w[ppltunnel-server- .log])
   svr = Process.spawn(SERVER, "-l#{HOST}:#{svr_port}", "-A#{PASS}",
                       "-M#{MPATH}", out: svr_log, err: [:child, :out])
-  wait_port_listen(svr_port)
+  wait_port_or_die(svr, svr_port, svr_log)
   Process.kill('TERM', svr) rescue nil
   Process.wait(svr) rescue nil
 
