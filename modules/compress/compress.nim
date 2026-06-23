@@ -200,7 +200,7 @@ proc process(ctxPtr: pointer, dir: cint, triggerIdx: cint): cint {.exportc, cdec
   if ctx.trace:
     let ratio = if outLen > 0: cast[float64](srcLen) / cast[float64](outLen) else: 0.0
     fprintf(stderr, "[compress node=%d %s] %s sz=%d -> %d (%.1fx)\n",
-      ctx.node_id, if triggerIdx == 0: "fw" else: "rv",
+      ctx.node_id, cast[cstring](if triggerIdx == 0: "fw" else: "rv"),
       cast[cstring](case ctx.algo
         of Algo.Zstd: "zstd"
         of Algo.Snappy: "snappy"
