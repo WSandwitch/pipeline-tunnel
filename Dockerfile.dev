@@ -14,7 +14,7 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     ca-certificates \
     net-tools \
     libzstd1 \
-    libsnappy1 \
+    libsnappy1v5 \
     zlib1g \
     && rm -rf /var/lib/apt/lists/*
 
@@ -32,8 +32,14 @@ RUN set -eux; \
 
 COPY nim-*.tar.xz /tmp/
 RUN set -eux; \
-    tar xJf "/tmp/nim-2.2.2-linux_x64.tar.xz" -C /usr/local; \
+    ARCH=$(uname -m); \
+    case "$ARCH" in \
+      x86_64)  NIM_ARCH="x64" ;; \
+      aarch64) NIM_ARCH="arm64" ;; \
+      *)       echo "unsupported arch: $ARCH"; exit 1 ;; \
+    esac; \
+    tar xJf "/tmp/nim-2.2.2-linux_${NIM_ARCH}.tar.xz" -C /usr/local; \
     ln -sf "/usr/local/nim-2.2.2/bin/nim" /usr/local/bin/nim; \
-    rm "/tmp/nim-2.2.2-linux_x64.tar.xz"
+    rm "/tmp/nim-2.2.2-linux_${NIM_ARCH}.tar.xz"
 
 WORKDIR /app

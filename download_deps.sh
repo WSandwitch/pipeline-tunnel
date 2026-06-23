@@ -58,7 +58,13 @@ https://ziglang.org/download/${ZIG_VERSION}"
 # --- Nim ---
 download_nim() {
   NIM_VERSION="2.2.2"
-  NIM_FILE="nim-${NIM_VERSION}-linux_x64.tar.xz"
+  ARCH=$(uname -m)
+  case "$ARCH" in
+    x86_64)  NIM_ARCH="x64" ;;
+    aarch64) NIM_ARCH="arm64" ;;
+    *)       echo "unsupported arch: $ARCH"; exit 1 ;;
+  esac
+  NIM_FILE="nim-${NIM_VERSION}-linux_${NIM_ARCH}.tar.xz"
   TMP="$DIR/$NIM_FILE.tmp"
 
   if [ -f "$DIR/$NIM_FILE" ]; then

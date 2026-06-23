@@ -12,6 +12,8 @@ add_custom_command(OUTPUT ${COMPRESS_OUT}
   COMMAND ${NIM_COMPILER} c --app:lib --mm:none --opt:speed -d:release
     --out:${COMPRESS_OUT} ${COMPRESS_SRC}
   DEPENDS ${COMPRESS_SRC}
+    ${CMAKE_CURRENT_SOURCE_DIR}/helpers.nim
+    ${CMAKE_CURRENT_SOURCE_DIR}/rle_impl.nim
   COMMENT "Building compress.so (Nim)")
 
 add_custom_target(compress ALL DEPENDS ${COMPRESS_OUT})
