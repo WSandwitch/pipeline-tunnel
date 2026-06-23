@@ -23,4 +23,7 @@ case "$BASE" in
   *) echo "Error: --base must be alpine or ubuntu (default: ubuntu)" >&2; exit 1 ;;
 esac
 
+# Pre-download Zig tarball into build context
+"$SCRIPT_DIR/download_deps.sh" > /dev/null
+
 exec "$SCRIPT_DIR/tests/runindocker.sh" "$DOCKERFILE" sh -c "mkdir -p /app/build/tests/test_modules && cmake -B /app/build -DCMAKE_BUILD_TYPE=$BUILD_TYPE $TRACE && cmake --build /app/build -j\$(nproc)"

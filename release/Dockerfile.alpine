@@ -5,7 +5,22 @@ RUN apk add --no-cache \
     cmake \
     openssl-dev \
     linux-headers \
-    musl-dev
+    musl-dev \
+    curl \
+    ca-certificates
+
+COPY zig-*.tar.xz /tmp/
+RUN set -eux; \
+    ARCH=$(uname -m); \
+    case "$ARCH" in \
+      x86_64)  ZIG_ARCH="x86_64" ;; \
+      aarch64) ZIG_ARCH="aarch64" ;; \
+      *)       echo "unsupported arch: $ARCH"; exit 1 ;; \
+    esac; \
+    tar xJf "/tmp/zig-${ZIG_ARCH}-linux-0.16.0.tar.xz" -C /usr/local; \
+    ln -sf "/usr/local/zig-${ZIG_ARCH}-linux-0.16.0/zig" /usr/local/bin/zig; \
+    rm "/tmp/zig-${ZIG_ARCH}-linux-0.16.0.tar.xz"
+
 COPY . /src
 WORKDIR /src
 RUN cmake -B /build -DCMAKE_BUILD_TYPE=Release \

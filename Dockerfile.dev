@@ -14,4 +14,17 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     ca-certificates \
     net-tools \
     && rm -rf /var/lib/apt/lists/*
+
+COPY zig-*.tar.xz /tmp/
+RUN set -eux; \
+    ARCH=$(uname -m); \
+    case "$ARCH" in \
+      x86_64)  ZIG_ARCH="x86_64" ;; \
+      aarch64) ZIG_ARCH="aarch64" ;; \
+      *)       echo "unsupported arch: $ARCH"; exit 1 ;; \
+    esac; \
+    tar xJf "/tmp/zig-${ZIG_ARCH}-linux-0.16.0.tar.xz" -C /usr/local; \
+    ln -sf "/usr/local/zig-${ZIG_ARCH}-linux-0.16.0/zig" /usr/local/bin/zig; \
+    rm "/tmp/zig-${ZIG_ARCH}-linux-0.16.0.tar.xz"
+
 WORKDIR /app

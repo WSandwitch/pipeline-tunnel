@@ -19,6 +19,9 @@ case "$BASE" in
   *) echo "Error: --base must be alpine or ubuntu (default: ubuntu)" >&2; exit 1 ;;
 esac
 
+# Pre-download Zig tarball into build context
+"$(cd "$(dirname "$0")/.." && pwd)/download_deps.sh" > /dev/null
+
 exec docker buildx build \
   --platform linux/amd64,linux/arm64 \
   -f "$DOCKERFILE" \

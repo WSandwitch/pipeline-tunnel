@@ -9,3 +9,5 @@ AGENTS.md
 PLAN.md
 CONTEXT.md
 logs
+zig-*-linux-*.tar.xz
+*.core
