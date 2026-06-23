@@ -2,7 +2,7 @@ set(COMPRESS_SRC ${CMAKE_CURRENT_SOURCE_DIR}/compress.nim)
 set(COMPRESS_OUT ${CMAKE_CURRENT_BINARY_DIR}/compress.so)
 
 find_program(NIM_COMPILER nim
-  PATHS /tmp/nim/nim-2.2.2/bin /usr/local/nim-2.2.2/bin
+  PATHS /tmp/nim/nim-2.2.8/bin /usr/local/nim-2.2.8/bin
   NO_DEFAULT_PATH)
 if(NOT NIM_COMPILER)
   find_program(NIM_COMPILER nim)

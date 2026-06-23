@@ -38,8 +38,8 @@ RUN set -eux; \
       aarch64) NIM_ARCH="arm64" ;; \
       *)       echo "unsupported arch: $ARCH"; exit 1 ;; \
     esac; \
-    tar xJf "/tmp/nim-2.2.2-linux_${NIM_ARCH}.tar.xz" -C /usr/local; \
+    tar xJf "/tmp/nim-2.2.8-linux_${NIM_ARCH}.tar.xz" -C /usr/local; \
     ln -sf "/usr/local/nim-2.2.2/bin/nim" /usr/local/bin/nim; \
-    rm "/tmp/nim-2.2.2-linux_${NIM_ARCH}.tar.xz"
+    rm "/tmp/nim-2.2.8-linux_${NIM_ARCH}.tar.xz"
 
 WORKDIR /app

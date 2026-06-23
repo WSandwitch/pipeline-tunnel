@@ -57,7 +57,7 @@ https://ziglang.org/download/${ZIG_VERSION}"
 
 # --- Nim ---
 download_nim() {
-  NIM_VERSION="2.2.2"
+  NIM_VERSION="2.2.8"
   ARCH=$(uname -m)
   case "$ARCH" in
     x86_64)  NIM_ARCH="x64" ;;
