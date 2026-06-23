@@ -318,8 +318,9 @@ def run_one_test(options)
     puts "-" * 40
     puts "[#{options[:config]}] #{dir_label}: #{'%.0f' % max_rate} Mbps peak, #{'%.0f' % avg_rate} Mbps avg" \
          "  (#{options[:clients]} clients, P=#{options[:parallel]}, t=#{options[:duration]})"
+    error_msg = all_outputs.find { |o| o.include?('control socket has closed unexpectedly') }
     puts ok ? 'PASS' : 'FAIL'
-    return { ok: ok, max_rate: max_rate, avg_rate: avg_rate }
+    return { ok: ok, max_rate: max_rate, avg_rate: avg_rate, error_msg: error_msg }
   ensure
     tunnels.each { |t| stop_procs(t[:cli_pid], t[:svr_pid]) }
     killall
@@ -349,5 +350,11 @@ def run_one_test(options)
 end
 
 result = run_one_test(options)
+
+if !result[:ok] && result[:error_msg]
+  $stderr.puts "  Retry (iperf3 control socket error)..."
+  sleep 2
+  result = run_one_test(options)
+end
 
 exit result && result[:ok] ? 0 : 1
