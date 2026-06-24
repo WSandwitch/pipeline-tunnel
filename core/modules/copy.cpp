@@ -40,9 +40,10 @@ extern "C" int builtin_copy_process(void *ctx_ptr, int dir, int trigger_idx, con
     }
     int write_dst = (dir == 0) ? 1 : 0;
     if (ctx->mode_copy) {
-        uint8_t *cp = (uint8_t *)malloc(len);
+        uint8_t *cp = (uint8_t *)ctx->api->malloc(ctx->api->ctx, len);
         if (!cp) return -1;
         memcpy(cp, data, len);
+        ctx->api->free(ctx->api->ctx, (void*)data);
         return ctx->api->write_packet(ctx->api->ctx, write_dst, cp, len);
     } else {
         return ctx->api->write_packet(ctx->api->ctx, write_dst, data, len);
