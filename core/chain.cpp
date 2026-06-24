@@ -281,7 +281,7 @@ int Chain::request_heartbeat_impl(Module *mod, int interval_sec) {
     if (interval_sec > 0) {
         mod->heartbeat_interval_sec = interval_sec;
     } else if (interval_sec == 0) {
-        mod->heartbeat_interval_sec = -1;
+        mod->heartbeat_interval_sec = -2;
     } else {
         mod->heartbeat_interval_sec = 0;
     }
@@ -293,6 +293,12 @@ void Chain::check_module_heartbeats(int system_interval_ms) {
     for (auto &mod : _modules) {
         int interval_sec = mod->heartbeat_interval_sec;
         if (interval_sec == 0) continue;
+
+        if (interval_sec == -2) {
+            std::lock_guard<std::mutex> dirlock(mod->dir_mutex[0]);
+            mod->base->process_fn(mod->ctx, -1, 0, nullptr, 0);
+            continue;
+        }
 
         int eff_interval_ms = (interval_sec < 0) ? system_interval_ms
                                                   : interval_sec * 1000;
