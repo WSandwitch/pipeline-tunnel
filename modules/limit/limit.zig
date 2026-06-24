@@ -1,4 +1,8 @@
 const std = @import("std");
+const ManagedArrayList = std.array_list.Managed;
+
+const MAX_PENDING: usize = 100;
+const MAX_PACKET: u64 = 131072;
 
 const ModuleChain = extern struct {
     ctx: *anyopaque,
@@ -10,11 +14,19 @@ const ModuleChain = extern struct {
     set_src: *const fn (*anyopaque, c_int) callconv(.c) void,
 };
 
+extern fn free(ptr: ?*anyopaque) void;
+
 fn now_ns() i128 {
     var ts: std.os.linux.timespec = undefined;
     _ = std.os.linux.clock_gettime(.MONOTONIC, &ts);
     return @as(i128, @intCast(ts.sec)) * 1_000_000_000 + @as(i128, @intCast(ts.nsec));
 }
+
+const PendingPacket = struct {
+    data: [*]const u8,
+    len: usize,
+    src_idx: c_int,
+};
 
 const TokenBucket = struct {
     rate_bps: u64,
@@ -37,32 +49,17 @@ const TokenBucket = struct {
         if (elapsed_ns <= 0) return;
         const rate_per_ns = @as(f64, @floatFromInt(self.rate_bps)) / 8.0 / 1_000_000_000.0;
         self.tokens += rate_per_ns * @as(f64, @floatFromInt(elapsed_ns));
-        if (self.tokens > self.burst)
-            self.tokens = self.burst;
         self.last_ns = now;
     }
 
-    fn consume(self: *TokenBucket, bytes: u64) void {
+    fn try_consume(self: *TokenBucket, bytes: u64) bool {
         self.refill();
         const needed = @as(f64, @floatFromInt(bytes));
         if (self.tokens >= needed) {
             self.tokens -= needed;
-            return;
+            return true;
         }
-        const deficit = needed - self.tokens;
-        if (self.rate_bps == 0) return;
-        const rate_per_ns = @as(f64, @floatFromInt(self.rate_bps)) / 8.0 / 1_000_000_000.0;
-        const wait_ns = @as(u64, @intFromFloat(deficit / rate_per_ns)) + 1;
-        var ts = std.os.linux.timespec{
-            .sec = @as(isize, @intCast(wait_ns / 1_000_000_000)),
-            .nsec = @as(isize, @intCast(wait_ns % 1_000_000_000)),
-        };
-        var rem: std.os.linux.timespec = undefined;
-        while (std.os.linux.nanosleep(&ts, &rem) != 0) {
-            ts = rem;
-        }
-        self.tokens = 0;
-        self.last_ns = now_ns();
+        return false;
     }
 };
 
@@ -72,9 +69,36 @@ const LimitCtx = struct {
     trace: bool,
     buckets: [2]TokenBucket,
     dir_mask: u2,
+    pending: [2]ManagedArrayList(PendingPacket),
+    allocator: std.mem.Allocator = undefined,
+    have_heartbeat: bool,
 };
 
 const dir_bits: [2]u2 = .{ 1, 2 };
+
+fn drain_dir(ctx: *LimitCtx, udir: usize) void {
+    if (dir_bits[udir] & ctx.dir_mask == 0) return;
+    var bucket = &ctx.buckets[udir];
+    while (ctx.pending[udir].items.len > 0) {
+        const pp = ctx.pending[udir].items[0];
+        if (!bucket.try_consume(pp.len)) break;
+        _ = ctx.pending[udir].orderedRemove(0);
+        ctx.api.set_src(ctx.api.ctx, pp.src_idx);
+        const write_dst: c_int = if (udir == 0) 1 else 0;
+        _ = ctx.api.write_packet(ctx.api.ctx, write_dst, pp.data, pp.len);
+    }
+}
+
+fn update_heartbeat(ctx: *LimitCtx) void {
+    const has_pending = ctx.pending[0].items.len > 0 or ctx.pending[1].items.len > 0;
+    if (has_pending and !ctx.have_heartbeat) {
+        _ = ctx.api.request_heartbeat(ctx.api.ctx, 0);
+        ctx.have_heartbeat = true;
+    } else if (!has_pending and ctx.have_heartbeat) {
+        _ = ctx.api.request_heartbeat(ctx.api.ctx, -1);
+        ctx.have_heartbeat = false;
+    }
+}
 
 export fn init(api: ?*ModuleChain, config: ?[*:0]const u8) callconv(.c) ?*anyopaque {
     const c_api = api orelse return null;
@@ -108,9 +132,10 @@ export fn init(api: ?*ModuleChain, config: ?[*:0]const u8) callconv(.c) ?*anyopa
     }
 
     if (burst_bytes == 0)
-        burst_bytes = @max(rate_bps / 80, 1);
+        burst_bytes = @max(rate_bps / 80, MAX_PACKET);
 
-    const buf = std.heap.page_allocator.create(LimitCtx) catch return null;
+    const allocator = std.heap.page_allocator;
+    const buf = allocator.create(LimitCtx) catch return null;
     buf.* = .{
         .api = c_api,
         .node_id = c_api.get_node_id(c_api.ctx),
@@ -120,6 +145,12 @@ export fn init(api: ?*ModuleChain, config: ?[*:0]const u8) callconv(.c) ?*anyopa
             TokenBucket.init(rate_bps, burst_bytes),
         },
         .dir_mask = dm,
+        .pending = .{
+            ManagedArrayList(PendingPacket).init(allocator),
+            ManagedArrayList(PendingPacket).init(allocator),
+        },
+        .allocator = allocator,
+        .have_heartbeat = false,
     };
 
     if (trace) {
@@ -130,10 +161,18 @@ export fn init(api: ?*ModuleChain, config: ?[*:0]const u8) callconv(.c) ?*anyopa
 }
 
 export fn process(ctx_ptr: ?*anyopaque, dir: c_int, trigger_idx: c_int, data: [*]const u8, len: usize) callconv(.c) c_int {
-    _ = trigger_idx;
     const ctx = @as(*LimitCtx, @ptrCast(@alignCast(ctx_ptr orelse return -1)));
+    const src_idx = trigger_idx;
 
-    if (dir < 0) return 0;
+    if (dir < 0) {
+        // heartbeat tick — refill + drain both dirs
+        ctx.buckets[0].refill();
+        ctx.buckets[1].refill();
+        drain_dir(ctx, 0);
+        drain_dir(ctx, 1);
+        update_heartbeat(ctx);
+        return 0;
+    }
 
     const udir = @as(usize, @intCast(dir));
     if (udir > 1) return 0;
@@ -141,14 +180,35 @@ export fn process(ctx_ptr: ?*anyopaque, dir: c_int, trigger_idx: c_int, data: [*
 
     if (len == 0) return -1;
 
-    ctx.buckets[udir].consume(len);
-
-    if (ctx.trace) {
-        std.debug.print("[limit node={d} dir={d} sz={d}]\n", .{ ctx.node_id, dir, len });
+    // Try to consume tokens immediately
+    if (ctx.buckets[udir].try_consume(len)) {
+        const write_dst: c_int = if (dir == 0) 1 else 0;
+        return ctx.api.write_packet(ctx.api.ctx, write_dst, data, len);
     }
 
-    const write_dst: c_int = if (dir == 0) 1 else 0;
-    return ctx.api.write_packet(ctx.api.ctx, write_dst, data, len);
+    // No tokens — queue or drop
+    if (ctx.pending[udir].items.len >= MAX_PENDING) {
+        if (ctx.trace) {
+            std.debug.print("[limit node={d}] DROP dir={d} len={d} pending={d}\n", .{ ctx.node_id, dir, len, ctx.pending[udir].items.len });
+        }
+        const p_free: [*]u8 = @constCast(data);
+        free(@as(?*anyopaque, @ptrCast(p_free)));
+        return 0;
+    }
+
+    ctx.pending[udir].append(.{ .data = @constCast(data), .len = len, .src_idx = src_idx }) catch {
+        const p_free2: [*]u8 = @constCast(data);
+        free(@as(?*anyopaque, @ptrCast(p_free2)));
+        return 0;
+    };
+
+    update_heartbeat(ctx);
+
+    if (ctx.trace) {
+        std.debug.print("[limit node={d}] QUEUE dir={d} len={d} pending={d}\n", .{ ctx.node_id, dir, len, ctx.pending[udir].items.len });
+    }
+
+    return 0;
 }
 
 fn parse_suffix_int(s: []const u8, multiplier: u64) !u64 {
@@ -169,13 +229,13 @@ export fn modulename() callconv(.c) [*:0]const u8 {
 }
 
 export fn moduleversion() callconv(.c) [*:0]const u8 {
-    return "1.0.0";
+    return "2.0.0";
 }
 
 export fn moduledesc() callconv(.c) [*:0]const u8 {
-    return "Rate limiter with token bucket";
+    return "Rate limiter with async token bucket and pending queue";
 }
 
 export fn modulehelp() callconv(.c) [*:0]const u8 {
-    return "Limits throughput using a token bucket.\nConfig: rate:N[kmg],b:N[km],dir:0|1|2,trace\n  rate - bits/sec (k=1000, m=1e6, g=1e9)\n  b    - burst bytes (k=1024, m=1024^2, default=100ms*rate/8)\n  dir  - 0=ext->wire, 1=wire->ext, 2=both (default=2)\n  trace - debug logging to stderr";
+    return "Async rate limiter. Queues packets when tokens unavailable, drains via heartbeat.\nConfig: rate:N[kmg],b:N[km],dir:0|1|2,trace\n  rate - bits/sec (k=1000, m=1e6, g=1e9)\n  b    - burst bytes (k=1024, m=1024^2, default=max(rate/80,131072))\n  dir  - 0=ext->wire, 1=wire->ext, 2=both (default=2)\n  trace - debug logging to stderr";
 }

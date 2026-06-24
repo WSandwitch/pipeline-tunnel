@@ -144,6 +144,8 @@ void Chain::push_packet(const uint8_t *data, size_t len, int src_idx, int dir) {
         }
         first = _wire_entries[src_idx];
     }
+    _inflight_bytes[dir].fetch_add(len);
+    check_backpressure(dir);
     enqueue_module(first, data, len, src_idx, dir);
 }
 
@@ -156,8 +158,6 @@ void Chain::enqueue_module(Module *mod, const uint8_t *data, size_t len,
     }
 
     _inflight.fetch_add(1);
-    _inflight_bytes[dir].fetch_add(len);
-    check_backpressure(dir);
 
     WorkTask wt;
     wt.fn = [this, data, len, src_idx, dir, mod, owner]() {
@@ -187,10 +187,11 @@ void Chain::enqueue_module(Module *mod, const uint8_t *data, size_t len,
         int ret = mod->base->process_fn(mod->ctx, dir, src_idx, data, len);
         TRACE("CHAIN WRITE_PACKET_IMPL done dir=%d ret=%d", dir, ret);
 
-        _inflight_bytes[dir].fetch_sub(len);
-        check_backpressure(dir);
-
         if (ret < 0) {
+            // balance the inflight_bytes added in push_packet — error, data won't
+            // reach wire_write
+            _inflight_bytes[dir].fetch_sub(len);
+            check_backpressure(dir);
             task_done();
             return;
         }
@@ -315,11 +316,14 @@ void Chain::check_module_heartbeats(int system_interval_ms) {
 }
 
 int Chain::write_packet_impl(Module *mod, int dst, const uint8_t *data, size_t len) {
-    // dir is computed from output port: dst=0 → ext side (dir=1), dst≠0 → wire side (dir=0)
+    // dst=0 → ext side (dir=1), dst≠0 → wire side (dir=0)
     int dir = (dst == 0) ? 1 : 0;
     if (dst >= 0 && (size_t)dst < mod->near.size() && mod->near[dst]) {
         enqueue_module(mod->near[dst], data, len, g_ctx_src_idx, dir);
         return 0;
     }
+    // Exit chain: inflight bytes leave the pipeline
+    _inflight_bytes[dir].fetch_sub(len);
+    check_backpressure(dir);
     return _kapi->wire_write(_kapi->ctx, dst == 0 ? 0 : mod->wire_dst, data, len);
 }
