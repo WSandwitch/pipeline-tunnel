@@ -40,7 +40,8 @@ void ThreadPool::enqueue(WorkTask &&task) {
         int n = snprintf(buf, sizeof(buf), "[%.6f ENQ POOL dir=%d len=%zu mod=%s]\n",
                          now_sec(), t.task_dir, t.task_len,
                          t.task_mod ? t.task_mod : "?");
-        write(STDERR_FILENO, buf, (size_t)n);
+        ssize_t r = write(STDERR_FILENO, buf, (size_t)n);
+        (void)r;
     }
     cv_.notify_one();
 }
@@ -60,7 +61,8 @@ void ThreadPool::worker_loop() {
             int n = snprintf(buf, sizeof(buf), "[%.6f DEQ POOL dir=%d len=%zu mod=%s]\n",
                              now_sec(), task.task_dir, task.task_len,
                              task.task_mod ? task.task_mod : "?");
-            write(STDERR_FILENO, buf, (size_t)n);
+            ssize_t r = write(STDERR_FILENO, buf, (size_t)n);
+            (void)r;
         }
         if (task.fn) {
             try { task.fn(); } catch (...) {}

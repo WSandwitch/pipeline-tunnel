@@ -16,6 +16,8 @@ typedef struct {
     int (*write_packet)(void *chain_ctx, int output_id, const uint8_t *data, size_t len);
     int (*request_heartbeat)(void *chain_ctx, int interval_sec);
     void (*set_src)(void *chain_ctx, int src_idx);
+    void *(*malloc)(void *chain_ctx, size_t size);
+    void (*free)(void *chain_ctx, void *ptr);
 } ModuleChain;
 
 void *init(ModuleChain *chain_api, const char *config);

@@ -244,13 +244,11 @@ void Session::handle_auth2_response(const Packet &pkt) {
                       (unsigned long long)self->session_id_, dst, len, len>0?data[0]:0);
             if (dst == 0) {
                 if (len < 1) {
-                    free(const_cast<uint8_t*>(data));
                     return 0;
                 }
                 if (data[0] == 255) {
                     if (len >= 3 && data[1] == CHAIN_CTRL_SHUTDOWN_WR) {
                         uint8_t conn_id = data[2];
-                        free(const_cast<uint8_t*>(data));
                         std::lock_guard<std::mutex> lock(self->targets_mtx_);
                         auto tit = self->targets_.find(conn_id);
                         if (tit != self->targets_.end()) {
@@ -265,7 +263,6 @@ void Session::handle_auth2_response(const Packet &pkt) {
                     }
                     log_error("session %llx: wire_write dst=0 unknown chain ctrl type=%u",
                               (unsigned long long)self->session_id_, len>=2?data[1]:0);
-                    free(const_cast<uint8_t*>(data));
                     return 0;
                 }
                 uint8_t conn_id = data[0];
@@ -276,7 +273,7 @@ void Session::handle_auth2_response(const Packet &pkt) {
                     std::lock_guard<std::mutex> lock(self->targets_mtx_);
                     auto tit = self->targets_.find(conn_id);
                     if (tit == self->targets_.end()) {
-                        free(const_cast<uint8_t*>(data)); return 0;
+                        return 0;
                     }
                     const uint8_t *payload = data + 1;
                     size_t payload_len = len - 1;
@@ -315,7 +312,6 @@ void Session::handle_auth2_response(const Packet &pkt) {
                     });
                     self->kernel_->wakeup();
                 }
-                free(const_cast<uint8_t*>(data));
                 return 0;
             }
             if (dst < 1 || (size_t)dst > self->data_connections_.size() ||
@@ -381,7 +377,6 @@ void Session::handle_auth2_response(const Packet &pkt) {
                 });
                 self->kernel_->wakeup();
             }
-            free(const_cast<uint8_t*>(data));
             return 0;
         };
 
@@ -673,7 +668,7 @@ void Session::handle_connect_req(const Packet &pkt) {
         try {
             if (events & EPOLLIN) {
                 if (chain_ && chain_->is_backpressure_paused(0)) return;
-                uint8_t *rbuf = (uint8_t*)malloc(MAX_PACKET_SIZE);
+                uint8_t *rbuf = (uint8_t*)chain_->alloc_buffer(MAX_PACKET_SIZE);
                 if (!rbuf) return;
                 ssize_t n = read(fd, rbuf + 1, MAX_PACKET_SIZE - 1);
                 TRACE("SVR EXTREAD cid=%u n=%zd errno=%d", conn_id, n, n < 0 ? errno : 0);
@@ -689,10 +684,10 @@ void Session::handle_connect_req(const Packet &pkt) {
                         rbuf[0] = conn_id;
                         chain_->push_packet(rbuf, 1 + (size_t)n, 0, 0);
                     } else {
-                        free(rbuf);
+                        chain_->free_buffer(rbuf);
                     }
                 } else {
-                    free(rbuf);
+                    chain_->free_buffer(rbuf);
                     if (n == 0) {
                         handle_target_eof(conn_id);
                     } else {
@@ -705,7 +700,7 @@ void Session::handle_connect_req(const Packet &pkt) {
                 // Drain remaining data then detect EOF
                 while (true) {
                       if (chain_ && chain_->is_backpressure_paused(0)) break;
-                      uint8_t *tmp = (uint8_t*)malloc(MAX_PACKET_SIZE);
+                      uint8_t *tmp = (uint8_t*)chain_->alloc_buffer(MAX_PACKET_SIZE);
                       if (!tmp) return;
                       ssize_t n = read(fd, tmp + 1, MAX_PACKET_SIZE - 1);
                       if (n > 0) {
@@ -715,10 +710,10 @@ void Session::handle_connect_req(const Packet &pkt) {
                               tmp[0] = conn_id;
                               chain_->push_packet(tmp, 1 + (size_t)n, 0, 0);
                           } else {
-                              free(tmp);
+                              chain_->free_buffer(tmp);
                           }
                      } else {
-                          free(tmp);
+                          chain_->free_buffer(tmp);
                         if (n == 0 || (errno != EAGAIN && errno != EWOULDBLOCK)) {
                             handle_target_eof(conn_id);
                         }
@@ -967,7 +962,7 @@ void Session::dispatch_data_conn_packet(const uint8_t *payload, size_t len, int 
     TRACE("SVR DISPATCH DATA len=%zu src_idx=%d chain=%p state=%d", len, src_idx, (void*)chain_.get(), (int)state_);
     if (len < 1) return;
     if (chain_ && state_ == RUNNING) {
-        uint8_t *blob = (uint8_t*)malloc(len);
+        uint8_t *blob = (uint8_t*)chain_->alloc_buffer(len);
         if (!blob) return;
         memcpy(blob, payload, len);
         chain_->push_packet(blob, len, src_idx, 1);
@@ -1276,7 +1271,7 @@ void Session::send_disconnect_now(uint8_t conn_id) {
         if (chain_) {
             // Send disconnect as in-band chain control frame
             // guaranteeing ordering with data via seqnum in split/merge
-            uint8_t *ctrl = (uint8_t*)malloc(3);
+            uint8_t *ctrl = (uint8_t*)chain_->alloc_buffer(3);
             ctrl[0] = 255;
             ctrl[1] = CHAIN_CTRL_DISCONNECT;
             ctrl[2] = conn_id;
@@ -1415,7 +1410,7 @@ void Session::process_pending_reconnect_targets() {
             if (events & EPOLLIN) {
                 if (chain_ && chain_->is_backpressure_paused(0)) return;
                 {
-                    uint8_t *rbuf = (uint8_t*)malloc(MAX_PACKET_SIZE);
+                    uint8_t *rbuf = (uint8_t*)chain_->alloc_buffer(MAX_PACKET_SIZE);
                     if (!rbuf) return;
                     ssize_t n = read(fd, rbuf + 1, MAX_PACKET_SIZE - 1);
                     if (n > 0) {
@@ -1439,7 +1434,7 @@ void Session::process_pending_reconnect_targets() {
             if (events & (EPOLLERR | EPOLLHUP)) {
                 while (true) {
                     if (chain_ && chain_->is_backpressure_paused(0)) break;
-                    uint8_t *tmp = (uint8_t*)malloc(MAX_PACKET_SIZE);
+                    uint8_t *tmp = (uint8_t*)chain_->alloc_buffer(MAX_PACKET_SIZE);
                     if (!tmp) return;
                     ssize_t n = read(fd, tmp + 1, MAX_PACKET_SIZE - 1);
                     if (n > 0) {
@@ -1606,11 +1601,9 @@ void Session::process_pending_io() {
     { static int ppi_cnt = 0; if (++ppi_cnt % 100 == 0) TRACE("SVR PPI tick %d", ppi_cnt); }
     { static int stats_cnt = 0; stats_cnt++; if (chain_ && stats_cnt % 10 == 0) {
         int infl = chain_ ? chain_->get_inflight() : -1;
-        TRACE("SVR STATS: bp0=%d bp1=%d maxdb0=%lu maxdb1=%lu inf=%d dc0=%zu dc1=%zu",
+        TRACE("SVR STATS: bp0=%d bp1=%d inf=%d dc0=%zu dc1=%zu",
               chain_->is_backpressure_paused(0),
               chain_->is_backpressure_paused(1),
-              (unsigned long)chain_->get_max_dir_bytes(0),
-              (unsigned long)chain_->get_max_dir_bytes(1),
               infl,
               data_connections_.size()>0?data_connections_[0].writer.size():0,
               data_connections_.size()>1?data_connections_[1].writer.size():0);

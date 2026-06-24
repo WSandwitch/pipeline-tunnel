@@ -86,21 +86,21 @@ proc process(ctxPtr: pointer, dir: cint, triggerIdx: cint, data: pointer, len: c
     case ctx.algo
     of Algo.Zstd:
       maxOut = ctx.zstdCompressBound(srcLen)
-      outBuf = c_malloc(maxOut)
+      outBuf = ctx.api.malloc(ctx.api.ctx, maxOut)
       if outBuf == nil: return -1
       let ret = ctx.zstdCompress(outBuf, maxOut, pkt, srcLen, ctx.level)
       if ctx.zstdIsError(ret) != 0:
-        c_free(outBuf)
+        ctx.api.free(ctx.api.ctx, outBuf)
         traceWrite(ctx[], "[compress node=%d] zstd compress failed\n", ctx.node_id)
         return -1
       outLen = ret
     of Algo.Snappy:
       maxOut = ctx.snappyMaxCompressedLength(srcLen)
-      outBuf = c_malloc(maxOut)
+      outBuf = ctx.api.malloc(ctx.api.ctx, maxOut)
       if outBuf == nil: return -1
       var compressedLen: csize_t = maxOut
       if ctx.snappyCompress(pkt, srcLen, outBuf, addr compressedLen) != 0:
-        c_free(outBuf)
+        ctx.api.free(ctx.api.ctx, outBuf)
         traceWrite(ctx[], "[compress node=%d] snappy compress failed\n", ctx.node_id)
         return -1
       outLen = compressedLen
@@ -111,7 +111,7 @@ proc process(ctxPtr: pointer, dir: cint, triggerIdx: cint, data: pointer, len: c
         traceWrite(ctx[], "[compress node=%d] gzip deflateInit2 failed\n", ctx.node_id)
         return -1
       maxOut = ctx.deflateBound(addr strm, srcLen.culong).csize_t
-      outBuf = c_malloc(maxOut)
+      outBuf = ctx.api.malloc(ctx.api.ctx, maxOut)
       if outBuf == nil:
         discard ctx.deflateEnd(addr strm)
         return -1
@@ -123,57 +123,57 @@ proc process(ctxPtr: pointer, dir: cint, triggerIdx: cint, data: pointer, len: c
       outLen = strm.total_out.csize_t
       discard ctx.deflateEnd(addr strm)
       if ret != Z_STREAM_END:
-        c_free(outBuf)
+        ctx.api.free(ctx.api.ctx, outBuf)
         traceWrite(ctx[], "[compress node=%d] gzip deflate failed ret=%d\n", ctx.node_id, ret)
         return -1
     of Algo.Rle:
       maxOut = srcLen * 2 + 64
-      outBuf = c_malloc(maxOut)
+      outBuf = ctx.api.malloc(ctx.api.ctx, maxOut)
       if outBuf == nil: return -1
       var rleLen = maxOut
       if rleCompress(pkt, srcLen, outBuf, addr rleLen) != 0:
-        c_free(outBuf)
+        ctx.api.free(ctx.api.ctx, outBuf)
         traceWrite(ctx[], "[compress node=%d] rle compress failed\n", ctx.node_id)
         return -1
       outLen = rleLen
     of Algo.Lz4:
       maxOut = ctx.lz4CompressBound(srcLen.cint).csize_t
-      outBuf = c_malloc(maxOut)
+      outBuf = ctx.api.malloc(ctx.api.ctx, maxOut)
       if outBuf == nil: return -1
       let lz4Ret = ctx.lz4CompressDefault(pkt, outBuf, srcLen.cint, maxOut.cint)
       if lz4Ret <= 0:
-        c_free(outBuf)
+        ctx.api.free(ctx.api.ctx, outBuf)
         traceWrite(ctx[], "[compress node=%d] lz4 compress failed ret=%d\n", ctx.node_id, lz4Ret)
         return -1
       outLen = lz4Ret.csize_t
     of Algo.Brotli:
       maxOut = ctx.brotliEncoderMaxCompressedSize(srcLen)
-      outBuf = c_malloc(maxOut)
+      outBuf = ctx.api.malloc(ctx.api.ctx, maxOut)
       if outBuf == nil: return -1
       var encLen = maxOut
       if ctx.brotliEncoderCompress(ctx.level, 22, 0, srcLen, pkt, addr encLen, outBuf) == 0:
-        c_free(outBuf)
+        ctx.api.free(ctx.api.ctx, outBuf)
         traceWrite(ctx[], "[compress node=%d] brotli compress failed\n", ctx.node_id)
         return -1
       outLen = encLen
     of Algo.Lzo:
       maxOut = srcLen + srcLen div 16 + 64 + 3
-      outBuf = c_malloc(maxOut)
+      outBuf = ctx.api.malloc(ctx.api.ctx, maxOut)
       if outBuf == nil: return -1
       var lzoLen = maxOut
       if ctx.lzo1x1Compress(pkt, srcLen, outBuf, addr lzoLen, ctx.lzoWrkmem) != 0:
-        c_free(outBuf)
+        ctx.api.free(ctx.api.ctx, outBuf)
         traceWrite(ctx[], "[compress node=%d] lzo compress failed\n", ctx.node_id)
         return -1
       outLen = lzoLen
     of Algo.Lzma:
       maxOut = srcLen + srcLen + 65536
-      outBuf = c_malloc(maxOut)
+      outBuf = ctx.api.malloc(ctx.api.ctx, maxOut)
       if outBuf == nil: return -1
       var outPos: csize_t = 0
       let lzmaRet = ctx.lzmaEasyBufferEncode(ctx.level.cuint, 4, nil, pkt, srcLen, outBuf, addr outPos, maxOut)
       if lzmaRet != 0:
-        c_free(outBuf)
+        ctx.api.free(ctx.api.ctx, outBuf)
         traceWrite(ctx[], "[compress node=%d] lzma compress failed ret=%d\n", ctx.node_id, lzmaRet)
         return -1
       outLen = outPos
@@ -186,11 +186,11 @@ proc process(ctxPtr: pointer, dir: cint, triggerIdx: cint, data: pointer, len: c
         cap = srcLen * 3 + 65536
       else:
         cap = contentSize.csize_t
-      outBuf = c_malloc(cap)
+      outBuf = ctx.api.malloc(ctx.api.ctx, cap)
       if outBuf == nil: return -1
       let ret = ctx.zstdDecompress(outBuf, cap, pkt, srcLen)
       if ctx.zstdIsError(ret) != 0:
-        c_free(outBuf)
+        ctx.api.free(ctx.api.ctx, outBuf)
         traceWrite(ctx[], "[compress node=%d] zstd decompress failed\n", ctx.node_id)
         return -1
       outLen = ret
@@ -199,21 +199,21 @@ proc process(ctxPtr: pointer, dir: cint, triggerIdx: cint, data: pointer, len: c
       if ctx.snappyUncompressedLength(pkt, srcLen, addr uncompLen) != 0:
         traceWrite(ctx[], "[compress node=%d] snappy uncompressed length failed\n", ctx.node_id)
         return -1
-      outBuf = c_malloc(uncompLen)
+      outBuf = ctx.api.malloc(ctx.api.ctx, uncompLen)
       if outBuf == nil: return -1
       outLen = uncompLen
       if ctx.snappyUncompress(pkt, srcLen, outBuf, addr outLen) != 0:
-        c_free(outBuf)
+        ctx.api.free(ctx.api.ctx, outBuf)
         traceWrite(ctx[], "[compress node=%d] snappy uncompress failed\n", ctx.node_id)
         return -1
     of Algo.Gzip:
       var cap = (srcLen * 3 div 2 + 65536).csize_t
-      outBuf = c_malloc(cap)
+      outBuf = ctx.api.malloc(ctx.api.ctx, cap)
       if outBuf == nil: return -1
       var strm: z_stream
       zeroMem(addr strm, sizeof(z_stream).csize_t)
       if ctx.inflateInit2(addr strm, 15 or 16, ZLIB_VERSION, sizeof(z_stream).cint) != Z_OK:
-        c_free(outBuf)
+        ctx.api.free(ctx.api.ctx, outBuf)
         traceWrite(ctx[], "[compress node=%d] gzip inflateInit2 failed\n", ctx.node_id)
         return -1
       strm.next_in = cast[ptr byte](pkt)
@@ -229,26 +229,28 @@ proc process(ctxPtr: pointer, dir: cint, triggerIdx: cint, data: pointer, len: c
           let written = strm.total_out
           if written.csize_t >= MAX_GZIP_DECOMP:
             discard ctx.inflateEnd(addr strm)
-            c_free(outBuf)
+            ctx.api.free(ctx.api.ctx, outBuf)
             return -1
           let newCap = cap * 2
-          let newBuf = c_realloc(outBuf, newCap)
+          let newBuf = ctx.api.malloc(ctx.api.ctx, newCap)
           if newBuf == nil:
             discard ctx.inflateEnd(addr strm)
-            c_free(outBuf)
+            ctx.api.free(ctx.api.ctx, outBuf)
             return -1
+          copyMem(newBuf, outBuf, written.csize_t)
+          ctx.api.free(ctx.api.ctx, outBuf)
           outBuf = newBuf
           cap = newCap
           strm.next_out = cast[ptr byte](cast[uint](outBuf) + written)
           strm.avail_out = (cap - written.csize_t).cuint
         elif ret != Z_OK and ret != Z_BUF_ERROR:
           discard ctx.inflateEnd(addr strm)
-          c_free(outBuf)
+          ctx.api.free(ctx.api.ctx, outBuf)
           traceWrite(ctx[], "[compress node=%d] gzip inflate failed ret=%d\n", ctx.node_id, ret)
           return -1
         else:
           discard ctx.inflateEnd(addr strm)
-          c_free(outBuf)
+          ctx.api.free(ctx.api.ctx, outBuf)
           return -1
       outLen = strm.total_out.csize_t
       discard ctx.inflateEnd(addr strm)
@@ -257,59 +259,59 @@ proc process(ctxPtr: pointer, dir: cint, triggerIdx: cint, data: pointer, len: c
       if decompSize == 0:
         traceWrite(ctx[], "[compress node=%d] rle decompress size failed\n", ctx.node_id)
         return -1
-      outBuf = c_malloc(decompSize)
+      outBuf = ctx.api.malloc(ctx.api.ctx, decompSize)
       if outBuf == nil: return -1
       var rleLen = decompSize
       if rleDecompress(pkt, srcLen, outBuf, addr rleLen) != 0:
-        c_free(outBuf)
+        ctx.api.free(ctx.api.ctx, outBuf)
         traceWrite(ctx[], "[compress node=%d] rle decompress failed\n", ctx.node_id)
         return -1
       outLen = rleLen
     of Algo.Lz4:
       var cap = srcLen * 3
-      outBuf = c_malloc(cap)
+      outBuf = ctx.api.malloc(ctx.api.ctx, cap)
       if outBuf == nil: return -1
       let lz4Ret = ctx.lz4DecompressSafe(pkt, outBuf, srcLen.cint, cap.cint)
       if lz4Ret < 0:
-        c_free(outBuf)
+        ctx.api.free(ctx.api.ctx, outBuf)
         traceWrite(ctx[], "[compress node=%d] lz4 decompress failed ret=%d\n", ctx.node_id, lz4Ret)
         return -1
       outLen = lz4Ret.csize_t
     of Algo.Brotli:
       var cap = srcLen * 3 + 65536
-      outBuf = c_malloc(cap)
+      outBuf = ctx.api.malloc(ctx.api.ctx, cap)
       if outBuf == nil: return -1
       var decLen = cap
       if ctx.brotliDecoderDecompress(srcLen, pkt, addr decLen, outBuf) == 0:
-        c_free(outBuf)
+        ctx.api.free(ctx.api.ctx, outBuf)
         traceWrite(ctx[], "[compress node=%d] brotli decompress failed\n", ctx.node_id)
         return -1
       outLen = decLen
     of Algo.Lzo:
       var cap = srcLen * 3
-      outBuf = c_malloc(cap)
+      outBuf = ctx.api.malloc(ctx.api.ctx, cap)
       if outBuf == nil: return -1
       var lzoLen = cap
       if ctx.lzo1xDecompress(pkt, srcLen, outBuf, addr lzoLen, nil) != 0:
-        c_free(outBuf)
+        ctx.api.free(ctx.api.ctx, outBuf)
         traceWrite(ctx[], "[compress node=%d] lzo decompress failed\n", ctx.node_id)
         return -1
       outLen = lzoLen
     of Algo.Lzma:
       var cap = srcLen * 3
-      outBuf = c_malloc(cap)
+      outBuf = ctx.api.malloc(ctx.api.ctx, cap)
       if outBuf == nil: return -1
       var outPos: csize_t = 0
       var srcPos: csize_t = 0
       var memlimit: uint64 = 0xFFFF_FFFF_FFFF_FFFF'u64
       let lzmaRet = ctx.lzmaStreamBufferDecode(addr memlimit, 0, nil, pkt, addr srcPos, srcLen, outBuf, addr outPos, cap)
       if lzmaRet != 0:
-        c_free(outBuf)
+        ctx.api.free(ctx.api.ctx, outBuf)
         traceWrite(ctx[], "[compress node=%d] lzma decompress failed ret=%d\n", ctx.node_id, lzmaRet)
         return -1
       outLen = outPos
   if outLen == 0 or outLen > 0x7FFFFFFF:
-    if outBuf != nil: c_free(outBuf)
+    if outBuf != nil: ctx.api.free(ctx.api.ctx, outBuf)
     traceWrite(ctx[], "[compress node=%d] bad output len=%zu\n", ctx.node_id, outLen)
     return -1
   if ctx.trace:
@@ -326,6 +328,7 @@ proc process(ctxPtr: pointer, dir: cint, triggerIdx: cint, data: pointer, len: c
         of Algo.Lzo: "lzo"
         of Algo.Lzma: "lzma"),
       srcLen.cint, outLen.cint, ratio)
+  ctx.api.free(ctx.api.ctx, data)
   let wr = ctx.api.write_packet(ctx.api.ctx, writeDst, outBuf, outLen)
   return wr
 

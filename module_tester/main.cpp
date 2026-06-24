@@ -151,8 +151,8 @@ int main(int argc, char *argv[]) {
     cfg_b.valid = true;
     auto chain_b = std::make_shared<Chain>(cfg_b, &kapi_b, &pool, guard_b);
 
-    // Generate random test data (malloc'd — push_packet takes ownership)
-    uint8_t *test_data = (uint8_t *)malloc(data_size);
+    // Generate random test data (chain-alloc'd — push_packet takes ownership)
+    uint8_t *test_data = (uint8_t *)chain_a->alloc_buffer(data_size);
     std::vector<uint8_t> original(data_size);
     std::mt19937 rng(42);
     for (size_t i = 0; i < data_size; i++) {
@@ -165,7 +165,7 @@ int main(int argc, char *argv[]) {
         const int PUMP_MS = 50;
         const int TIMEOUT_MS = 30000;
         auto start = std::chrono::steady_clock::now();
-        while (ch->get_max_dir_bytes(0) + ch->get_max_dir_bytes(1) > 0) {
+        while (ch->get_bytes_allocated() > 0) {
             ch->check_module_heartbeats(PUMP_MS);
             auto elapsed = std::chrono::duration_cast<std::chrono::milliseconds>(
                 std::chrono::steady_clock::now() - start).count();
@@ -197,8 +197,8 @@ int main(int argc, char *argv[]) {
     fprintf(stderr, "\n");
 
     // Decode: push through chain B (dir=1=merge, trigger_idx=1)
-    // Must malloc for push_packet ownership
-    uint8_t *chain_a_out = (uint8_t *)malloc(tk_a.captured.size());
+    // Must alloc_buffer for push_packet ownership
+    uint8_t *chain_a_out = (uint8_t *)chain_b->alloc_buffer(tk_a.captured.size());
     memcpy(chain_a_out, tk_a.captured.data(), tk_a.captured.size());
     chain_b->push_packet(chain_a_out, tk_a.captured.size(), 1, 1);
     pump_drain(chain_b);

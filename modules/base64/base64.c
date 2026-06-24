@@ -32,7 +32,7 @@ int process(void *ctx_ptr, int dir, int trigger_idx, const uint8_t *data, size_t
 
     if (dir == 0) {
         size_t elen = (len + 2) / 3 * 4;
-        char *wbuf = (char *)malloc(elen);
+        char *wbuf = (char *)ctx->api->malloc(ctx->api->ctx, elen);
         if (!wbuf) return -1;
 
         size_t outlen;
@@ -40,17 +40,19 @@ int process(void *ctx_ptr, int dir, int trigger_idx, const uint8_t *data, size_t
 
         if (ctx->trace)
             fprintf(stderr, "[base64 node=%d fw] sz=%zu -> out=%zu\n", ctx->node_id, len, outlen);
+        ctx->api->free(ctx->api->ctx, (void*)data);
         ret = ctx->api->write_packet(ctx->api->ctx, write_dst, (const uint8_t *)wbuf, outlen);
     } else {
         size_t outlen;
-        uint8_t *buf = (uint8_t *)malloc(len);
+        uint8_t *buf = (uint8_t *)ctx->api->malloc(ctx->api->ctx, len);
         if (!buf) return -1;
         memcpy(buf, data, len);
         int ok = base64_decode((const char *)buf, len, (char *)buf, &outlen, 0);
-        if (!ok) { free(buf); return -1; }
+        if (!ok) { ctx->api->free(ctx->api->ctx, buf); return -1; }
 
         if (ctx->trace)
             fprintf(stderr, "[base64 node=%d rv] sz=%zu -> out=%zu\n", ctx->node_id, len, outlen);
+        ctx->api->free(ctx->api->ctx, (void*)data);
         ret = ctx->api->write_packet(ctx->api->ctx, write_dst, buf, outlen);
     }
 

@@ -88,8 +88,9 @@ static int process_split(SplitContext *ctx, int trigger_idx, const uint8_t *data
         uint32_t hdr_val = encode_hdr(ctx->pkt_seq, more, ctx->chunk_idx);
 
         int out_idx = 1 + (int)(ctx->rr_idx % (uint32_t)ctx->num_outputs);
-        uint8_t *out_buf = (uint8_t *)std::malloc((size_t)(chunk_len + HEADER_SIZE));
+        uint8_t *out_buf = (uint8_t *)ctx->api->malloc(ctx->api->ctx, (size_t)(chunk_len + HEADER_SIZE));
         if (!out_buf) {
+            ctx->api->free(ctx->api->ctx, (void*)data);
             return 0;
         }
         out_buf[0] = (uint8_t)(hdr_val & 0xFF);
@@ -116,6 +117,7 @@ static int process_split(SplitContext *ctx, int trigger_idx, const uint8_t *data
     ctx->pkt_seq++;
     ctx->chunk_idx = 0;
 
+    ctx->api->free(ctx->api->ctx, (void*)data);
     return 0;
 }
 
@@ -125,7 +127,10 @@ static int process_merge(SplitContext *ctx, int trigger_idx, const uint8_t *data
         return 0;
     }
 
-    if (len < HEADER_SIZE) return 0;
+    if (len < HEADER_SIZE) {
+        ctx->api->free(ctx->api->ctx, (void*)data);
+        return 0;
+    }
     uint32_t hdr = (uint32_t)data[0]
                  | ((uint32_t)data[1] << 8)
                  | ((uint32_t)data[2] << 16)
@@ -153,6 +158,7 @@ static int process_merge(SplitContext *ctx, int trigger_idx, const uint8_t *data
             std::fprintf(stderr, "[MERGE] ORPHAN pkt=%u (wire=%u) chunk=%u (exp_pkt=%u) — LOST!\n",
                     pkt_full, wire_id, chunk_id, ctx->exp_pkt);
         ctx->chunks_lost++;
+        ctx->api->free(ctx->api->ctx, (void*)data);
         return 0;
     }
 
@@ -160,12 +166,12 @@ static int process_merge(SplitContext *ctx, int trigger_idx, const uint8_t *data
 
     auto it = ctx->pending.find(key);
     if (it != ctx->pending.end()) {
-        std::free(it->second.data);
+        ctx->api->free(ctx->api->ctx, it->second.data);
         ctx->pending.erase(it);
     }
 
     SlotEntry &se = ctx->pending[key];
-    se.data = (uint8_t *)std::malloc((size_t)payload_len);
+    se.data = (uint8_t *)ctx->api->malloc(ctx->api->ctx, (size_t)payload_len);
     std::memcpy(se.data, payload, (size_t)payload_len);
     se.size = (uint32_t)payload_len;
     se.more = more;
@@ -190,13 +196,13 @@ static int process_merge(SplitContext *ctx, int trigger_idx, const uint8_t *data
             if (ctx->trace) std::fprintf(stderr, "[MERGE] FLUSH pkt=%u chunks=0..%u size=%zu\n",
                     ctx->exp_pkt, ctx->exp_chunk, total);
 
-            uint8_t *out_buf = (uint8_t *)std::malloc(total);
+            uint8_t *out_buf = (uint8_t *)ctx->api->malloc(ctx->api->ctx, total);
             if (out_buf) {
                 size_t off = 0;
                 for (auto ki = ctx->pending.lower_bound(start_key); ki != ctx->pending.end() && ki->first <= end_key; ) {
                     std::memcpy(out_buf + off, ki->second.data, ki->second.size);
                     off += ki->second.size;
-                    std::free(ki->second.data);
+                    ctx->api->free(ctx->api->ctx, ki->second.data);
                     ki = ctx->pending.erase(ki);
                 }
                 ctx->api->write_packet(ctx->api->ctx, write_output, out_buf, total);
@@ -214,6 +220,7 @@ static int process_merge(SplitContext *ctx, int trigger_idx, const uint8_t *data
         ctx->exp_chunk++;
     }
 
+    ctx->api->free(ctx->api->ctx, (void*)data);
     return 0;
 }
 
@@ -279,8 +286,9 @@ int process(void *ctx_ptr, int dir, int trigger_idx, const uint8_t *data, size_t
     SplitContext *ctx = (SplitContext *)ctx_ptr;
     if (dir == 0)
         return process_split(ctx, trigger_idx, data, len);
-    else
+    else {
         return process_merge(ctx, trigger_idx, data, len);
+    }
 }
 
 const char *moduleversion(void) {

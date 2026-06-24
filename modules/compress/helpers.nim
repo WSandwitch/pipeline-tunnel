@@ -8,6 +8,8 @@ type
     write_packet*: proc(ctx: pointer, output_id: cint, data: pointer, len: csize_t): cint {.cdecl.}
     request_heartbeat*: proc(ctx: pointer, interval_sec: cint): cint {.cdecl.}
     set_src*: proc(ctx: pointer, src_idx: cint) {.cdecl.}
+    malloc*: proc(ctx: pointer, size: csize_t): pointer {.cdecl.}
+    free*: proc(ctx: pointer, p: pointer) {.cdecl.}
 
 const
   RTLD_NOW* = 2

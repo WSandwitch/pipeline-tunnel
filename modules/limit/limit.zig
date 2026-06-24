@@ -12,9 +12,9 @@ const ModuleChain = extern struct {
     write_packet: *const fn (*anyopaque, c_int, [*]const u8, usize) callconv(.c) c_int,
     request_heartbeat: *const fn (*anyopaque, c_int) callconv(.c) c_int,
     set_src: *const fn (*anyopaque, c_int) callconv(.c) void,
+    malloc: *const fn (*anyopaque, usize) callconv(.c) ?*anyopaque,
+    free: *const fn (*anyopaque, ?*anyopaque) callconv(.c) void,
 };
-
-extern fn free(ptr: ?*anyopaque) void;
 
 fn now_ns() i128 {
     var ts: std.os.linux.timespec = undefined;
@@ -191,14 +191,12 @@ export fn process(ctx_ptr: ?*anyopaque, dir: c_int, trigger_idx: c_int, data: [*
         if (ctx.trace) {
             std.debug.print("[limit node={d}] DROP dir={d} len={d} pending={d}\n", .{ ctx.node_id, dir, len, ctx.pending[udir].items.len });
         }
-        const p_free: [*]u8 = @constCast(data);
-        free(@as(?*anyopaque, @ptrCast(p_free)));
+        ctx.api.free(ctx.api.ctx, @constCast(data));
         return 0;
     }
 
     ctx.pending[udir].append(.{ .data = @constCast(data), .len = len, .src_idx = src_idx }) catch {
-        const p_free2: [*]u8 = @constCast(data);
-        free(@as(?*anyopaque, @ptrCast(p_free2)));
+        ctx.api.free(ctx.api.ctx, @constCast(data));
         return 0;
     };
 

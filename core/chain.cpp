@@ -2,6 +2,7 @@
 #include "thread_pool.h"
 #include "common/logger.h"
 #include "common/utils.h"
+#include <cstdlib>
 #include <deque>
 
 Chain::Chain(const ChainConfig &cfg, KernelAPI *kapi,
@@ -28,6 +29,8 @@ Chain::Chain(const ChainConfig &cfg, KernelAPI *kapi,
         mod->api.write_packet = &Chain::write_packet_static;
         mod->api.request_heartbeat = &Chain::request_heartbeat_static;
         mod->api.set_src = &Chain::set_src_static;
+        mod->api.malloc = &Chain::malloc_static;
+        mod->api.free = &Chain::free_static;
 
         mod->ctx = base->init_fn(&mod->api, spec.params.c_str());
         if (!mod->ctx) {
@@ -115,20 +118,39 @@ Chain::~Chain() {
 
 thread_local int g_ctx_src_idx = 0;
 
+void *Chain::alloc_buffer_impl(size_t size) {
+    uint8_t *buf = (uint8_t*)std::malloc(sizeof(size_t) + size);
+    if (!buf) return nullptr;
+    *(size_t*)buf = size;
+    _bytes_allocated.fetch_add((int64_t)size);
+    check_backpressure();
+    return buf + sizeof(size_t);
+}
+
+void Chain::free_buffer_impl(void *ptr) {
+    if (!ptr) return;
+    uint8_t *real = (uint8_t*)ptr - sizeof(size_t);
+    size_t size = *(size_t*)real;
+    _bytes_allocated.fetch_sub((int64_t)size);
+    check_backpressure();
+    std::free(real);
+}
+
+void *Chain::alloc_buffer(size_t size) { return alloc_buffer_impl(size); }
+void Chain::free_buffer(void *ptr) { free_buffer_impl(ptr); }
+
 void Chain::push_packet(const uint8_t *data, size_t len, int src_idx, int dir) {
     if (_cancelled.load()) {
-        free(const_cast<uint8_t*>(data));
+        free_buffer(const_cast<uint8_t*>(data));
         return;
     }
     if (!_entry_ext) {
-        if (dir == 0)
-            _kapi->wire_write(_kapi->ctx, 1, data, len);
-        else
-            _kapi->wire_write(_kapi->ctx, 0, data, len);
+        _kapi->wire_write(_kapi->ctx, dir == 0 ? 1 : 0, data, len);
+        free_buffer(const_cast<uint8_t*>(data));
         return;
     }
     if (!_owner.lock()) {
-        free(const_cast<uint8_t*>(data));
+        free_buffer(const_cast<uint8_t*>(data));
         return;
     }
 
@@ -139,13 +161,11 @@ void Chain::push_packet(const uint8_t *data, size_t len, int src_idx, int dir) {
         if (src_idx < 0 || (size_t)src_idx >= _wire_entries.size()) {
             log_error("chain: src_idx=%d out of range (%zu entries)",
                       src_idx, _wire_entries.size());
-            free(const_cast<uint8_t*>(data));
+            free_buffer(const_cast<uint8_t*>(data));
             abort();
         }
         first = _wire_entries[src_idx];
     }
-    _inflight_bytes[dir].fetch_add(len);
-    check_backpressure(dir);
     enqueue_module(first, data, len, src_idx, dir);
 }
 
@@ -153,7 +173,7 @@ void Chain::enqueue_module(Module *mod, const uint8_t *data, size_t len,
                            int src_idx, int dir) {
     auto owner = _owner.lock();
     if (!owner) {
-        free(const_cast<uint8_t*>(data));
+        free_buffer(const_cast<uint8_t*>(data));
         return;
     }
 
@@ -165,9 +185,7 @@ void Chain::enqueue_module(Module *mod, const uint8_t *data, size_t len,
 
         if (_cancelled.load()) {
             nogap_mutex_[dir].unlock();
-            _inflight_bytes[dir].fetch_sub(len);
-            check_backpressure(dir);
-            free(const_cast<uint8_t*>(data));
+            free_buffer(const_cast<uint8_t*>(data));
             task_done();
             return;
         }
@@ -188,10 +206,7 @@ void Chain::enqueue_module(Module *mod, const uint8_t *data, size_t len,
         TRACE("CHAIN WRITE_PACKET_IMPL done dir=%d ret=%d", dir, ret);
 
         if (ret < 0) {
-            // balance the inflight_bytes added in push_packet — error, data won't
-            // reach wire_write
-            _inflight_bytes[dir].fetch_sub(len);
-            check_backpressure(dir);
+            free_buffer(const_cast<uint8_t*>(data));
             task_done();
             return;
         }
@@ -211,18 +226,20 @@ void Chain::task_done() {
     }
 }
 
-void Chain::check_backpressure(int dir) {
-    uint64_t bytes = _inflight_bytes[dir].load();
-
-    if (bytes > BACKPRESSURE_HIGH && !_backpressure_paused[dir].load()) {
-        _backpressure_paused[dir].store(true);
-        TRACE("CHAIN BP PAUSE dir=%d bytes=%zu inflight=%d", dir, (size_t)bytes, _inflight.load());
-        if (_pause_cb[dir]) _pause_cb[dir](true);
-    }
-    if (bytes <= BACKPRESSURE_LOW && _backpressure_paused[dir].load()) {
-        _backpressure_paused[dir].store(false);
-        TRACE("CHAIN BP RESUME dir=%d bytes=%zu inflight=%d", dir, (size_t)bytes, _inflight.load());
-        if (_pause_cb[dir]) _pause_cb[dir](false);
+void Chain::check_backpressure() {
+    int64_t bytes = _bytes_allocated.load();
+    for (int dir = 0; dir < 2; dir++) {
+        bool was_paused = _backpressure_paused[dir].load();
+        if (bytes > BACKPRESSURE_HIGH && !was_paused) {
+            _backpressure_paused[dir].store(true);
+            TRACE("CHAIN BP PAUSE dir=%d bytes=%ld inflight=%d", dir, (long)bytes, _inflight.load());
+            if (_pause_cb[dir]) _pause_cb[dir](true);
+        }
+        if (bytes <= BACKPRESSURE_LOW && was_paused) {
+            _backpressure_paused[dir].store(false);
+            TRACE("CHAIN BP RESUME dir=%d bytes=%ld inflight=%d", dir, (long)bytes, _inflight.load());
+            if (_pause_cb[dir]) _pause_cb[dir](false);
+        }
     }
 }
 
@@ -232,7 +249,6 @@ void Chain::wait_drain() {
 }
 
 int Chain::total_extra_outputs() const {
-    // _wire_entries[0] = nullptr (unused), [1] = primary wire module, [2+] = extra split outputs
     if (_wire_entries.size() < 2) return 0;
     return (int)(_wire_entries.size() - 2);
 }
@@ -262,6 +278,16 @@ int Chain::get_output_fd_static(void *chain_ctx, int idx) {
 int Chain::request_heartbeat_static(void *chain_ctx, int interval_sec) {
     auto *mod = (Module *)chain_ctx;
     return mod->chain->request_heartbeat_impl(mod, interval_sec);
+}
+
+void *Chain::malloc_static(void *chain_ctx, size_t size) {
+    auto *mod = (Module *)chain_ctx;
+    return mod->chain->alloc_buffer_impl(size);
+}
+
+void Chain::free_static(void *chain_ctx, void *ptr) {
+    auto *mod = (Module *)chain_ctx;
+    mod->chain->free_buffer_impl(ptr);
 }
 
 // --- implementation ---
@@ -322,14 +348,13 @@ void Chain::check_module_heartbeats(int system_interval_ms) {
 }
 
 int Chain::write_packet_impl(Module *mod, int dst, const uint8_t *data, size_t len) {
-    // dst=0 → ext side (dir=1), dst≠0 → wire side (dir=0)
     int dir = (dst == 0) ? 1 : 0;
     if (dst >= 0 && (size_t)dst < mod->near.size() && mod->near[dst]) {
         enqueue_module(mod->near[dst], data, len, g_ctx_src_idx, dir);
         return 0;
     }
-    // Exit chain: inflight bytes leave the pipeline
-    _inflight_bytes[dir].fetch_sub(len);
-    check_backpressure(dir);
-    return _kapi->wire_write(_kapi->ctx, dst == 0 ? 0 : mod->wire_dst, data, len);
+    // Exit chain: data leaves the pipeline
+    int ret = _kapi->wire_write(_kapi->ctx, dst == 0 ? 0 : mod->wire_dst, data, len);
+    free_buffer(const_cast<uint8_t*>(data));
+    return ret;
 }

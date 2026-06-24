@@ -47,7 +47,8 @@ Kernel::~Kernel() {
 void Kernel::wakeup() {
     if (wake_fd_ >= 0) {
         uint64_t val = 1;
-        ::write(wake_fd_, &val, sizeof(val));
+        ssize_t r = ::write(wake_fd_, &val, sizeof(val));
+        (void)r;
     }
 }
 

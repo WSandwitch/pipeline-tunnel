@@ -283,7 +283,7 @@ void Client::dispatch_data_conn_packet(const uint8_t *payload, size_t len, int s
                   payload[0], pending_data_frames_.size());
         return;
     }
-    uint8_t *blob = (uint8_t*)malloc(len);
+    uint8_t *blob = (uint8_t*)chain_->alloc_buffer(1 + len);
     if (!blob) { log_error("client: dispatch OOM"); return; }
     memcpy(blob, payload, len);
     chain_->push_packet(blob, len, src_idx, 1);
@@ -474,7 +474,7 @@ void Client::on_listener_accept(int cfd, const struct sockaddr_in &addr) {
 
 void Client::on_external_recv(uint8_t conn_id, const uint8_t *data, size_t len) {
     if (state_ < RUNNING) return;
-    uint8_t *blob = (uint8_t*)malloc(1 + len);
+    uint8_t *blob = (uint8_t*)chain_->alloc_buffer(1 + len);
     if (!blob) { log_error("client: on_external_recv OOM"); return; }
     blob[0] = conn_id;
     memcpy(blob + 1, data, len);
@@ -643,18 +643,15 @@ void Client::handle_auth2_challenge(const Packet &pkt) {
         log_debug("client: wire_write dst=%d len=%zu data[0]=%u", dst, len, len>0?data[0]:0);
         if (dst == 0) {
         if (len < 1) {
-            free(const_cast<uint8_t*>(data));
             return 0;
         }
         if (data[0] == 255) {
             if (len < 3 || data[1] != CHAIN_CTRL_DISCONNECT) {
                 log_error("client: wire_write dst=0 unknown chain ctrl type=%u",
                           len>=2?data[1]:0);
-                free(const_cast<uint8_t*>(data));
                 return 0;
             }
             uint8_t conn_id = data[2];
-            free(const_cast<uint8_t*>(data));
             std::lock_guard<std::mutex> lock(self->data_mtx_);
             self->pending_io_.push_back([self, conn_id]() {
                 log_info("client: chain ctrl disconnect conn_id=%u", conn_id);
@@ -678,7 +675,6 @@ void Client::handle_auth2_challenge(const Packet &pkt) {
                 auto it = self->conns_.find(conn_id);
                 if (it == self->conns_.end() || it->second.disconnecting || it->second.fd < 0) {
                     log_error("client: wire_write dst=0 conn_id=%u not found", conn_id);
-                    free(const_cast<uint8_t*>(data));
                     return 0;
                 }
                 ext_fd = it->second.fd;
@@ -713,14 +709,12 @@ void Client::handle_auth2_challenge(const Packet &pkt) {
                 }
             }
             self->kernel_->wakeup();
-            free(const_cast<uint8_t*>(data));
             return 0;
         }
         // dst >= 1: forward to correct wire connection with varint+type=0
         if (dst < 1 || (size_t)dst > self->data_connections_.size() ||
             self->data_connections_[dst-1].fd < 0) {
             log_error("client: wire_write dst=%d no data connection", dst);
-            free(const_cast<uint8_t*>(data));
             return 0;
         }
         int fd = self->data_connections_[dst-1].fd;
@@ -774,7 +768,6 @@ void Client::handle_auth2_challenge(const Packet &pkt) {
             });
             self->kernel_->wakeup();
         }
-        free(const_cast<uint8_t*>(data));
         return 0;
     };
 
@@ -1000,7 +993,7 @@ void Client::handle_transmit_ready(const Packet &pkt) {
             for (auto &frame : pending_data_frames_) {
                 auto &buf = frame.first;
                 int src_idx = frame.second;
-                uint8_t *blob = (uint8_t*)malloc(buf.size());
+                uint8_t *blob = (uint8_t*)chain_->alloc_buffer(buf.size());
                 if (blob) {
                     memcpy(blob, buf.data(), buf.size());
                     chain_->push_packet(blob, buf.size(), src_idx, 1);
@@ -1221,7 +1214,7 @@ void Client::handle_connect_ok(const Packet &pkt) {
         TRACE("CLI EXT EV cid=%u fd=%d events=0x%x", conn_id, fd, events);
         if (events & EPOLLIN) {
             if (chain_ && chain_->is_backpressure_paused(0)) return;
-            uint8_t *buf = (uint8_t*)malloc(MAX_PACKET_SIZE);
+                uint8_t *buf = (uint8_t*)chain_->alloc_buffer(MAX_PACKET_SIZE);
             if (!buf) { log_error("client: OOM in ext handler"); return; }
             ssize_t n = read(fd, buf + 1, MAX_PACKET_SIZE - 1);
             TRACE("CLI EXT READ cid=%u n=%zd errno=%d", conn_id, n, n < 0 ? errno : 0);
@@ -1236,14 +1229,14 @@ void Client::handle_connect_ok(const Packet &pkt) {
                 buf[0] = conn_id;
                 chain_->push_packet(buf, (size_t)n + 1, 0, 0);
             } else {
-                free(buf);
+                chain_->free_buffer(buf);
             }
             if (n == 0) {
                 auto it = conns_.find(conn_id);
                 if (it != conns_.end())
                     it->second.shutting_down_wr = true;
                 if (chain_) {
-                    uint8_t *ctrl = (uint8_t*)malloc(3);
+                    uint8_t *ctrl = (uint8_t*)chain_->alloc_buffer(3);
                     ctrl[0] = 255;
                     ctrl[1] = CHAIN_CTRL_SHUTDOWN_WR;
                     ctrl[2] = conn_id;
@@ -1326,11 +1319,9 @@ void Client::process_pending_io() {
     { static int ppi_cnt = 0; ppi_cnt++; TRACE("CLI PPI tick %d", ppi_cnt); }
     { static int stats_cnt = 0; stats_cnt++;     if (chain_) {
         int infl = chain_ ? chain_->get_inflight() : -1;
-        TRACE("CLI STATS: bp0=%d bp1=%d maxdb0=%lu maxdb1=%lu inf=%d dc0=%zu dc1=%zu",
+        TRACE("CLI STATS: bp0=%d bp1=%d inf=%d dc0=%zu dc1=%zu",
               chain_->is_backpressure_paused(0),
               chain_->is_backpressure_paused(1),
-              (unsigned long)chain_->get_max_dir_bytes(0),
-              (unsigned long)chain_->get_max_dir_bytes(1),
               infl,
               data_connections_.size()>0?data_connections_[0].writer.size():0,
               data_connections_.size()>1?data_connections_[1].writer.size():0);
