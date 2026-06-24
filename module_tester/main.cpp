@@ -5,6 +5,7 @@
 #include <string>
 #include <memory>
 #include <random>
+#include <chrono>
 #include <unistd.h>
 
 #include "core/chain.h"
@@ -160,9 +161,26 @@ int main(int argc, char *argv[]) {
         original[i] = v;
     }
 
+    auto pump_drain = [](std::shared_ptr<Chain> ch) {
+        const int PUMP_MS = 50;
+        const int TIMEOUT_MS = 30000;
+        auto start = std::chrono::steady_clock::now();
+        while (ch->get_max_dir_bytes(0) + ch->get_max_dir_bytes(1) > 0) {
+            ch->check_module_heartbeats(PUMP_MS);
+            auto elapsed = std::chrono::duration_cast<std::chrono::milliseconds>(
+                std::chrono::steady_clock::now() - start).count();
+            if (elapsed > TIMEOUT_MS) {
+                fprintf(stderr, "[tester] TIMEOUT waiting for drain (%dms)\n", TIMEOUT_MS);
+                break;
+            }
+            usleep(PUMP_MS * 1000);
+        }
+        ch->wait_drain();
+    };
+
     // Encode: push through chain A (dir=0=split, trigger_idx=0)
     chain_a->push_packet(test_data, data_size, 0, 0);
-    chain_a->wait_drain();
+    pump_drain(chain_a);
 
     if (tk_a.captured.empty()) {
         fprintf(stderr, "FAIL: chain A produced no output\n");
@@ -183,7 +201,7 @@ int main(int argc, char *argv[]) {
     uint8_t *chain_a_out = (uint8_t *)malloc(tk_a.captured.size());
     memcpy(chain_a_out, tk_a.captured.data(), tk_a.captured.size());
     chain_b->push_packet(chain_a_out, tk_a.captured.size(), 1, 1);
-    chain_b->wait_drain();
+    pump_drain(chain_b);
 
     fprintf(stderr, "[tester] chain B output: %zu bytes\n", tk_b.captured.size());
     fprintf(stderr, "[tester] decoded hex: ");
