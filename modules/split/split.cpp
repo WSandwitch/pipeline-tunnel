@@ -62,15 +62,15 @@ static uint32_t encode_hdr(uint32_t pkt_id, uint16_t more, uint16_t chunk_id) {
          | ((uint32_t)chunk_id << 16);
 }
 
-static int process_split(SplitContext *ctx, int trigger_idx) {
-    int sz = 0;
-    uint8_t *in_buf = (uint8_t *)ctx->api->get_packet(ctx->api->ctx, 0, &sz);
-    if (!in_buf || sz <= 0) {
-        if (ctx->trace) std::fprintf(stderr, "[SPLIT] dir=0 IN sz=%d trigger=%d pkt=%u chunk=%u outputs=%d\n", sz, trigger_idx, ctx->pkt_seq, ctx->chunk_idx, ctx->num_outputs);
+static int process_split(SplitContext *ctx, int trigger_idx, const uint8_t *data, size_t len) {
+    if (!data || len <= 0) {
+        if (ctx->trace) std::fprintf(stderr, "[SPLIT] dir=0 IN sz=%zu trigger=%d pkt=%u chunk=%u outputs=%d\n", len, trigger_idx, ctx->pkt_seq, ctx->chunk_idx, ctx->num_outputs);
         return 0;
     }
 
-    if (ctx->trace) std::fprintf(stderr, "[SPLIT] dir=0 IN sz=%d trigger=%d pkt=%u chunk=%u outputs=%d\n", sz, trigger_idx, ctx->pkt_seq, ctx->chunk_idx, ctx->num_outputs);
+    if (ctx->trace) std::fprintf(stderr, "[SPLIT] dir=0 IN sz=%zu trigger=%d pkt=%u chunk=%u outputs=%d\n", len, trigger_idx, ctx->pkt_seq, ctx->chunk_idx, ctx->num_outputs);
+    int sz = (int)len;
+    const uint8_t *in_buf = data;
     int offset = 0;
     int chunks = 0;
 
@@ -90,7 +90,6 @@ static int process_split(SplitContext *ctx, int trigger_idx) {
         int out_idx = 1 + (int)(ctx->rr_idx % (uint32_t)ctx->num_outputs);
         uint8_t *out_buf = (uint8_t *)std::malloc((size_t)(chunk_len + HEADER_SIZE));
         if (!out_buf) {
-            std::free(in_buf);
             return 0;
         }
         out_buf[0] = (uint8_t)(hdr_val & 0xFF);
@@ -117,23 +116,20 @@ static int process_split(SplitContext *ctx, int trigger_idx) {
     ctx->pkt_seq++;
     ctx->chunk_idx = 0;
 
-    std::free(in_buf);
     return 0;
 }
 
-static int process_merge(SplitContext *ctx, int trigger_idx) {
-    int sz = 0;
-    uint8_t *buf = (uint8_t *)ctx->api->get_packet(ctx->api->ctx, 0, &sz);
-    if (!buf || sz <= 0) {
-        if (ctx->trace) std::fprintf(stderr, "[MERGE] dir=1 IN sz=%d trigger=%d exp_pkt=%u exp_chunk=%u\n", sz, trigger_idx, ctx->exp_pkt, ctx->exp_chunk);
+static int process_merge(SplitContext *ctx, int trigger_idx, const uint8_t *data, size_t len) {
+    if (!data || len <= 0) {
+        if (ctx->trace) std::fprintf(stderr, "[MERGE] dir=1 IN sz=%zu trigger=%d exp_pkt=%u exp_chunk=%u\n", len, trigger_idx, ctx->exp_pkt, ctx->exp_chunk);
         return 0;
     }
 
-    if (sz < HEADER_SIZE) { std::free(buf); return 0; }
-    uint32_t hdr = (uint32_t)buf[0]
-                 | ((uint32_t)buf[1] << 8)
-                 | ((uint32_t)buf[2] << 16)
-                 | ((uint32_t)buf[3] << 24);
+    if (len < HEADER_SIZE) return 0;
+    uint32_t hdr = (uint32_t)data[0]
+                 | ((uint32_t)data[1] << 8)
+                 | ((uint32_t)data[2] << 16)
+                 | ((uint32_t)data[3] << 24);
     uint16_t wire_id = (uint16_t)(hdr & 0x7FFF);
     uint16_t more = (uint16_t)((hdr >> 15) & 1);
     uint16_t chunk_id = (uint16_t)((hdr >> 16) & 0xFFFF);
@@ -145,11 +141,11 @@ static int process_merge(SplitContext *ctx, int trigger_idx) {
     else if (pkt_full >= ctx->exp_pkt + 16384)
         pkt_full -= 32768;
 
-    uint8_t *data = buf + HEADER_SIZE;
-    int data_len = sz - HEADER_SIZE;
+    const uint8_t *payload = data + HEADER_SIZE;
+    int payload_len = (int)(len - HEADER_SIZE);
 
     if (ctx->trace) std::fprintf(stderr, "[MERGE] RECV pkt=%u (wire=%u) chunk=%u more=%d len=%d trigger=%d exp_pkt=%u exp_chunk=%u\n",
-                pkt_full, wire_id, chunk_id, more, data_len, trigger_idx, ctx->exp_pkt, ctx->exp_chunk);
+                pkt_full, wire_id, chunk_id, more, payload_len, trigger_idx, ctx->exp_pkt, ctx->exp_chunk);
 
     // Detect orphan: chunk belongs to a packet before exp_pkt (will never be flushed)
     if (pkt_full < ctx->exp_pkt) {
@@ -157,7 +153,6 @@ static int process_merge(SplitContext *ctx, int trigger_idx) {
             std::fprintf(stderr, "[MERGE] ORPHAN pkt=%u (wire=%u) chunk=%u (exp_pkt=%u) — LOST!\n",
                     pkt_full, wire_id, chunk_id, ctx->exp_pkt);
         ctx->chunks_lost++;
-        std::free(buf);
         return 0;
     }
 
@@ -170,13 +165,12 @@ static int process_merge(SplitContext *ctx, int trigger_idx) {
     }
 
     SlotEntry &se = ctx->pending[key];
-    se.data = (uint8_t *)std::malloc((size_t)data_len);
-    std::memcpy(se.data, data, (size_t)data_len);
-    se.size = (uint32_t)data_len;
+    se.data = (uint8_t *)std::malloc((size_t)payload_len);
+    std::memcpy(se.data, payload, (size_t)payload_len);
+    se.size = (uint32_t)payload_len;
     se.more = more;
 
     ctx->chunks_received++;
-    std::free(buf);
 
     int write_output = 0;
 
@@ -281,12 +275,12 @@ void *init(ModuleChain *api, const char *config) {
     return ctx;
 }
 
-int process(void *ctx_ptr, int dir, int trigger_idx) {
+int process(void *ctx_ptr, int dir, int trigger_idx, const uint8_t *data, size_t len) {
     SplitContext *ctx = (SplitContext *)ctx_ptr;
     if (dir == 0)
-        return process_split(ctx, trigger_idx);
+        return process_split(ctx, trigger_idx, data, len);
     else
-        return process_merge(ctx, trigger_idx);
+        return process_merge(ctx, trigger_idx, data, len);
 }
 
 const char *moduleversion(void) {

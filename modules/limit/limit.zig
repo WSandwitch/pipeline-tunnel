@@ -5,9 +5,9 @@ const ModuleChain = extern struct {
     request_outputs: *const fn (*anyopaque, c_int) callconv(.c) c_int,
     get_output_fd: *const fn (*anyopaque, c_int) callconv(.c) c_int,
     get_node_id: *const fn (*anyopaque) callconv(.c) c_int,
-    get_packet: *const fn (*anyopaque, c_int, *c_int) callconv(.c) ?*anyopaque,
     write_packet: *const fn (*anyopaque, c_int, [*]const u8, usize) callconv(.c) c_int,
     request_heartbeat: *const fn (*anyopaque, c_int) callconv(.c) c_int,
+    set_src: *const fn (*anyopaque, c_int) callconv(.c) void,
 };
 
 fn now_ns() i128 {
@@ -129,7 +129,7 @@ export fn init(api: ?*ModuleChain, config: ?[*:0]const u8) callconv(.c) ?*anyopa
     return buf;
 }
 
-export fn process(ctx_ptr: ?*anyopaque, dir: c_int, trigger_idx: c_int) callconv(.c) c_int {
+export fn process(ctx_ptr: ?*anyopaque, dir: c_int, trigger_idx: c_int, data: [*]const u8, len: usize) callconv(.c) c_int {
     _ = trigger_idx;
     const ctx = @as(*LimitCtx, @ptrCast(@alignCast(ctx_ptr orelse return -1)));
 
@@ -139,19 +139,16 @@ export fn process(ctx_ptr: ?*anyopaque, dir: c_int, trigger_idx: c_int) callconv
     if (udir > 1) return 0;
     if (dir_bits[udir] & ctx.dir_mask == 0) return 0;
 
-    var sz: c_int = 0;
-    const data = ctx.api.get_packet(ctx.api.ctx, 0, &sz);
-    const bytes = @as(u64, @intCast(sz));
-    if (data == null or bytes == 0) return -1;
+    if (len == 0) return -1;
 
-    ctx.buckets[udir].consume(bytes);
+    ctx.buckets[udir].consume(len);
 
     if (ctx.trace) {
-        std.debug.print("[limit node={d} dir={d} sz={d}]\n", .{ ctx.node_id, dir, sz });
+        std.debug.print("[limit node={d} dir={d} sz={d}]\n", .{ ctx.node_id, dir, len });
     }
 
     const write_dst: c_int = if (dir == 0) 1 else 0;
-    return ctx.api.write_packet(ctx.api.ctx, write_dst, @as([*]const u8, @ptrCast(data)), bytes);
+    return ctx.api.write_packet(ctx.api.ctx, write_dst, data, len);
 }
 
 fn parse_suffix_int(s: []const u8, multiplier: u64) !u64 {

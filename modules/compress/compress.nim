@@ -71,18 +71,17 @@ proc init(api: ptr ModuleChain, config: cstring): pointer {.exportc, cdecl, dynl
         of Algo.Lzma: "lzma"), ctx.level)
   return ctx
 
-proc process(ctxPtr: pointer, dir: cint, triggerIdx: cint): cint {.exportc, cdecl, dynlib.} =
+proc process(ctxPtr: pointer, dir: cint, triggerIdx: cint, data: pointer, len: csize_t): cint {.exportc, cdecl, dynlib.} =
   if ctxPtr == nil: return -1
   let ctx = cast[ptr CompressCtx](ctxPtr)
   if dir < 0 or dir > 1: return 0
-  var sz: cint = 0
-  let pkt = ctx.api.get_packet(ctx.api.ctx, 0, addr sz)
-  if pkt == nil or sz <= 0: return -1
-  let srcLen = sz.csize_t
-  let writeDst: cint = if triggerIdx == 0: 1 else: 0
+  if data == nil or len <= 0: return -1
+  let pkt = cast[ptr byte](data)
+  let srcLen = len
+  let writeDst: cint = if dir == 0: 1 else: 0
   var outLen: csize_t = 0
   var outBuf: pointer = nil
-  if triggerIdx == 0:
+  if dir == 0:
     var maxOut: csize_t = 0
     case ctx.algo
     of Algo.Zstd:

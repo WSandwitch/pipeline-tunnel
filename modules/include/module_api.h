@@ -13,13 +13,13 @@ typedef struct {
     int (*request_outputs)(void *chain_ctx, int count);
     int (*get_output_fd)(void *chain_ctx, int idx);
     int (*get_node_id)(void *chain_ctx);
-    void *(*get_packet)(void *chain_ctx, int idx, int *out_size);
     int (*write_packet)(void *chain_ctx, int output_id, const uint8_t *data, size_t len);
     int (*request_heartbeat)(void *chain_ctx, int interval_sec);
+    void (*set_src)(void *chain_ctx, int src_idx);
 } ModuleChain;
 
 void *init(ModuleChain *chain_api, const char *config);
-int process(void *ctx, int dir, int trigger_idx);
+int process(void *ctx, int dir, int trigger_idx, const uint8_t *data, size_t len);
 const char *moduleversion(void);
 const char *modulename(void);
 const char *moduledesc(void);

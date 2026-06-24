@@ -36,14 +36,13 @@ public:
     void cancel() { _cancelled.store(true); }
     int total_extra_outputs() const;
 
-    static void *get_packet_static(void *chain_ctx, int idx, int *out_size);
     static int   write_packet_static(void *chain_ctx, int dst, const uint8_t *data, size_t len);
     static int   get_node_id_static(void *chain_ctx);
     static int   request_outputs_static(void *chain_ctx, int count);
     static int   get_output_fd_static(void *chain_ctx, int idx);
     static int   request_heartbeat_static(void *chain_ctx, int interval_sec);
+    static void  set_src_static(void *chain_ctx, int src_idx);
 
-    void *get_packet_impl(Module *mod, int idx, int *out_size);
     int   write_packet_impl(Module *mod, int dst, const uint8_t *data, size_t len);
     int   request_outputs_impl(Module *mod, int count);
     int   request_heartbeat_impl(Module *mod, int interval_sec);

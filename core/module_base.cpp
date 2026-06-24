@@ -31,7 +31,7 @@ void ModuleBase::load(const std::string &directory) {
         auto help_fn = (const char *(*)())dlsym(handle, "modulehelp");
         auto version_fn = (const char *(*)())dlsym(handle, "moduleversion");
         auto init_fn = (void *(*)(ModuleChain *, const char *))dlsym(handle, "init");
-        auto process_fn = (int (*)(void *, int, int))dlsym(handle, "process");
+        auto process_fn = (int (*)(void *, int, int, const uint8_t *, size_t))dlsym(handle, "process");
 
         if (!init_fn || !process_fn || !name_fn || !desc_fn || !help_fn || !version_fn) {
             log_error("module %s: missing required symbol", p.c_str());

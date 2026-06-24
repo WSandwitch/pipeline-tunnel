@@ -26,30 +26,26 @@ extern "C" void *builtin_copy_init(ModuleChain *api, const char *config) {
     return ctx;
 }
 
-extern "C" int builtin_copy_process(void *ctx_ptr, int dir, int trigger_idx) {
-    (void)dir;
+extern "C" int builtin_copy_process(void *ctx_ptr, int dir, int trigger_idx, const uint8_t *data, size_t len) {
     auto *ctx = (builtin_copy_ctx *)ctx_ptr;
 
-    int sz = 0;
-    uint8_t *pkt = (uint8_t *)ctx->api->get_packet(ctx->api->ctx, 0, &sz);
-    if (!pkt || sz <= 0) return -1;
+    if (!data || len <= 0) return -1;
 
     if (ctx->trace) {
-        fprintf(stderr, "[copy node=%d sz=%d trigger=%d] ", ctx->node_id, sz, trigger_idx);
-        size_t show = (size_t)sz < 64 ? (size_t)sz : 64;
-        for (size_t i = 0; i < show; i++) fprintf(stderr, "%02x", pkt[i]);
-        if ((size_t)sz > 64) fprintf(stderr, "...");
+        fprintf(stderr, "[copy node=%d sz=%zu trigger=%d] ", ctx->node_id, len, trigger_idx);
+        size_t show = len < 64 ? len : 64;
+        for (size_t i = 0; i < show; i++) fprintf(stderr, "%02x", data[i]);
+        if (len > 64) fprintf(stderr, "...");
         fprintf(stderr, "\n");
     }
     int write_dst = (dir == 0) ? 1 : 0;
     if (ctx->mode_copy) {
-        uint8_t *cp = (uint8_t *)malloc((size_t)sz);
-        if (!cp) { free(pkt); return -1; }
-        memcpy(cp, pkt, (size_t)sz);
-        free(pkt);
-        return ctx->api->write_packet(ctx->api->ctx, write_dst, cp, (size_t)sz);
+        uint8_t *cp = (uint8_t *)malloc(len);
+        if (!cp) return -1;
+        memcpy(cp, data, len);
+        return ctx->api->write_packet(ctx->api->ctx, write_dst, cp, len);
     } else {
-        return ctx->api->write_packet(ctx->api->ctx, write_dst, pkt, (size_t)sz);
+        return ctx->api->write_packet(ctx->api->ctx, write_dst, data, len);
     }
 }
 

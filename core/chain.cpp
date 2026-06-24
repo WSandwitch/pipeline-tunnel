@@ -25,9 +25,9 @@ Chain::Chain(const ChainConfig &cfg, KernelAPI *kapi,
         mod->api.request_outputs = &Chain::request_outputs_static;
         mod->api.get_output_fd = &Chain::get_output_fd_static;
         mod->api.get_node_id = &Chain::get_node_id_static;
-        mod->api.get_packet = &Chain::get_packet_static;
         mod->api.write_packet = &Chain::write_packet_static;
         mod->api.request_heartbeat = &Chain::request_heartbeat_static;
+        mod->api.set_src = &Chain::set_src_static;
 
         mod->ctx = base->init_fn(&mod->api, spec.params.c_str());
         if (!mod->ctx) {
@@ -113,14 +113,7 @@ Chain::~Chain() {
     wait_drain();
 }
 
-struct ChainContext {
-    const uint8_t *data = nullptr;
-    size_t len = 0;
-    int src_idx = 0;
-    int dir = 0;
-};
-
-thread_local ChainContext g_ctx;
+thread_local int g_ctx_src_idx = 0;
 
 void Chain::push_packet(const uint8_t *data, size_t len, int src_idx, int dir) {
     if (_cancelled.load()) {
@@ -179,7 +172,7 @@ void Chain::enqueue_module(Module *mod, const uint8_t *data, size_t len,
             return;
         }
 
-        g_ctx = ChainContext{data, len, src_idx, dir};
+        g_ctx_src_idx = src_idx;
 
         {
             std::lock_guard<std::mutex> lock(mod->hb_mutex);
@@ -191,7 +184,7 @@ void Chain::enqueue_module(Module *mod, const uint8_t *data, size_t len,
 
         TRACE("CHAIN WRITE_PACKET_IMPL entering dir=%d src=%d len=%zu mod=%s",
               dir, src_idx, len, mod->base ? mod->base->name.c_str() : "?");
-        int ret = mod->base->process_fn(mod->ctx, dir, src_idx);
+        int ret = mod->base->process_fn(mod->ctx, dir, src_idx, data, len);
         TRACE("CHAIN WRITE_PACKET_IMPL done dir=%d ret=%d", dir, ret);
 
         _inflight_bytes[dir].fetch_sub(len);
@@ -245,11 +238,6 @@ int Chain::total_extra_outputs() const {
 
 // --- static API stubs ---
 
-void *Chain::get_packet_static(void *chain_ctx, int idx, int *out_size) {
-    auto *mod = (Module *)chain_ctx;
-    return mod->chain->get_packet_impl(mod, idx, out_size);
-}
-
 int Chain::write_packet_static(void *chain_ctx, int dst, const uint8_t *data, size_t len) {
     auto *mod = (Module *)chain_ctx;
     return mod->chain->write_packet_impl(mod, dst, data, len);
@@ -283,12 +271,8 @@ int Chain::request_outputs_impl(Module *mod, int count) {
     return count;
 }
 
-void *Chain::get_packet_impl(Module *mod, int idx, int *out_size) {
-    (void)mod;
-    (void)idx;
-    *out_size = (int)g_ctx.len;
-    const uint8_t *ret_ptr = g_ctx.data;
-    return const_cast<uint8_t*>(ret_ptr);
+void Chain::set_src_static(void *chain_ctx, int src_idx) {
+    g_ctx_src_idx = src_idx;
 }
 
 int Chain::request_heartbeat_impl(Module *mod, int interval_sec) {
@@ -325,16 +309,17 @@ void Chain::check_module_heartbeats(int system_interval_ms) {
         }
         if (should_tick) {
             std::lock_guard<std::mutex> dirlock(mod->dir_mutex[0]);
-            mod->base->process_fn(mod->ctx, -1, 0);
+            mod->base->process_fn(mod->ctx, -1, 0, nullptr, 0);
         }
     }
 }
 
 int Chain::write_packet_impl(Module *mod, int dst, const uint8_t *data, size_t len) {
+    // dir is computed from output port: dst=0 → ext side (dir=1), dst≠0 → wire side (dir=0)
+    int dir = (dst == 0) ? 1 : 0;
     if (dst >= 0 && (size_t)dst < mod->near.size() && mod->near[dst]) {
-        enqueue_module(mod->near[dst], data, len, g_ctx.src_idx, g_ctx.dir);
+        enqueue_module(mod->near[dst], data, len, g_ctx_src_idx, dir);
         return 0;
     }
-    // dst=0 always means ext side. dst>=1 uses wire_dst (handles sub-chains).
     return _kapi->wire_write(_kapi->ctx, dst == 0 ? 0 : mod->wire_dst, data, len);
 }

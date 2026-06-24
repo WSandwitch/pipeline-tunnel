@@ -16,7 +16,7 @@ static std::string hex_sha256(const std::string &data) {
 
 extern "C" {
     void *builtin_copy_init(ModuleChain *, const char *);
-    int   builtin_copy_process(void *, int, int);
+    int   builtin_copy_process(void *, int, int, const uint8_t *, size_t);
     const char *builtin_copy_modulename();
     const char *builtin_copy_moduledesc();
     const char *builtin_copy_modulehelp();

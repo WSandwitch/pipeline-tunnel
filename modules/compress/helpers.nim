@@ -5,9 +5,9 @@ type
     request_outputs*: proc(ctx: pointer, count: cint): cint {.cdecl.}
     get_output_fd*: proc(ctx: pointer, idx: cint): cint {.cdecl.}
     get_node_id*: proc(ctx: pointer): cint {.cdecl.}
-    get_packet*: proc(ctx: pointer, idx: cint, out_size: ptr cint): pointer {.cdecl.}
     write_packet*: proc(ctx: pointer, output_id: cint, data: pointer, len: csize_t): cint {.cdecl.}
     request_heartbeat*: proc(ctx: pointer, interval_sec: cint): cint {.cdecl.}
+    set_src*: proc(ctx: pointer, src_idx: cint) {.cdecl.}
 
 const
   RTLD_NOW* = 2

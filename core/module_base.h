@@ -12,7 +12,7 @@ struct ModuleBase {
     std::string mid;
     void *handle = nullptr;
     void *(*init_fn)(ModuleChain *, const char *config) = nullptr;
-    int   (*process_fn)(void *, int dir, int trigger_idx) = nullptr;
+    int   (*process_fn)(void *, int dir, int trigger_idx, const uint8_t *data, size_t len) = nullptr;
     const char *(*name_fn)() = nullptr;
     const char *(*desc_fn)() = nullptr;
     const char *(*help_fn)() = nullptr;
