@@ -321,7 +321,8 @@ void Chain::check_module_heartbeats(int system_interval_ms) {
         if (interval_sec == 0) continue;
 
         if (interval_sec == -2) {
-            std::lock_guard<std::mutex> dirlock(mod->dir_mutex[0]);
+            std::lock_guard<std::mutex> lock0(mod->dir_mutex[0]);
+            std::lock_guard<std::mutex> lock1(mod->dir_mutex[1]);
             mod->base->process_fn(mod->ctx, -1, 0, nullptr, 0);
             continue;
         }
@@ -341,7 +342,8 @@ void Chain::check_module_heartbeats(int system_interval_ms) {
             }
         }
         if (should_tick) {
-            std::lock_guard<std::mutex> dirlock(mod->dir_mutex[0]);
+            std::lock_guard<std::mutex> lock0(mod->dir_mutex[0]);
+            std::lock_guard<std::mutex> lock1(mod->dir_mutex[1]);
             mod->base->process_fn(mod->ctx, -1, 0, nullptr, 0);
         }
     }
