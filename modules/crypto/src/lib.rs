@@ -71,7 +71,7 @@ fn parse_config(config: &str) -> Option<(Algorithm, [u8; 32], bool)> {
         }
     }
 
-    algo.map(|a| (a, key_bytes, trace))
+    Some((algo.unwrap_or(Algorithm::ChaCha20Poly1305), key_bytes, trace))
 }
 
 fn nonce_size(algo: &Algorithm) -> usize {
