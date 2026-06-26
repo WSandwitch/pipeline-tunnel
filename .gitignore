@@ -13,3 +13,4 @@ zig-*-linux-*.tar.xz
 *.core
 *.so
 nim-*.tar.xz
+rustup-*

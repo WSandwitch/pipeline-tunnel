@@ -90,5 +90,41 @@ download_nim() {
   exit 1
 }
 
+# --- Rust (rustup-init) ---
+download_rust() {
+  ARCH=$(uname -m)
+  case "$ARCH" in
+    x86_64)  RUST_ARCH="x86_64" ;;
+    aarch64) RUST_ARCH="aarch64" ;;
+    *)       echo "unsupported arch: $ARCH"; exit 1 ;;
+  esac
+  FILE="rustup-init-${RUST_ARCH}-unknown-linux-gnu"
+  TMP="$DIR/$FILE.tmp"
+
+  if [ -f "$DIR/$FILE" ]; then
+    echo "$DIR/$FILE"
+    return 0
+  fi
+
+  echo "Downloading $FILE ..."
+  rm -f "$TMP"
+  curl -fsSL --connect-timeout 30 --max-time 120 \
+    "https://static.rust-lang.org/rustup/dist/${RUST_ARCH}-unknown-linux-gnu/rustup-init" -o "$TMP" 2>/dev/null
+  if [ -f "$TMP" ]; then
+    SIZE=$(stat -c%s "$TMP" 2>/dev/null || stat -f%z "$TMP" 2>/dev/null)
+    if [ "$SIZE" -gt 100000 ] 2>/dev/null; then
+      mv "$TMP" "$DIR/$FILE"
+      chmod +x "$DIR/$FILE"
+      echo "done ($SIZE bytes)"
+      echo "$DIR/$FILE"
+      return 0
+    fi
+  fi
+  echo "error: failed to download rustup-init"
+  rm -f "$TMP"
+  exit 1
+}
+
 download_zig
 download_nim
+download_rust
