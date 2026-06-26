@@ -2,7 +2,7 @@ set -e
 
 docker kill modtunnel-worker || echo container not found
 
-export LOGS_DIR=/app/logs/arm64  
+export LOGS_DIR=/app/logs/$(uname -m)  
 
 bash tests/run_all_benchmark.sh --  -d 15 --direction forward --save_logs
 bash tests/run_all_benchmark.sh --  -d 15 --direction reverse --save_logs
