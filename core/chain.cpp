@@ -159,10 +159,10 @@ void Chain::push_packet(const uint8_t *data, size_t len, int src_idx, int dir) {
         first = _entry_ext;
     } else {
         if (src_idx < 0 || (size_t)src_idx >= _wire_entries.size()) {
-            log_error("chain: src_idx=%d out of range (%zu entries)",
+            log_error("chain: src_idx=%d out of range (%zu entries), dropping packet",
                       src_idx, _wire_entries.size());
             free_buffer(const_cast<uint8_t*>(data));
-            abort();
+            return;
         }
         first = _wire_entries[src_idx];
     }

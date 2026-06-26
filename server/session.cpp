@@ -144,6 +144,10 @@ void Session::on_data(const uint8_t *data, size_t len) {
                 if (state_ == RUNNING || state_ == AWAIT_CHAIN_CREATE)
                     handle_disconnect(pkt);
                 break;
+            case MSG_CONNECT_CANCEL:
+                if (state_ == RUNNING || state_ == AWAIT_CHAIN_CREATE)
+                    handle_connect_cancel(pkt);
+                break;
             case MSG_WRITER_PAUSE:
                 if (state_ == RUNNING || state_ == AWAIT_CHAIN_CREATE) {
                     if (pkt.payload.size() >= 1) {
@@ -624,53 +628,154 @@ void Session::handle_reconnect(const Packet &pkt) {
 
 uint8_t Session::alloc_conn_id() {
     static uint8_t next = 0;
-    return next++;
+    for (int i = 0; i < 256; i++) {
+        if (targets_.count(next) == 0)
+            return next++;
+    }
+    return CONN_ID_NONE;
 }
 
 void Session::handle_connect_req(const Packet &pkt) {
-    // MSG_CONNECT_REQ: [addr_len:u8][addr...]
-    if (pkt.payload.size() < 1) {
+    // MSG_CONNECT_REQ: [req_id:1][addr_len:u8][addr...]
+    if (pkt.payload.size() < 2) {
         log_error("session %llx: MSG_CONNECT_REQ too short", (unsigned long long)session_id_);
         return;
     }
-    uint8_t addr_len = pkt.payload[0];
-    if (1 + addr_len > pkt.payload.size()) {
+    uint8_t req_id = pkt.payload[0];
+    uint8_t addr_len = pkt.payload[1];
+    if (2 + addr_len > pkt.payload.size()) {
         log_error("session %llx: MSG_CONNECT_REQ addr length mismatch", (unsigned long long)session_id_);
         return;
     }
-    std::string target_addr((const char *)pkt.payload.data() + 1, addr_len);
+    std::string target_addr((const char *)pkt.payload.data() + 2, addr_len);
 
     uint8_t conn_id = alloc_conn_id();
-    log_info("session %llx: MSG_CONNECT_REQ target='%s' allocated conn_id=%u",
-             (unsigned long long)session_id_, target_addr.c_str(), conn_id);
+    if (conn_id == CONN_ID_NONE) {
+        log_error("session %llx: no free conn_id for target '%s'",
+                  (unsigned long long)session_id_, target_addr.c_str());
+        uint8_t payload[2] = {0, req_id};
+        Packet fail = Protocol::make_msg(MSG_CONNECT_FAIL, payload, sizeof(payload));
+        send_control(fail);
+        return;
+    }
+    log_info("session %llx: MSG_CONNECT_REQ target='%s' conn_id=%u req_id=%u",
+             (unsigned long long)session_id_, target_addr.c_str(), conn_id, req_id);
 
-    if (!setup_tunnel_target(target_addr, conn_id)) {
-        Packet fail = Protocol::make_msg(MSG_CONNECT_FAIL, &conn_id, 1);
+    setup_tunnel_target_async(target_addr, conn_id, req_id);
+}
+
+void Session::setup_tunnel_target_async(const std::string &target_addr, uint8_t conn_id, uint8_t req_id) {
+    size_t colon = target_addr.find(':');
+    if (colon == std::string::npos) {
+        log_error("session %llx: invalid target address '%s' (need host:port)",
+                  (unsigned long long)session_id_, target_addr.c_str());
+        uint8_t payload[2] = {conn_id, req_id};
+        Packet fail = Protocol::make_msg(MSG_CONNECT_FAIL, payload, sizeof(payload));
         send_control(fail);
         return;
     }
 
+    std::string host = target_addr.substr(0, colon);
+    std::string port = target_addr.substr(colon + 1);
+
+    struct addrinfo hints, *res;
+    memset(&hints, 0, sizeof(hints));
+    hints.ai_family = AF_UNSPEC;
+    hints.ai_socktype = SOCK_STREAM;
+
+    int err = getaddrinfo(host.c_str(), port.c_str(), &hints, &res);
+    if (err != 0) {
+        log_error("session %llx: getaddrinfo '%s:%s' failed: %s",
+                  (unsigned long long)session_id_, host.c_str(), port.c_str(),
+                  gai_strerror(err));
+        uint8_t payload[2] = {conn_id, req_id};
+        Packet fail = Protocol::make_msg(MSG_CONNECT_FAIL, payload, sizeof(payload));
+        send_control(fail);
+        return;
+    }
+
+    int fd = -1;
+    for (struct addrinfo *rp = res; rp; rp = rp->ai_next) {
+        fd = socket(rp->ai_family, rp->ai_socktype, rp->ai_protocol);
+        if (fd < 0) continue;
+        set_nonblock(fd);
+        if (connect(fd, rp->ai_addr, rp->ai_addrlen) == 0) {
+            freeaddrinfo(res);
+            log_info("session %llx: immediate connect to %s:%s fd=%d conn_id=%u",
+                     (unsigned long long)session_id_, host.c_str(), port.c_str(), fd, conn_id);
+            on_target_connected(fd, conn_id, req_id);
+            return;
+        }
+        if (errno == EINPROGRESS) {
+            freeaddrinfo(res);
+            pending_connects_[req_id] = {fd, conn_id, req_id, std::chrono::steady_clock::now()};
+            auto self = shared_from_this();
+            kernel_->add_fd_handler(fd, [this, self, conn_id, req_id](int ev_fd, uint32_t events) {
+                if (events & EPOLLOUT) {
+                    int error = 0;
+                    socklen_t len = sizeof(error);
+                    if (getsockopt(ev_fd, SOL_SOCKET, SO_ERROR, &error, &len) == 0 && error == 0) {
+                        kernel_->mod_fd_events(ev_fd, 0, EPOLLOUT); // prevent re-fire
+                        on_target_connected(ev_fd, conn_id, req_id);
+                    } else {
+                        log_error("session %llx: async connect fail conn_id=%u req_id=%u: %s",
+                                  (unsigned long long)session_id_, conn_id, req_id, strerror(error));
+                        close(ev_fd);
+                        pending_connects_.erase(req_id);
+                        uint8_t payload[2] = {conn_id, req_id};
+                        Packet fail = Protocol::make_msg(MSG_CONNECT_FAIL, payload, sizeof(payload));
+                        send_control(fail);
+                    }
+                }
+                if (events & (EPOLLERR | EPOLLHUP)) {
+                    int error = 0;
+                    socklen_t len = sizeof(error);
+                    getsockopt(ev_fd, SOL_SOCKET, SO_ERROR, &error, &len);
+                    log_error("session %llx: async connect EPOLLERR conn_id=%u req_id=%u: %s",
+                              (unsigned long long)session_id_, conn_id, req_id, strerror(error ? error : ENOTCONN));
+                    close(ev_fd);
+                    pending_connects_.erase(req_id);
+                    uint8_t payload[2] = {conn_id, req_id};
+                    Packet fail = Protocol::make_msg(MSG_CONNECT_FAIL, payload, sizeof(payload));
+                    send_control(fail);
+                }
+            }, EPOLLOUT);
+            return;
+        }
+        close(fd);
+        fd = -1;
+    }
+    freeaddrinfo(res);
+    log_error("session %llx: connect to %s:%s failed (no address worked)",
+              (unsigned long long)session_id_, host.c_str(), port.c_str());
+    uint8_t payload[2] = {conn_id, req_id};
+    Packet fail = Protocol::make_msg(MSG_CONNECT_FAIL, payload, sizeof(payload));
+    send_control(fail);
+}
+
+void Session::on_target_connected(int fd, uint8_t conn_id, uint8_t req_id) {
+    pending_connects_.erase(req_id);
+
+    targets_[conn_id] = {fd, ""};
+    log_info("session %llx: target connected fd=%d conn_id=%u req_id=%u",
+             (unsigned long long)session_id_, fd, conn_id, req_id);
+
     // Register in chain_ref
-    chain_ref_.in_fd[conn_id] = targets_[conn_id].fd;
+    chain_ref_.in_fd[conn_id] = fd;
     chain_ref_.in_writer[conn_id] = &targets_[conn_id].writer;
     chain_ref_.in_paused[conn_id] = false;
 
-    // Send OK with conn_id
-    Packet ok = Protocol::make_msg(MSG_CONNECT_OK, &conn_id, 1);
-    send_control(ok);
-
     // Register target read handler
-    int tfd = targets_[conn_id].fd;
-    TRACE("SVR TARGET REG cid=%u fd=%d", conn_id, tfd);
+    TRACE("SVR TARGET REG cid=%u fd=%d", conn_id, fd);
     auto self = shared_from_this();
-    kernel_->add_fd_handler(tfd, [this, self, conn_id](int fd, uint32_t events) {
-        TRACE("SVR TARGET EV cid=%u fd=%d events=0x%x", conn_id, fd, events);
+    kernel_->add_fd_handler(fd, [this, self, conn_id](int ev_fd, uint32_t events) {
+        TRACE("SVR TARGET EV cid=%u fd=%d events=0x%x", conn_id, ev_fd, events);
         try {
             if (events & EPOLLIN) {
                 if (chain_ && chain_->is_backpressure_paused(0)) return;
                 uint8_t *rbuf = (uint8_t*)chain_->alloc_buffer(MAX_PACKET_SIZE);
                 if (!rbuf) return;
-                ssize_t n = read(fd, rbuf + 1, MAX_PACKET_SIZE - 1);
+                ssize_t n = read(ev_fd, rbuf + 1, MAX_PACKET_SIZE - 1);
                 TRACE("SVR EXTREAD cid=%u n=%zd errno=%d", conn_id, n, n < 0 ? errno : 0);
                 if (n > 0) {
                     {
@@ -702,7 +807,7 @@ void Session::handle_connect_req(const Packet &pkt) {
                       if (chain_ && chain_->is_backpressure_paused(0)) break;
                       uint8_t *tmp = (uint8_t*)chain_->alloc_buffer(MAX_PACKET_SIZE);
                       if (!tmp) return;
-                      ssize_t n = read(fd, tmp + 1, MAX_PACKET_SIZE - 1);
+                      ssize_t n = read(ev_fd, tmp + 1, MAX_PACKET_SIZE - 1);
                       if (n > 0) {
                           static int ext_read2_cnt = 0;
                           if (++ext_read2_cnt % 100 == 0) TRACE("SVR EXTREAD2 cid=%u n=%d", conn_id, (int)n);
@@ -723,12 +828,51 @@ void Session::handle_connect_req(const Packet &pkt) {
             }
         } catch (const std::exception &e) {
             log_error("session %llx: exception in target handler fd=%d: %s",
-                      (unsigned long long)session_id_, fd, e.what());
+                      (unsigned long long)session_id_, ev_fd, e.what());
         } catch (...) {
             log_error("session %llx: exception in target handler fd=%d (unknown)",
-                      (unsigned long long)session_id_, fd);
+                      (unsigned long long)session_id_, ev_fd);
         }
     });
+
+    // Send OK to client
+    uint8_t payload[2] = {conn_id, req_id};
+    Packet ok = Protocol::make_msg(MSG_CONNECT_OK, payload, sizeof(payload));
+    send_control(ok);
+}
+
+void Session::handle_connect_cancel(const Packet &pkt) {
+    // MSG_CONNECT_CANCEL: [req_id:1]
+    if (pkt.payload.size() < 1) return;
+    uint8_t req_id = pkt.payload[0];
+    auto it = pending_connects_.find(req_id);
+    if (it == pending_connects_.end()) {
+        log_debug("session %llx: CONNECT_CANCEL req_id=%u not found",
+                  (unsigned long long)session_id_, req_id);
+        return;
+    }
+    log_info("session %llx: CONNECT_CANCEL req_id=%u conn_id=%u",
+             (unsigned long long)session_id_, req_id, it->second.conn_id);
+    close(it->second.fd);
+    pending_connects_.erase(it);
+}
+
+void Session::check_pending_connect_timeout() {
+    auto now = std::chrono::steady_clock::now();
+    auto it = pending_connects_.begin();
+    while (it != pending_connects_.end()) {
+        if (now - it->second.started_at > std::chrono::milliseconds(CONNECT_TIMEOUT_MS)) {
+            log_error("session %llx: pending connect timeout req_id=%u conn_id=%u",
+                      (unsigned long long)session_id_, it->second.req_id, it->second.conn_id);
+            close(it->second.fd);
+            uint8_t payload[2] = {it->second.conn_id, it->second.req_id};
+            Packet fail = Protocol::make_msg(MSG_CONNECT_FAIL, payload, sizeof(payload));
+            send_control(fail);
+            it = pending_connects_.erase(it);
+        } else {
+            ++it;
+        }
+    }
 }
 
 void Session::handle_disconnect(const Packet &pkt) {
@@ -872,6 +1016,9 @@ void Session::process_wire_buffer(const uint8_t *data, size_t len) {
                 switch (pkt.type) {
                     case MSG_CONNECT_REQ:
                         handle_connect_req(pkt);
+                        break;
+                    case MSG_CONNECT_CANCEL:
+                        handle_connect_cancel(pkt);
                         break;
                     case MSG_DISCONNECT:
                         handle_disconnect(pkt);
@@ -1418,10 +1565,10 @@ void Session::process_pending_reconnect_targets() {
                              rbuf[0] = conn_id;
                              chain_->push_packet(rbuf, 1 + (size_t)n, 0, 0);
                          } else {
-                             free(rbuf);
+                             chain_->free_buffer(rbuf);
                          }
                      } else {
-                         free(rbuf);
+                         chain_->free_buffer(rbuf);
                          if (n == 0) {
                              handle_target_eof(conn_id);
                          } else {
@@ -1442,10 +1589,10 @@ void Session::process_pending_reconnect_targets() {
                             tmp[0] = conn_id;
                             chain_->push_packet(tmp, 1 + (size_t)n, 0, 0);
                         } else {
-                            free(tmp);
+                            chain_->free_buffer(tmp);
                         }
                    } else {
-                        free(tmp);
+                        chain_->free_buffer(tmp);
                         if (n == 0 || (errno != EAGAIN && errno != EWOULDBLOCK)) {
                             handle_target_eof(conn_id);
                         }
@@ -1534,6 +1681,9 @@ void Session::apply_control(const Packet &pkt) {
         case MSG_CONNECT_REQ:
             handle_connect_req(pkt);
             break;
+        case MSG_CONNECT_CANCEL:
+            handle_connect_cancel(pkt);
+            break;
         case MSG_DISCONNECT:
             handle_disconnect(pkt);
             break;
@@ -1598,6 +1748,7 @@ void Session::apply_control(const Packet &pkt) {
 }
 
 void Session::process_pending_io() {
+    check_pending_connect_timeout();
     { static int ppi_cnt = 0; if (++ppi_cnt % 100 == 0) TRACE("SVR PPI tick %d", ppi_cnt); }
     { static int stats_cnt = 0; stats_cnt++; if (chain_ && stats_cnt % 10 == 0) {
         int infl = chain_ ? chain_->get_inflight() : -1;

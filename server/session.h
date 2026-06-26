@@ -118,6 +118,8 @@ private:
     std::unordered_map<uint8_t, TargetConn> targets_;
     std::mutex targets_mtx_;
 
+    static constexpr uint8_t CONN_ID_NONE = 255;
+
     // Server-side conn_id allocation
     uint8_t alloc_conn_id();
 
@@ -132,18 +134,32 @@ private:
     void handle_auth2_response(const Packet &pkt);
     void handle_reconnect(const Packet &pkt);
     void handle_connect_req(const Packet &pkt);
+    void handle_connect_cancel(const Packet &pkt);
     void handle_disconnect(const Packet &pkt);
     void handle_module_list_req(const Packet &pkt);
     void handle_chain_create(const Packet &pkt);
     bool setup_tunnel_target(const std::string &target_addr, uint8_t conn_id);
+    void setup_tunnel_target_async(const std::string &target_addr, uint8_t conn_id, uint8_t req_id);
+    void on_target_connected(int fd, uint8_t conn_id, uint8_t req_id);
     void handle_target_eof(uint8_t conn_id);
     void close_target(uint8_t conn_id);
     void close_all_targets();
+    void check_pending_connect_timeout();
 
     // Pending data connections that arrived before chain create (9-byte handshake)
     std::vector<std::pair<uint8_t, int>> pending_data_conns_;
     void process_pending_data_conns();
     void process_pending_reconnect_targets();
+
+    // Async pending connects (non-blocking connect)
+    struct PendingConnect {
+        int fd = -1;
+        uint8_t conn_id = 0;
+        uint8_t req_id = 0;
+        std::chrono::steady_clock::time_point started_at;
+    };
+    static constexpr int CONNECT_TIMEOUT_MS = 5000;
+    std::unordered_map<uint8_t, PendingConnect> pending_connects_;
 
     // Total extra outputs needed (from _requested_outputs)
     int total_extra_outputs_ = 0;

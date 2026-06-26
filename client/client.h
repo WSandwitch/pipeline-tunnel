@@ -91,12 +91,18 @@ private:
     };
     std::unordered_map<uint8_t, ExternalConn> conns_;
 
+    static constexpr int MAX_PENDING_EXT = 256;
+    static constexpr int PENDING_TIMEOUT_MS = 5000;
+
     // Pending ext fds waiting for conn_id from server
     struct PendingConn {
         int fd;
         struct sockaddr_in addr;
+        uint8_t req_id;
+        std::chrono::steady_clock::time_point created_at;
     };
     std::deque<PendingConn> pending_ext_;
+    uint8_t next_req_id_ = 0;
 
     std::shared_ptr<Kernel> kernel_;
     std::shared_ptr<void> chain_guard_;

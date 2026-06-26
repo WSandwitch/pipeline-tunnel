@@ -462,10 +462,19 @@ void Client::start_listener() {
 void Client::on_listener_accept(int cfd, const struct sockaddr_in &addr) {
     log_info("client: external connection from %s (pending conn_id)", sockaddr_to_str(addr).c_str());
 
+    if (pending_ext_.size() >= MAX_PENDING_EXT) {
+        log_error("client: too many pending connections (%zu), dropping",
+                  pending_ext_.size());
+        close(cfd);
+        return;
+    }
+
     set_nonblock(cfd);
-    pending_ext_.push_back({cfd, addr});
+    uint8_t req_id = next_req_id_++;
+    pending_ext_.push_back({cfd, addr, req_id, std::chrono::steady_clock::now()});
 
     std::vector<uint8_t> payload;
+    payload.push_back(req_id);
     payload.push_back((uint8_t)target_addr_.size());
     payload.insert(payload.end(), target_addr_.begin(), target_addr_.end());
     Packet pkt = Protocol::make_msg(MSG_CONNECT_REQ, payload);
@@ -1188,19 +1197,23 @@ void Client::handle_chain_resume(const Packet &pkt) {
 }
 
 void Client::handle_connect_ok(const Packet &pkt) {
-    if (pkt.payload.size() < 1) return;
+    if (pkt.payload.size() < 2) return;
     uint8_t conn_id = pkt.payload[0];
-    log_info("client: MSG_CONNECT_OK conn_id=%u", conn_id);
+    uint8_t req_id = pkt.payload[1];
+    log_info("client: MSG_CONNECT_OK conn_id=%u req_id=%u", conn_id, req_id);
 
-    if (pending_ext_.empty()) {
-        log_error("client: MSG_CONNECT_OK with no pending external fd");
+    // Find by req_id (may have been cancelled)
+    auto it = std::find_if(pending_ext_.begin(), pending_ext_.end(),
+                           [req_id](const PendingConn &pc) { return pc.req_id == req_id; });
+    if (it == pending_ext_.end()) {
+        log_error("client: MSG_CONNECT_OK req_id=%u not found (cancelled?)", req_id);
         Packet pkt2 = Protocol::make_msg(MSG_DISCONNECT, &conn_id, 1);
         send_control(pkt2);
         return;
     }
 
-    auto pc = pending_ext_.front();
-    pending_ext_.pop_front();
+    auto pc = *it;
+    pending_ext_.erase(it);
     int cfd = pc.fd;
 
     conns_.emplace(conn_id, ExternalConn{cfd});
@@ -1265,14 +1278,16 @@ void Client::handle_connect_ok(const Packet &pkt) {
 }
 
 void Client::handle_connect_fail(const Packet &pkt) {
-    if (pkt.payload.size() < 1) return;
+    if (pkt.payload.size() < 2) return;
     uint8_t conn_id = pkt.payload[0];
-    log_error("client: MSG_CONNECT_FAIL conn_id=%u", conn_id);
-    // Cleanup pending fd — only the failed one
-    if (pending_ext_.empty()) return;
-    auto pc = pending_ext_.front();
-    pending_ext_.pop_front();
-    close(pc.fd);
+    uint8_t req_id = pkt.payload[1];
+    log_error("client: MSG_CONNECT_FAIL conn_id=%u req_id=%u", conn_id, req_id);
+    // Find by req_id
+    auto it = std::find_if(pending_ext_.begin(), pending_ext_.end(),
+                           [req_id](const PendingConn &pc) { return pc.req_id == req_id; });
+    if (it == pending_ext_.end()) return;
+    close(it->fd);
+    pending_ext_.erase(it);
 }
 
 void Client::handle_disconnect(const Packet &pkt) {
@@ -1316,6 +1331,24 @@ void Client::check_heartbeat() {
 }
 
 void Client::process_pending_io() {
+    // Pending connect timeout — cancel stale requests
+    {
+        auto now = std::chrono::steady_clock::now();
+        while (!pending_ext_.empty()) {
+            auto &front = pending_ext_.front();
+            if (now - front.created_at > std::chrono::milliseconds(PENDING_TIMEOUT_MS)) {
+                log_error("client: pending connect timeout req_id=%u addr=%s",
+                          front.req_id, sockaddr_to_str(front.addr).c_str());
+                uint8_t req_id = front.req_id;
+                Packet cancel = Protocol::make_msg(MSG_CONNECT_CANCEL, &req_id, 1);
+                send_control(cancel);
+                close(front.fd);
+                pending_ext_.pop_front();
+            } else {
+                break;
+            }
+        }
+    }
     { static int ppi_cnt = 0; ppi_cnt++; TRACE("CLI PPI tick %d", ppi_cnt); }
     { static int stats_cnt = 0; stats_cnt++;     if (chain_) {
         int infl = chain_ ? chain_->get_inflight() : -1;

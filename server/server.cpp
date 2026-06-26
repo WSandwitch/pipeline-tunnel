@@ -7,7 +7,6 @@
 #include <unistd.h>
 #include <fcntl.h>
 #include <cstring>
-#include <poll.h>
 
 extern std::unordered_map<uint64_t, std::weak_ptr<Session>> g_session_registry;
 extern std::unordered_map<uint64_t, std::shared_ptr<Session>> g_paused_sessions;
@@ -57,7 +56,6 @@ bool Server::start() {
 
     set_nonblock(listen_fd_);
 
-    // Register listen fd with kernel for accept
     auto k = kernel_;
     kernel_->add_fd_handler(listen_fd_, [this, k](int fd, uint32_t events) {
         if (!(events & EPOLLIN)) return;
@@ -72,105 +70,53 @@ bool Server::start() {
                 break;
             }
 
-            char client_ip[64];
-            inet_ntop(AF_INET, &client_addr.sin_addr, client_ip, sizeof(client_ip));
+            set_nonblock(cfd);
 
-            int fl = fcntl(cfd, F_GETFL, 0);
-            if (fl >= 0) fcntl(cfd, F_SETFL, fl | O_NONBLOCK);
-
-            // Try to read up to 9 bytes — data connections send 9-byte handshake immediately
-            uint8_t header[9];
-            ssize_t nread = read(cfd, header, 9);
-
-            {
-                uint64_t sid = 0;
-                uint8_t output_idx = 0;
-                bool is_data_conn = false;
-
-                if (nread == 9) {
-                    memcpy(&sid, header, 8);
-                    output_idx = header[8];
-                    is_data_conn = true;
-                } else if (nread < 0 && errno == EAGAIN) {
-                    struct pollfd pfd = {cfd, POLLIN, 0};
-                    int pret = poll(&pfd, 1, 200);
-                    if (pret > 0 && (pfd.revents & POLLIN)) {
-                        nread = read(cfd, header, 9);
-                        if (nread == 9) {
-                            memcpy(&sid, header, 8);
-                            output_idx = header[8];
-                            is_data_conn = true;
+            // Try immediate read — data connections send 9-byte handshake right away
+            uint8_t hdr[9];
+            ssize_t nread = read(cfd, hdr, 9);
+            if (nread > 0 && (size_t)nread < 9) {
+                // Partial — register EPOLLIN to accumulate the rest
+                pending_handshakes_.push_back({cfd, {}, 0, std::chrono::steady_clock::now()});
+                memcpy(pending_handshakes_.back().buf, hdr, (size_t)nread);
+                pending_handshakes_.back().got = (size_t)nread;
+                kernel_->add_fd_handler(cfd, [this, k](int ev_fd, uint32_t events) {
+                    if (!(events & EPOLLIN)) return;
+                    size_t idx = pending_handshakes_.size();
+                    for (size_t i = 0; i < pending_handshakes_.size(); i++) {
+                        if (pending_handshakes_[i].fd == ev_fd) { idx = i; break; }
+                    }
+                    if (idx >= pending_handshakes_.size()) return;
+                    auto &ph = pending_handshakes_[idx];
+                    ssize_t nr = read(ev_fd, ph.buf + ph.got, 9 - ph.got);
+                    if (nr > 0) {
+                        ph.got += (size_t)nr;
+                        if (ph.got == 9) {
+                            finish_handshake(ev_fd, ph.buf, 9);
+                            pending_handshakes_.erase(pending_handshakes_.begin() + idx);
+                            return;
                         }
+                        return; // still partial
                     }
-                } else if (nread > 0 && nread < 9) {
-                    // Partial read: temporarily switch to blocking to get remaining bytes
-                    int fl = fcntl(cfd, F_GETFL, 0);
-                    if (fl >= 0) fcntl(cfd, F_SETFL, fl & ~O_NONBLOCK);
-                    ssize_t n2 = read(cfd, header + nread, 9 - (size_t)nread);
-                    if (fl >= 0) fcntl(cfd, F_SETFL, fl | O_NONBLOCK);
-                    if (n2 == 9 - nread) {
-                        nread = 9;
-                        memcpy(&sid, header, 8);
-                        output_idx = header[8];
-                        is_data_conn = true;
+                    if (nr == 0 || (nr < 0 && errno != EAGAIN && errno != EWOULDBLOCK)) {
+                        close(ev_fd);
+                        k->del_fd(ev_fd);
+                        pending_handshakes_.erase(pending_handshakes_.begin() + idx);
                     }
-                }
-
-                if (is_data_conn) {
-                    auto it = g_session_registry.find(sid);
-                    if (it != g_session_registry.end()) {
-                        auto session = it->second.lock();
-                        if (session) {
-                            log_info("data connection for session %llx output %u (fd=%d)",
-                                     (unsigned long long)sid, output_idx, cfd);
-                            session->add_data_connection(output_idx, cfd);
-                            continue;
-                        }
-                    }
-                    log_error("data connection handshake for unknown session %llx, closing",
-                              (unsigned long long)sid);
-                    close(cfd);
-                    continue;
-                }
+                }, EPOLLIN);
+            } else if (nread == 9) {
+                // Full 9 bytes — check for data connection
+                finish_handshake(cfd, hdr, 9);
+            } else {
+                // EAGAIN (no data) or error — this is a new session
+                finish_handshake(cfd, hdr, nread > 0 ? (size_t)nread : 0);
             }
-
-            log_info("client connected: %s:%d", client_ip, ntohs(client_addr.sin_port));
-
-            auto session = std::make_shared<Session>(cfd, password_, kernel_, heartbeat_interval_ms_);
-            g_session_registry[session->session_id()] = session;
-
-            std::string challenge = std::to_string(rand()) + std::to_string(time(nullptr));
-            session->set_challenge(challenge);
-            Packet challenge_pkt = Protocol::make_msg(MSG_AUTH_CHALLENGE,
-                                                      challenge.data(), challenge.size());
-            session->send_packet(challenge_pkt);
-
-            kernel_->add_fd_handler(cfd, [session, k](int ev_fd, uint32_t events) {
-                if (session->client_fd() < 0) return;
-                uint8_t buf[65536];
-                ssize_t n;
-                TRACE("SVR OLD HANDLER events=0x%x", events);
-                while ((n = read(session->client_fd(), buf, sizeof(buf))) > 0) {
-                    TRACE("SVR OLD READ n=%zd state=%d", n, (int)session->state());
-                    session->on_data(buf, (size_t)n);
-                    if (session->client_fd() < 0) break;
-                    if (session->state() >= Session::AUTH_DONE) break;
-                }
-                if (n == 0) {
-                    k->del_fd(ev_fd);
-                    session->on_disconnect();
-                    g_paused_sessions[session->session_id()] = session;
-                } else if (n < 0 && errno != EAGAIN) {
-                    k->del_fd(ev_fd);
-                    session->on_disconnect();
-                    g_paused_sessions[session->session_id()] = session;
-                }
-            });
         }
     }, EPOLLIN);
 
-    // Tick callback to process pending I/O for all sessions
-    kernel_->set_tick_callback([]() {
+    // Tick callback to process pending I/O for all sessions + handshake timeouts
+    kernel_->set_tick_callback([this]() {
+        check_handshake_timeout();
         std::vector<std::shared_ptr<Session>> alive;
         for (auto &[sid, wptr] : g_session_registry) {
             (void)sid;
@@ -193,8 +139,88 @@ void Server::stop() {
         close(listen_fd_);
         listen_fd_ = -1;
     }
+    for (auto &ph : pending_handshakes_) {
+        kernel_->del_fd(ph.fd);
+        close(ph.fd);
+    }
+    pending_handshakes_.clear();
     if (kernel_) {
         kernel_->stop();
         kernel_.reset();
+    }
+}
+
+void Server::check_handshake_timeout() {
+    auto now = std::chrono::steady_clock::now();
+    auto it = pending_handshakes_.begin();
+    while (it != pending_handshakes_.end()) {
+        if (now - it->accepted_at > std::chrono::milliseconds(HANDSHAKE_TIMEOUT_MS)) {
+            log_debug("server: handshake timeout on fd=%d got=%zu", it->fd, it->got);
+            close(it->fd);
+            kernel_->del_fd(it->fd);
+            it = pending_handshakes_.erase(it);
+        } else {
+            ++it;
+        }
+    }
+}
+
+void Server::finish_handshake(int fd, const uint8_t *buf, size_t len) {
+    uint64_t sid = 0;
+    uint8_t output_idx = 0;
+    bool is_data_conn = false;
+
+    if (len == 9) {
+        memcpy(&sid, buf, 8);
+        output_idx = buf[8];
+        auto it = g_session_registry.find(sid);
+        if (it != g_session_registry.end()) {
+            auto session = it->second.lock();
+            if (session) {
+                log_info("data connection for session %llx output %u (fd=%d)",
+                         (unsigned long long)sid, output_idx, fd);
+                session->add_data_connection(output_idx, fd);
+                is_data_conn = true;
+            }
+        }
+    }
+
+    if (!is_data_conn) {
+        log_info("client connected (fd=%d), new session", fd);
+        auto session = std::make_shared<Session>(fd, password_, kernel_, heartbeat_interval_ms_);
+        g_session_registry[session->session_id()] = session;
+
+        std::string challenge = std::to_string(rand()) + std::to_string(time(nullptr));
+        session->set_challenge(challenge);
+        Packet challenge_pkt = Protocol::make_msg(MSG_AUTH_CHALLENGE,
+                                                  challenge.data(), challenge.size());
+        session->send_packet(challenge_pkt);
+
+        if (len > 0) {
+            session->on_data(buf, len);
+        }
+
+        auto k = kernel_;
+        kernel_->add_fd_handler(fd, [session, k](int ev_fd, uint32_t events) {
+            if (session->client_fd() < 0) return;
+            uint8_t rbuf[65536];
+            ssize_t n;
+            TRACE("SVR OLD HANDLER events=0x%x", events);
+            while ((n = read(session->client_fd(), rbuf, sizeof(rbuf))) > 0) {
+                TRACE("SVR OLD READ n=%zd state=%d", n, (int)session->state());
+                session->on_data(rbuf, (size_t)n);
+                if (session->client_fd() < 0) break;
+                if (session->state() >= Session::AUTH_DONE) break;
+            }
+            if (n == 0) {
+                k->del_fd(ev_fd);
+                session->on_disconnect();
+                g_paused_sessions[session->session_id()] = session;
+            } else if (n < 0 && errno != EAGAIN) {
+                k->del_fd(ev_fd);
+                session->on_disconnect();
+                g_paused_sessions[session->session_id()] = session;
+            }
+        });
     }
 }

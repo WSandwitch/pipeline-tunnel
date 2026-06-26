@@ -211,6 +211,17 @@ def parse_iperf_bitrate(output)
   rates
 end
 
+def parse_iperf_duration(output)
+  max_end = 0
+  output.each_line do |line|
+    if line =~ /(\d+\.?\d*)-(\d+\.?\d*)\s+sec/
+      end_val = Regexp.last_match(2).to_f
+      max_end = end_val if end_val > max_end
+    end
+  end
+  max_end
+end
+
 $options = options
 
 # ---- main ----
@@ -312,12 +323,26 @@ def run_one_test(options)
     max_rate = all_rates.max || 0
     total_rate = all_rates.sum
     avg_rate = all_rates.empty? ? 0 : total_rate / all_rates.length
-    ok = max_rate > 0 && !timed_out
+
+    interval_ok = all_rates.length >= (options[:duration] / 2)
+    actual_duration = all_outputs.map { |o| parse_iperf_duration(o) }.max || 0
+    duration_ok = actual_duration >= options[:duration] * 0.5
+
+    ok = max_rate > 0 && !timed_out && interval_ok && duration_ok
 
     dir_label = options[:direction]
     puts "-" * 40
     puts "[#{options[:config]}] #{dir_label}: #{'%.0f' % max_rate} Mbps peak, #{'%.0f' % avg_rate} Mbps avg" \
          "  (#{options[:clients]} clients, P=#{options[:parallel]}, t=#{options[:duration]})"
+
+    unless ok
+      reasons = []
+      reasons << "zero throughput" if max_rate <= 0
+      reasons << "timed_out" if timed_out
+      reasons << "only #{all_rates.length}/#{options[:duration]} intervals" unless interval_ok
+      reasons << "actual duration #{'%.1f' % actual_duration}s" unless duration_ok
+      puts "  FAIL: #{reasons.join(', ')}"
+    end
     error_msg = all_outputs.find { |o| o.include?('control socket has closed unexpectedly') }
     puts ok ? 'PASS' : 'FAIL'
     return { ok: ok, max_rate: max_rate, avg_rate: avg_rate, error_msg: error_msg }
