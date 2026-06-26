@@ -324,7 +324,7 @@ def run_one_test(options)
   ensure
     tunnels.each { |t| stop_procs(t[:cli_pid], t[:svr_pid]) }
     killall
-    if !ok && options[:save_logs] && options[:attempt] == 2
+    if !ok && options[:save_logs] && (options[:attempt] == 2 || !error_msg)
       diag_dir = LOGS_DIR
       FileUtils.mkdir_p(diag_dir)
       ts = Time.now.strftime("%Y%m%d_%H%M%S")
