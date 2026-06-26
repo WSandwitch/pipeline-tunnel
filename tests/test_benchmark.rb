@@ -324,7 +324,7 @@ def run_one_test(options)
   ensure
     tunnels.each { |t| stop_procs(t[:cli_pid], t[:svr_pid]) }
     killall
-    if !ok && options[:save_logs]
+    if !ok && options[:save_logs] && options[:attempt] == 2
       diag_dir = LOGS_DIR
       FileUtils.mkdir_p(diag_dir)
       ts = Time.now.strftime("%Y%m%d_%H%M%S")
@@ -349,11 +349,13 @@ def run_one_test(options)
   end
 end
 
+options[:attempt] = 1
 result = run_one_test(options)
 
 if !result[:ok] && result[:error_msg]
   $stderr.puts "  Retry (iperf3 control socket error)..."
   sleep 2
+  options[:attempt] = 2
   result = run_one_test(options)
 end
 
