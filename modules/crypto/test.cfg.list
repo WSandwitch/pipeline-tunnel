@@ -1,0 +1,4 @@
+algo:chacha20-poly1305,key:testpass
+algo:xchacha20-poly1305,key:testpass
+algo:aes-256-gcm,key:testpass
+algo:aes-256-ctr,key:testpass

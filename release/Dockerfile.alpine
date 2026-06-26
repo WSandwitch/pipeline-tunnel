@@ -33,25 +33,6 @@ RUN set -eux; \
     ln -sf "/usr/local/nim-2.2.2/bin/nim" /usr/local/bin/nim; \
     rm "/tmp/nim-2.2.8-linux_${NIM_ARCH}.tar.xz"
 
-ENV CARGO_HOME=/usr/local/lib/rust/cargo \
-    RUSTUP_HOME=/usr/local/lib/rust/rustup
-COPY rustup-* /tmp/
-RUN set -eux; \
-    ARCH=$(uname -m); \
-    case "$ARCH" in \
-      x86_64)  RUST_ARCH="x86_64" ;; \
-      aarch64) RUST_ARCH="aarch64" ;; \
-      *)       echo "unsupported arch: $ARCH"; exit 1 ;; \
-    esac; \
-    chmod +x "/tmp/rustup-init-${RUST_ARCH}-unknown-linux-gnu"; \
-    "/tmp/rustup-init-${RUST_ARCH}-unknown-linux-gnu" -y \
-      --default-toolchain stable --profile minimal --no-modify-path; \
-    ${CARGO_HOME}/bin/cargo --version; \
-    ${CARGO_HOME}/bin/rustc --version; \
-    ln -sf ${CARGO_HOME}/bin/cargo /usr/local/bin/; \
-    ln -sf ${CARGO_HOME}/bin/rustc /usr/local/bin/; \
-    rm "/tmp/rustup-init-${RUST_ARCH}-unknown-linux-gnu"
-
 COPY . /src
 WORKDIR /src
 RUN cmake -B /build -DCMAKE_BUILD_TYPE=Release \

@@ -63,6 +63,7 @@ RUN set -eux; \
     ${CARGO_HOME}/bin/rustc --version; \
     ln -sf ${CARGO_HOME}/bin/cargo /usr/local/bin/; \
     ln -sf ${CARGO_HOME}/bin/rustc /usr/local/bin/; \
+    chmod -R a+rwX ${CARGO_HOME}; \
     rm "/tmp/rustup-init-${RUST_ARCH}-unknown-linux-gnu"
 
 WORKDIR /app

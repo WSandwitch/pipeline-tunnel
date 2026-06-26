@@ -28,15 +28,30 @@ endif()
 
 # pack target: copy binaries and .so to out/
 set(PACK_DIR "${CMAKE_SOURCE_DIR}/out")
-set(MODULES base64 split limit compress crypto)
-add_custom_target(pack
-  COMMAND ${CMAKE_COMMAND} -E make_directory ${PACK_DIR}
-  COMMAND ${CMAKE_COMMAND} -E make_directory ${PACK_DIR}/modules
-  COMMAND ${CMAKE_COMMAND} -E copy $<TARGET_FILE:base64> ${PACK_DIR}/modules/
-  COMMAND ${CMAKE_COMMAND} -E copy $<TARGET_FILE:split> ${PACK_DIR}/modules/
-  COMMAND ${CMAKE_COMMAND} -E copy ${CMAKE_BINARY_DIR}/modules/limit/limit.so ${PACK_DIR}/modules/
-  COMMAND ${CMAKE_COMMAND} -E copy ${CMAKE_BINARY_DIR}/modules/compress/compress.so ${PACK_DIR}/modules/
-  COMMAND ${CMAKE_COMMAND} -E copy ${CMAKE_BINARY_DIR}/modules/crypto/target/release/libcrypto.so ${PACK_DIR}/modules/
-  COMMENT "Packing binaries and modules to ${PACK_DIR}"
-  DEPENDS ppltunnel-server ppltunnel-client ${MODULES}
-)
+# Alpine's musl Rust target does not support cdylib crate type
+if(EXISTS "/etc/alpine-release")
+  set(MODULES base64 split limit compress)
+  add_custom_target(pack
+    COMMAND ${CMAKE_COMMAND} -E make_directory ${PACK_DIR}
+    COMMAND ${CMAKE_COMMAND} -E make_directory ${PACK_DIR}/modules
+    COMMAND ${CMAKE_COMMAND} -E copy $<TARGET_FILE:base64> ${PACK_DIR}/modules/
+    COMMAND ${CMAKE_COMMAND} -E copy $<TARGET_FILE:split> ${PACK_DIR}/modules/
+    COMMAND ${CMAKE_COMMAND} -E copy ${CMAKE_BINARY_DIR}/modules/limit/limit.so ${PACK_DIR}/modules/
+    COMMAND ${CMAKE_COMMAND} -E copy ${CMAKE_BINARY_DIR}/modules/compress/compress.so ${PACK_DIR}/modules/
+    COMMENT "Packing binaries and modules to ${PACK_DIR}"
+    DEPENDS ppltunnel-server ppltunnel-client ${MODULES}
+  )
+else()
+  set(MODULES base64 split limit compress crypto)
+  add_custom_target(pack
+    COMMAND ${CMAKE_COMMAND} -E make_directory ${PACK_DIR}
+    COMMAND ${CMAKE_COMMAND} -E make_directory ${PACK_DIR}/modules
+    COMMAND ${CMAKE_COMMAND} -E copy $<TARGET_FILE:base64> ${PACK_DIR}/modules/
+    COMMAND ${CMAKE_COMMAND} -E copy $<TARGET_FILE:split> ${PACK_DIR}/modules/
+    COMMAND ${CMAKE_COMMAND} -E copy ${CMAKE_BINARY_DIR}/modules/limit/limit.so ${PACK_DIR}/modules/
+    COMMAND ${CMAKE_COMMAND} -E copy ${CMAKE_BINARY_DIR}/modules/compress/compress.so ${PACK_DIR}/modules/
+    COMMAND ${CMAKE_COMMAND} -E copy ${CMAKE_BINARY_DIR}/modules/crypto/release/libcrypto.so ${PACK_DIR}/modules/
+    COMMENT "Packing binaries and modules to ${PACK_DIR}"
+    DEPENDS ppltunnel-server ppltunnel-client ${MODULES}
+  )
+endif()

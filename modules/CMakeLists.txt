@@ -3,4 +3,7 @@ add_subdirectory(base64)
 add_subdirectory(split)
 add_subdirectory(limit)
 add_subdirectory(compress)
-add_subdirectory(crypto)
+# Alpine musl Rust target does not support cdylib crate type
+if(NOT EXISTS "/etc/alpine-release")
+  add_subdirectory(crypto)
+endif()
