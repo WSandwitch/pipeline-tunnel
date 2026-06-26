@@ -2,11 +2,7 @@ set(CRYPTO_SRC_DIR ${CMAKE_CURRENT_SOURCE_DIR})
 set(CRYPTO_OUT ${CMAKE_CURRENT_BINARY_DIR}/release/libcrypto.so)
 
 find_program(CARGO cargo
-  PATHS /root/.cargo/bin $ENV{HOME}/.cargo/bin
-  NO_DEFAULT_PATH)
-if(NOT CARGO)
-  find_program(CARGO cargo)
-endif()
+  PATHS /usr/local/bin /usr/local/lib/rust/cargo/bin /root/.cargo/bin $ENV{HOME}/.cargo/bin)
 
 add_custom_command(OUTPUT ${CRYPTO_OUT}
   COMMAND ${CARGO} build --release --manifest-path ${CRYPTO_SRC_DIR}/Cargo.toml

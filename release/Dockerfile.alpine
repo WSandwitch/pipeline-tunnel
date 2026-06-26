@@ -33,6 +33,8 @@ RUN set -eux; \
     ln -sf "/usr/local/nim-2.2.2/bin/nim" /usr/local/bin/nim; \
     rm "/tmp/nim-2.2.8-linux_${NIM_ARCH}.tar.xz"
 
+ENV CARGO_HOME=/usr/local/lib/rust/cargo \
+    RUSTUP_HOME=/usr/local/lib/rust/rustup
 COPY rustup-* /tmp/
 RUN set -eux; \
     ARCH=$(uname -m); \
@@ -42,12 +44,12 @@ RUN set -eux; \
       *)       echo "unsupported arch: $ARCH"; exit 1 ;; \
     esac; \
     chmod +x "/tmp/rustup-init-${RUST_ARCH}-unknown-linux-gnu"; \
-    "/tmp/rustup-init-${RUST_ARCH}-unknown-linux-gnu" -y --default-toolchain stable --profile minimal; \
-    . /root/.cargo/env; \
-    rustc --version; \
+    "/tmp/rustup-init-${RUST_ARCH}-unknown-linux-gnu" -y \
+      --default-toolchain stable --profile minimal --no-modify-path; \
     cargo --version; \
-    ln -sf /root/.cargo/bin/cargo /usr/local/bin/; \
-    ln -sf /root/.cargo/bin/rustc /usr/local/bin/; \
+    rustc --version; \
+    ln -sf ${CARGO_HOME}/bin/cargo /usr/local/bin/; \
+    ln -sf ${CARGO_HOME}/bin/rustc /usr/local/bin/; \
     rm "/tmp/rustup-init-${RUST_ARCH}-unknown-linux-gnu"
 
 COPY . /src
