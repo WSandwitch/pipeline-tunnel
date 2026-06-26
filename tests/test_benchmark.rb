@@ -197,7 +197,7 @@ end
 def parse_iperf_bitrate(output)
   rates = []
   output.each_line do |line|
-    next unless line =~ /(\d+\.?\d*)\s*(G|M|K)bits\/sec/
+    next unless line =~ /(\d+\.?\d*)\s*(G|M|K)?bits\/sec/
     val = Regexp.last_match(1).to_f
     unit = Regexp.last_match(2)
     case unit
@@ -326,7 +326,9 @@ def run_one_test(options)
     total_rate = all_rates.sum
     avg_rate = all_rates.empty? ? 0 : total_rate / all_rates.length
 
-    interval_ok = all_rates.length >= (options[:duration] / 2)
+    all_rates_len = all_rates.length
+    non_zero = all_rates.count { |r| r > 0 }
+    interval_ok = all_rates_len >= (options[:duration] / 2) && non_zero >= 1
     actual_duration = all_outputs.map { |o| parse_iperf_duration(o) }.max || 0
     duration_ok = actual_duration >= options[:duration] * 0.5
 
@@ -341,7 +343,7 @@ def run_one_test(options)
       reasons = []
       reasons << "zero throughput" if max_rate <= 0
       reasons << "timed_out" if timed_out
-      reasons << "only #{all_rates.length}/#{options[:duration]} intervals" unless interval_ok
+      reasons << "only #{non_zero}/#{all_rates_len} intervals with data" unless interval_ok
       reasons << "actual duration #{'%.1f' % actual_duration}s" unless duration_ok
       puts "  FAIL: #{reasons.join(', ')}"
     end
