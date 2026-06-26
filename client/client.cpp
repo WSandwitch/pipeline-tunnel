@@ -1268,11 +1268,11 @@ void Client::handle_connect_fail(const Packet &pkt) {
     if (pkt.payload.size() < 1) return;
     uint8_t conn_id = pkt.payload[0];
     log_error("client: MSG_CONNECT_FAIL conn_id=%u", conn_id);
-    // Cleanup pending fd
-    for (auto &pc : pending_ext_) {
-        close(pc.fd);
-    }
-    pending_ext_.clear();
+    // Cleanup pending fd — only the failed one
+    if (pending_ext_.empty()) return;
+    auto pc = pending_ext_.front();
+    pending_ext_.pop_front();
+    close(pc.fd);
 }
 
 void Client::handle_disconnect(const Packet &pkt) {
