@@ -45,8 +45,8 @@ RUN set -eux; \
     chmod +x "/tmp/rustup-init-${RUST_ARCH}-unknown-linux-gnu"; \
     "/tmp/rustup-init-${RUST_ARCH}-unknown-linux-gnu" -y \
       --default-toolchain stable --profile minimal --no-modify-path; \
-    cargo --version; \
-    rustc --version; \
+    ${CARGO_HOME}/bin/cargo --version; \
+    ${CARGO_HOME}/bin/rustc --version; \
     ln -sf ${CARGO_HOME}/bin/cargo /usr/local/bin/; \
     ln -sf ${CARGO_HOME}/bin/rustc /usr/local/bin/; \
     rm "/tmp/rustup-init-${RUST_ARCH}-unknown-linux-gnu"
