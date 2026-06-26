@@ -35,6 +35,7 @@ private:
         std::chrono::steady_clock::time_point accepted_at;
     };
     static constexpr int HANDSHAKE_TIMEOUT_MS = 5000;
+    static constexpr int HANDSHAKE_SHORT_TIMEOUT_MS = 50;
     std::vector<PendingHandshake> pending_handshakes_;
 
     void check_handshake_timeout();

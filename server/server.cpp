@@ -75,41 +75,52 @@ bool Server::start() {
             // Try immediate read — data connections send 9-byte handshake right away
             uint8_t hdr[9];
             ssize_t nread = read(cfd, hdr, 9);
+
+            // Shared handler for pending handshake accumulation (partial or EAGAIN)
+            auto pending_handler = [this, k](int ev_fd, uint32_t events) {
+                if (!(events & EPOLLIN)) return;
+                size_t idx = pending_handshakes_.size();
+                for (size_t i = 0; i < pending_handshakes_.size(); i++) {
+                    if (pending_handshakes_[i].fd == ev_fd) { idx = i; break; }
+                }
+                if (idx >= pending_handshakes_.size()) return;
+                auto &ph = pending_handshakes_[idx];
+                ssize_t nr = read(ev_fd, ph.buf + ph.got, 9 - ph.got);
+                if (nr > 0) {
+                    ph.got += (size_t)nr;
+                    if (ph.got == 9) {
+                        finish_handshake(ev_fd, ph.buf, 9);
+                        pending_handshakes_.erase(pending_handshakes_.begin() + idx);
+                        return;
+                    }
+                    return; // still partial
+                }
+                if (nr == 0 || (nr < 0 && errno != EAGAIN && errno != EWOULDBLOCK)) {
+                    close(ev_fd);
+                    k->del_fd(ev_fd);
+                    pending_handshakes_.erase(pending_handshakes_.begin() + idx);
+                }
+            };
+
             if (nread > 0 && (size_t)nread < 9) {
                 // Partial — register EPOLLIN to accumulate the rest
                 pending_handshakes_.push_back({cfd, {}, 0, std::chrono::steady_clock::now()});
                 memcpy(pending_handshakes_.back().buf, hdr, (size_t)nread);
                 pending_handshakes_.back().got = (size_t)nread;
-                kernel_->add_fd_handler(cfd, [this, k](int ev_fd, uint32_t events) {
-                    if (!(events & EPOLLIN)) return;
-                    size_t idx = pending_handshakes_.size();
-                    for (size_t i = 0; i < pending_handshakes_.size(); i++) {
-                        if (pending_handshakes_[i].fd == ev_fd) { idx = i; break; }
-                    }
-                    if (idx >= pending_handshakes_.size()) return;
-                    auto &ph = pending_handshakes_[idx];
-                    ssize_t nr = read(ev_fd, ph.buf + ph.got, 9 - ph.got);
-                    if (nr > 0) {
-                        ph.got += (size_t)nr;
-                        if (ph.got == 9) {
-                            finish_handshake(ev_fd, ph.buf, 9);
-                            pending_handshakes_.erase(pending_handshakes_.begin() + idx);
-                            return;
-                        }
-                        return; // still partial
-                    }
-                    if (nr == 0 || (nr < 0 && errno != EAGAIN && errno != EWOULDBLOCK)) {
-                        close(ev_fd);
-                        k->del_fd(ev_fd);
-                        pending_handshakes_.erase(pending_handshakes_.begin() + idx);
-                    }
-                }, EPOLLIN);
+                kernel_->add_fd_handler(cfd, pending_handler, EPOLLIN);
             } else if (nread == 9) {
                 // Full 9 bytes — check for data connection
                 finish_handshake(cfd, hdr, 9);
+            } else if (nread < 0 && (errno == EAGAIN || errno == EWOULDBLOCK)) {
+                // No data yet — wait for EPOLLIN (could be data connection handshake)
+                pending_handshakes_.push_back({cfd, {}, 0, std::chrono::steady_clock::now()});
+                kernel_->add_fd_handler(cfd, pending_handler, EPOLLIN);
+            } else if (nread > 0) {
+                // nread > 0 but not 9 (shouldn't happen, but handle gracefully)
+                finish_handshake(cfd, hdr, (size_t)nread);
             } else {
-                // EAGAIN (no data) or error — this is a new session
-                finish_handshake(cfd, hdr, nread > 0 ? (size_t)nread : 0);
+                // nread == 0 (EOF) or read error — close
+                close(cfd);
             }
         }
     }, EPOLLIN);
@@ -154,10 +165,19 @@ void Server::check_handshake_timeout() {
     auto now = std::chrono::steady_clock::now();
     auto it = pending_handshakes_.begin();
     while (it != pending_handshakes_.end()) {
-        if (now - it->accepted_at > std::chrono::milliseconds(HANDSHAKE_TIMEOUT_MS)) {
-            log_debug("server: handshake timeout on fd=%d got=%zu", it->fd, it->got);
+        auto elapsed = now - it->accepted_at;
+        if (it->got > 0 && elapsed > std::chrono::milliseconds(HANDSHAKE_TIMEOUT_MS)) {
+            // Partial data received but stalled — close
+            log_debug("server: partial handshake timeout on fd=%d got=%zu", it->fd, it->got);
             close(it->fd);
             kernel_->del_fd(it->fd);
+            it = pending_handshakes_.erase(it);
+        } else if (it->got == 0 && elapsed > std::chrono::milliseconds(HANDSHAKE_SHORT_TIMEOUT_MS)) {
+            // No data received — likely a control connection (new session)
+            log_debug("server: pending handshake timeout on fd=%d — treating as new session", it->fd);
+            int pending_fd = it->fd;
+            kernel_->del_fd(pending_fd);
+            finish_handshake(pending_fd, it->buf, 0);
             it = pending_handshakes_.erase(it);
         } else {
             ++it;

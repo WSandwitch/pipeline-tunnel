@@ -161,9 +161,8 @@ def client_thread_args
   ['-t', n.to_s]
 end
 
-def start_tunnel(svr_port, cli_port, tgt_port)
+def start_tunnel(svr_port, cli_port, tgt_port, svr_log, cli_log)
   log_setup "start_tunnel: spawning server on #{svr_port}..."
-  svr_log = Tempfile.new(%w[ppltunnel-server- .log])
   svr = spawn_verbosely(SERVER, "-l#{HOST}:#{svr_port}", "-A#{PASS}",
                         "-M#{MPATH}", '-H60',
                         *server_thread_args,
@@ -175,7 +174,6 @@ def start_tunnel(svr_port, cli_port, tgt_port)
 
   chain = $options[:config]&.start_with?(';') ? $options[:config] : ";#{$options[:config]}"
   log_setup "start_tunnel: spawning client (chain='#{chain}')..."
-  cli_log = Tempfile.new(%w[ppltunnel-client- .log])
   cli = spawn_verbosely(CLIENT, "-L#{HOST}:#{cli_port}:#{HOST}:#{tgt_port}",
                         "-M#{MPATH}", '-H60',
                         "#{HOST}:#{svr_port},#{PASS}#{chain}",
@@ -186,7 +184,7 @@ def start_tunnel(svr_port, cli_port, tgt_port)
   wait_port_or_die(cli, cli_port, cli_log)
   log_setup "start_tunnel: client ready"
 
-  [svr, cli, svr_log, cli_log]
+  [svr, cli]
 end
 
 def stop_procs(*pids)
@@ -251,9 +249,13 @@ def run_one_test(options)
         servers << { tgt_port: tgt, pid: iperf_pid, log: iperf_log }
 
         log_setup "setup client #{i + 1}: starting tunnel svr=#{svr_port} cli=#{cli_port} -> tgt=#{tgt}..."
-        svr, cli, svr_log, cli_log = start_tunnel(svr_port, cli_port, tgt)
+        svr_log = Tempfile.new(%w[ppltunnel-server- .log])
+        cli_log = Tempfile.new(%w[ppltunnel-client- .log])
+        tunnels << { cli_port: cli_port, svr_pid: nil, cli_pid: nil, svr_log: svr_log, cli_log: cli_log }
+        svr, cli = start_tunnel(svr_port, cli_port, tgt, svr_log, cli_log)
+        tunnels.last[:svr_pid] = svr
+        tunnels.last[:cli_pid] = cli
         log_setup "setup client #{i + 1}: tunnel ready (svr=#{svr} cli=#{cli})"
-        tunnels << { cli_port: cli_port, svr_pid: svr, cli_pid: cli, svr_log: svr_log, cli_log: cli_log }
       rescue => e
         $stderr.puts "  SETUP ERROR (client #{i + 1}): #{e.message}"
         servers.each { |s| stop_procs(s[:pid]) }
